@@ -45,6 +45,17 @@ $Prefix = "$env:LOCALAPPDATA\agent-collab\code"   # 安装时的 --prefix
 & "$Prefix\bin\agent-collab.ps1" agent run --data-dir <节点数据目录> --foreground   # 由计划任务托管时不需手动运行
 ```
 
+上面的 `agent pair` 只用于尚未配对的新数据目录。已经由安装器配对（`--pairing-code`，见 [install.md](install.md)）的节点不要再次配对：
+数据目录已有身份，会被拒绝。要调整并发，编辑节点数据目录中 `agent.json` 的 `slots` / `host_slots`，
+然后重启节点服务（节点在启动注册时读取这两个值）。
+
+组织策略禁止执行 PowerShell 脚本（如 `Restricted`）时，遵循该策略、不要自行放宽；改为直接用安装记录的解释器运行启动器：
+
+```powershell
+$Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).config.python
+& $Python -B "$Prefix\launcher.py" agent doctor --data-dir <节点数据目录>   # pair、run 同样把脚本入口换成这一写法
+```
+
 节点数据目录必须在本机磁盘。受管协调节点需在 `agent.json` 设置 `claude_command`（Claude Code 可执行文件路径），并由用户在该机本地完成官方登录；本系统不复制凭据。
 
 ## 排空、迁移与恢复
