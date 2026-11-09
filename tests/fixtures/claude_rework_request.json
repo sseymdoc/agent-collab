@@ -1,0 +1,21 @@
+{
+  "decision": "rework",
+  "assessment": {
+    "status": "rework",
+    "method": "对 context.json 提供的证据做静态审查：检查点 diff（新增 greeting.py、test_greeting.py）、两个文件的完整内容、stub harness 报告（第 2 步 unittest exit_code=0，输出 'Ran 1 test ... OK'）。我自己没有执行任何命令或测试。",
+    "result": "验收第 1 条满足：greet(\"ada\") 返回 \"hello, ada\"，唯一的测试也覆盖并通过了这一点。验收第 2 条不满足：greeting.py 没有处理空字符串的分支，greet(\"\") 会返回 \"hello, \"，而不是 \"hello, world\"。验收第 3 条不满足：test_greeting.py 只有 test_name 一个用例，没有覆盖空名字的情况；报告里也只跑了 1 个测试。改动范围只涉及合同允许的两个文件，没有越出范围。",
+    "checkpoint_id": "844dd63e-89ff-47de-b97f-7ffe3e4b497a"
+  },
+  "follow_up": {
+    "title": "补齐 greet 的空名字分支和对应单元测试",
+    "goal": "修改 greeting.py，让 greet(\"\") 返回 \"hello, world\"，非空 name 时仍返回 \"hello, <name>\"；在 test_greeting.py 中增加空名字的测试用例，保留现有 test_name。",
+    "acceptance": [
+      "greet(\"ada\") == \"hello, ada\"",
+      "greet(\"\") == \"hello, world\"",
+      "test_greeting.py 覆盖以上两种情况且运行通过（python -m unittest -q test_greeting 至少运行 2 个测试并全部通过）"
+    ],
+    "instructions": "只修改 greeting.py 和 test_greeting.py；补齐空名字分支和测试，保留非空名字行为，运行 python -m unittest -q test_greeting。",
+    "effort": "xhigh"
+  },
+  "notes": "回归样本：assessment 原样取自主控的真实 Claude 输出；follow_up 转换为修复请求，不包含模型自造契约。"
+}
