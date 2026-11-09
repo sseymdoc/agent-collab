@@ -224,9 +224,11 @@ class DirectTlsTests(unittest.TestCase):
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
         probe.close()
+        log = open(str(self.temp / 'server.log'), 'wb')
+        self.addCleanup(log.close)
         server = subprocess.Popen([sys.executable, '-B', '-m', 'agent_collab.controller', 'serve', '--data-dir', str(self.temp / 'data'),
                                    '--bind', '127.0.0.1:%d' % port, '--tls-cert', str(cert), '--tls-key', str(key)],
-                                  cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                  cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT)
         self.addCleanup(server.wait, 10)
         self.addCleanup(server.kill)
         context = ssl.create_default_context(cafile=str(cert))
@@ -237,14 +239,15 @@ class DirectTlsTests(unittest.TestCase):
             with urllib.request.urlopen(url, context=context, timeout=5) as r:
                 return r.status
 
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         while True:
             try:
                 self.assertEqual(health(), 200)
                 break
-            except OSError:
-                if time.monotonic() > deadline:
-                    raise
+            except OSError as exc:
+                if server.poll() is not None or time.monotonic() > deadline:
+                    self.fail('controller did not become healthy: %r exit=%s log=%s' % (
+                        exc, server.poll(), (self.temp / 'server.log').read_text(errors='replace')[-3000:]))
                 time.sleep(0.2)
         stalled = socket.create_connection(('127.0.0.1', port))  # 只建 TCP 连接，从不发送 ClientHello
         self.addCleanup(stalled.close)
