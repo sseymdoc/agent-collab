@@ -49,6 +49,15 @@ class PathAndManifestTests(unittest.TestCase):
                 p.validate_manifest({'version': 1, 'base': None, 'files': files, 'deleted': []})
         p.validate_manifest({'version': 1, 'base': None, 'files': [entry('dir/a'), entry('dir/b')], 'deleted': []})
 
+    def test_deeply_nested_manifest_validates_in_linear_time(self):
+        # 每个路径约 1000 字符、500 段：按前缀拼字符串的做法是平方级，逐段建树为线性。
+        files = [entry('/'.join(['d'] * 499 + ['f%04d' % i])) for i in range(2000)]
+        started = time.monotonic()
+        p.validate_manifest({'version': 1, 'base': None, 'files': files, 'deleted': []})
+        self.assertLess(time.monotonic() - started, 3.0)
+        with self.assertRaises(ValueError):  # 深层目录的大小写冲突仍能发现
+            p.validate_manifest({'version': 1, 'base': None, 'files': files + [entry('/'.join(['d'] * 498 + ['D', 'x']))], 'deleted': []})
+
     def test_manifest_diff_accepts_missing_new_manifest(self):
         old = {'version': 1, 'base': None, 'files': [entry('a')], 'deleted': []}
         self.assertEqual(p.manifest_diff(old, None), {'added': [], 'modified': [], 'deleted': ['a']})

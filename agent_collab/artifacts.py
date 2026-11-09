@@ -62,15 +62,8 @@ def atomic_write(path, data, mode=0o600):
 
 
 def checked_manifest(manifest):
-    result = p.validate_manifest(manifest)
-    # Shared validator does not reject case aliases in directory components.
-    names = set()
-    for item in result['files']:
-        parts = item['path'].split('/')
-        names.update('/'.join(parts[:i]) for i in range(1, len(parts) + 1))
-    if p.case_collisions(sorted(names)):
-        raise ValueError('case-conflicting paths')
-    return result
+    # 共享校验已覆盖文件与各级目录的大小写冲突（protocol.check_path_tree），这里不再重复扫描。
+    return p.validate_manifest(manifest)
 
 
 def safe_path(root, relative):
