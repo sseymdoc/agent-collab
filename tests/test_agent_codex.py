@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -154,6 +155,22 @@ class CodexTests(unittest.TestCase):
         self.assertTrue(process.stop())
         time.sleep(1)
         self.assertFalse(marker.exists())  # stop 清掉整个进程组，后代不会在恢复后补写
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux /proc scan')
+    def test_group_empty_tolerates_non_utf8_process_name(self):
+        from agent_collab.adapters.codex import group_empty
+        code = ('import ctypes, time; ctypes.CDLL(None).prctl(15, b"\\xff\\xfeproc", 0, 0, 0); '
+                'open(%r, "w").close(); time.sleep(30)') % str(self.temp / 'named')
+        child = subprocess.Popen([sys.executable, '-c', code], start_new_session=True)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        deadline = time.monotonic() + 10
+        while not (self.temp / 'named').exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertFalse(group_empty(child.pid))  # 非 UTF-8 的 comm 不会让扫描抛 UnicodeDecodeError
+        child.kill()
+        child.wait()
+        self.assertTrue(group_empty(child.pid))
 
     def run_fake_codex(self, events):
         class Context:

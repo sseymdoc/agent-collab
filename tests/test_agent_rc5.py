@@ -341,6 +341,26 @@ class RuntimeRC5Tests(unittest.TestCase):
         self.assertIsNone(self.fake.completions[task['attempt_id']]['report']['checks'])
         self.assertIsNotNone(process.poll())
 
+    def test_unverified_check_stop_survives_restart_check_and_blocks_claims(self):
+        task = self.fake.add()
+        task['contract']['checks'] = [dict(name='long', run=['{python}', '-c', 'import time; time.sleep(60)'])]
+        self.until(lambda: self.attempt(task).check_runner is not None and self.attempt(task).check_runner.process is not None)
+        self.assertTrue(self.agent.connected and self.agent.reconciled)
+        attempt = self.attempt(task)
+        process = attempt.check_runner.process
+        self.addCleanup(process.stop)  # 测试结束后真正清理检查进程
+        with patch.object(process, 'stop', return_value=False):
+            # 不 mock quarantine：取消先停已结束的 harness（报告已停止），再停检查进程（未确认）
+            attempt.cancel()
+            self.assertEqual(attempt.meta['state'], 'quarantined')
+            attempt.refresh_restart()
+        self.assertIsNone(process.poll())  # 检查进程确实还在运行
+        self.assertEqual(attempt.meta['state'], 'quarantined')  # 不能被判为 gone 而 abandoned
+        self.assertTrue(attempt.meta['restart_unknown'])
+        waiting = self.fake.add()
+        self.agent.claim()
+        self.assertIn(waiting, self.fake.assignments)  # 领取仍被阻塞
+
     def test_disabled_harness_assignment_is_rejected_before_any_process(self):
         self.agent.commands = resolve_commands({'disabled_harnesses': {'codex': 'known failure', 'claude': 'fixture'}})
         task = self.fake.add()
@@ -425,23 +445,46 @@ class RuntimeRC5Tests(unittest.TestCase):
         self.assertEqual(complete['outcome'], 'succeeded')  # 不是 code_failure
 
     def test_events_are_sent_in_bounded_batches(self):
-        task = self.fake.add([{'progress': {'n': i, 'pad': 'x' * 200}} for i in range(12)])
+        task = self.fake.add([{'sleep': 100}])
+        self.until(lambda: task['attempt_id'] in self.agent.attempts and self.attempt(task).meta['state'] == 'running')
+        attempt = self.attempt(task)
+        self.until(lambda: not attempt.events)
+        for i in range(12):  # 一次积压多个事件（约 3.6 KB），按 1 KiB 上限必须拆成多批
+            attempt.event('attempt.progress', {'n': i, 'pad': 'x' * 200})
+        before = sum(path.endswith('/events') for _, path in self.fake.calls)
         with patch('agent_collab.node_agent.EVENT_BATCH_BYTES', 1024):
-            complete = self.run_to_completion(task)
-        self.assertEqual(complete['outcome'], 'succeeded')
+            attempt.flush_events()
+        batches = sum(path.endswith('/events') for _, path in self.fake.calls) - before
+        self.assertGreater(batches, 1)
+        self.assertLess(batches, 12)
         progress = [e for e in self.fake.events.values() if e['event']['type'] == 'attempt.progress']
         self.assertEqual(len(progress), 12)
-        self.assertGreater(sum(path.endswith('/events') for _, path in self.fake.calls), 3)
-        self.assertFalse(self.attempt(task).events)
+        self.assertFalse(attempt.events)
 
     def test_event_batch_halves_on_controller_size_limit(self):
         # controller 的 max_json_bytes 比本地 512 KiB 分批上限还小：收到 413 后减半重试直到送达。
+        task = self.fake.add([{'sleep': 100}])
+        self.until(lambda: task['attempt_id'] in self.agent.attempts and self.attempt(task).meta['state'] == 'running')
+        attempt = self.attempt(task)
+        self.until(lambda: not attempt.events)
+        for i in range(12):  # 一次积压多个事件，整批必然超过上限
+            attempt.event('attempt.progress', {'n': i, 'pad': 'x' * 200})
         self.fake.max_json_bytes = 3000
-        task = self.fake.add([{'progress': {'n': i, 'pad': 'x' * 200}} for i in range(12)])
-        complete = self.run_to_completion(task)
-        self.assertEqual(complete['outcome'], 'succeeded')
+        self.until(lambda: not attempt.events)
+        self.assertGreater(self.fake.too_large_hits, 0)
         progress = [e for e in self.fake.events.values() if e['event']['type'] == 'attempt.progress']
         self.assertEqual(len(progress), 12)
+
+    def test_unverified_stop_keeps_process_record_open_for_restart_check(self):
+        task = self.fake.add([{'sleep': 100}])
+        self.until(lambda: task['attempt_id'] in self.agent.attempts and self.attempt(task).meta['state'] == 'running')
+        attempt = self.attempt(task)
+        attempt.meta['process'] = dict(state='running', pid=12345, stamp='x')
+        attempt.process_stopped(True)   # 已结束的 harness 先报告“已停止”（它的旧句柄已关闭）
+        attempt.process_stopped(False)  # 契约检查进程停止未确认
+        attempt.process_stopped(True)
+        self.assertNotEqual(attempt.meta['process']['state'], 'stopped')
+        self.assertTrue(attempt.meta['process']['unverified'])
 
     def test_malformed_controller_reply_disconnects_instead_of_crashing(self):
         self.cycles()

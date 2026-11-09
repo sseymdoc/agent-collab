@@ -282,8 +282,16 @@ class Attempt:
 
     def process_stopped(self, verified):
         self.meta['stop_verified'] = verified
-        if verified and self.meta.get('process') is not None:
-            self.meta['process']['state'] = 'stopped'
+        record = self.meta.get('process')
+        if record is not None:
+            # 记录只对应最近启动的那个进程，但已结束的 harness 与契约检查都会回调这里。
+            # 一旦有人报告停止未确认，这条记录就不再被标为 stopped，交给重启复查按 PID/启动时间确认。
+            if not verified:
+                record['unverified'] = True
+                if record.get('state') == 'stopped':
+                    record['state'] = 'running'
+            elif not record.get('unverified'):
+                record['state'] = 'stopped'
         self.persist()
 
     def persist(self):

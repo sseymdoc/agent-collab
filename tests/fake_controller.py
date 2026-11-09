@@ -45,6 +45,7 @@ class FakeController:
         self.version_mismatch = False
         self.integration_error = None
         self.max_json_bytes = None
+        self.too_large_hits = 0
         self.fail_put_after = None
         self.puts = []
         self.checkpoint_requests = []
@@ -135,6 +136,7 @@ class FakeController:
             stale = self.fenced(identity, value)
             if operation == 'events':
                 if self.max_json_bytes is not None and len(body) > self.max_json_bytes:
+                    self.too_large_hits += 1
                     return self.response(413, p.error_body('too_large', 'request body too large', limit=self.max_json_bytes))
                 accepted, duplicates = [], []
                 for event in value['events']:
