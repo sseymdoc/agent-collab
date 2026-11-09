@@ -198,8 +198,9 @@ class RuntimeTests(unittest.TestCase):
                 steps = [{'progress': {'done': 1}}, {'run': ['{python}', '-c', '']}, {'delete': {'path': 'absent'}}]
                 assignment = self.fake.add(steps)
                 secret = assignment['lease_token']
-                steps[1]['run'][-1] = ('import sys; print("文" * 5000 + ' + repr(secret + 'test-node-secret END') +
-                                      '); print("e" * 5000 + " ERR", file=sys.stderr); sys.exit(' + str(code) + ')')
+                # 直接写 UTF-8 字节：Windows 上重定向的标准输出用区域编码（如 cp1252），print 中文会让子进程出错退出。
+                steps[1]['run'][-1] = ('import sys; sys.stdout.buffer.write(("文" * 5000 + ' + repr(secret + 'test-node-secret END') +
+                                      ' + "\\n").encode("utf-8")); sys.stdout.flush(); print("e" * 5000 + " ERR", file=sys.stderr); sys.exit(' + str(code) + ')')
                 for _ in range(150):
                     self.cycles()
                     if assignment['attempt_id'] in self.fake.completions:

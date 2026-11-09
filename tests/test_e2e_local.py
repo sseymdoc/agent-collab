@@ -22,6 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
 
 
+def note(text):
+    """按控制台编码输出说明文字；写不出的字符用替代符（Windows 运行器的控制台可能是 cp1252）。"""
+    encoding = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+    print(text.encode(encoding, 'replace').decode(encoding))
+
+
 def free_port():
     s = socket.socket()
     s.bind(('127.0.0.1', 0))
@@ -58,7 +64,8 @@ class E2E(unittest.TestCase):
         self.url = 'http://127.0.0.1:%d' % self.port
         self.spawn('controller', [PY, '-m', 'agent_collab.controller', 'serve', '--data-dir', str(self.data),
                                   '--bind', '127.0.0.1:%d' % self.port])
-        self.wait(lambda: self.raw('GET', '/healthz', auth=False)[0] == 200, 20, 'controller 未就绪')
+        # macOS CI 运行器上进程启动可能超过 20 秒。
+        self.wait(lambda: self.raw('GET', '/healthz', auth=False)[0] == 200, 60, 'controller 未就绪')
         self.token = (self.data / 'admin.token').read_text(encoding='utf-8').strip()
 
     def cleanup(self):
@@ -220,7 +227,7 @@ class E2E(unittest.TestCase):
         # 第 0 步只执行过一次：n2 从检查点继续而不是重做。
         self.assertEqual(files['count.txt'], b'1')
         self.assertEqual(files['second.txt'], b'after recovery\n')
-        print('\n[e2e] 崩溃到新节点发布耗时 %.1fs（lease_ttl_s=6）' % recovered_s)
+        note('\n[e2e] 崩溃到新节点发布耗时 %.1fs（lease_ttl_s=6）' % recovered_s)
 
     def test_c_partition_old_epoch_publish_rejected(self):
         part = self.tmp / 'partition-n1'
