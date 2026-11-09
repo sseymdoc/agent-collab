@@ -382,7 +382,7 @@ class RuntimeTests(unittest.TestCase):
             integration={'target_node_id': 'node-a', 'target_path': str(target)})
         self.until(lambda: bool(self.fake.integrations) and self.fake.integrations[-1]['status'] == 'integrated')
         self.assertEqual((target / 'new').read_text(), 'result')
-        self.assertEqual([x['status'] for x in self.fake.integrations], ['integration_pending', 'integrated'])
+        self.assertEqual([x['status'] for x in self.fake.integrations], ['integration_pending', 'integration_pending', 'integrated'])
 
     def test_fault_partition_checks_file_without_network(self):
         fault = self.temp / 'partition'

@@ -14,6 +14,8 @@ class ContractChecks:
         if not isinstance(self.checks, list) or len(self.checks) > 16:
             raise ValueError('invalid contract checks')
         for check in self.checks:
+            if not isinstance(check, dict):
+                raise ValueError('invalid contract check')
             name, argv, timeout = check.get('name'), check.get('run'), check.get('timeout_s', 600)
             if (not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', name) or name in names
                     or not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv)
@@ -39,9 +41,18 @@ class ContractChecks:
         if self.process is None:
             self.started = self.context.clock()
             try:
+                # 输出目录用检查序号而不是契约里的名字：合法名字 ".." 会让目录落到 attempt 根并覆盖 harness 输出。
                 self.process = self.context.start_process(self.process_factory, argv, self.context.work,
-                    self.context.directory / 'checks' / check['name'], b'', self.context.agent.environment)
+                    self.context.directory / 'checks' / str(len(self.results)), b'', self.context.agent.environment)
             except OSError:
+                # start_process 可能已启动并登记了子进程，随后才在落盘时失败：先停掉它，确认不了就隔离。
+                if self.process is not None:
+                    stopped = self.process.stop()
+                    self.process = None
+                    if not stopped:
+                        self.context.process_stopped(False)
+                        self.context.quarantine('check process termination could not be verified')
+                        return
                 self.context.process_stopped(True)
                 self.results.append(dict(name=check['name'], argv=argv, exit_code=None, timed_out=False,
                     duration_s=max(0, self.context.clock() - self.started), stdout_tail='', stderr_tail='Check could not start'))

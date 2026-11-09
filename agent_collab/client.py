@@ -14,10 +14,13 @@ from . import protocol as p
 class APIError(Exception):
     def __init__(self, status, body):
         self.status = status
-        error = body.get('error', {}) if isinstance(body, dict) else {}
-        self.code = error.get('code', 'invalid')
-        self.details = error.get('details', {})
-        self.body = p.error_body(self.code, 'Controller request failed', **self.details)
+        # 错误体形状不合规时退回通用错误，不能因 AttributeError/TypeError 让 agent 在一次 4xx 上崩溃。
+        error = body.get('error') if isinstance(body, dict) else None
+        error = error if isinstance(error, dict) else {}
+        self.code = error.get('code') if isinstance(error.get('code'), str) else 'invalid'
+        self.details = error.get('details') if isinstance(error.get('details'), dict) else {}
+        self.body = p.error_body(self.code, 'Controller request failed')
+        self.body['error']['details'] = self.details  # 不用 **：details 可能含 code/message 键
         super().__init__(self.code)
 
 
@@ -82,7 +85,8 @@ class Client:
         else:
             connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=self.timeout)
         try:
-            connection.request(method, parts.path, body=body, headers=headers)
+            # 保留查询串（如 /events?after=<seq>），否则游标丢失、从缺省位置重放。
+            connection.request(method, parts.path + ('?' + parts.query if parts.query else ''), body=body, headers=headers)
             response = connection.getresponse()
             return response.status, dict(response.getheaders()), response.read()
         finally:

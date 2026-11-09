@@ -11,6 +11,7 @@ from .. import protocol as p
 
 MODEL = 'gpt-6-astra'
 EFFORTS = ('high', 'xhigh', 'max')
+CREATE_SUSPENDED = 0x00000004  # Windows CreateProcess 标志
 
 
 def build_argv(command, cwd, output_dir, params=None, session_id=None, structured_report=False,
@@ -48,8 +49,10 @@ def build_argv(command, cwd, output_dir, params=None, session_id=None, structure
 def classify_failure(text, returncode=None, abnormal=False):
     text = text.lower()
     # 状态码只按独立数字匹配：UUID、路径或行号中的“401/429”子串不能被当作认证或限额失败。
-    if any(word in text for word in ('unauthorized', 'authentication', 'auth expired',
-                                     'token expired', 'login required', 'sign in')) or re.search(r'(?<![\w-])401(?![\w-])', text):
+    # 关键词同样按词边界匹配："assign int"、普通测试输出里的 "authentication" 不是认证失效。
+    if (re.search(r'\b(unauthorized|authentication (?:failed|expired|required)|auth expired|'
+                  r'token expired|login required|sign in)\b', text)
+            or re.search(r'(?<![\w-])401(?![\w-])', text)):
         return 'auth_expired'
     if any(word in text for word in ('usage limit', 'usage_limit', 'rate limit', 'rate_limit',
                                      'rate-limit', 'too many requests', 'quota')) or re.search(r'(?<![\w-])429(?![\w-])', text):
@@ -212,6 +215,14 @@ class WindowsJob:
             self.k.CloseHandle(self.h)
             raise OSError(ct.get_last_error(), '无法绑定本次 Codex 进程组')
 
+    def resume(self, child):
+        """恢复以 CREATE_SUSPENDED 创建的子进程（此前已绑定到本 Job）。"""
+        ntdll = self.ct.WinDLL('ntdll')
+        ntdll.NtResumeProcess.argtypes = [self.ct.c_void_p]
+        status = ntdll.NtResumeProcess(int(child._handle))
+        if status != 0:
+            raise OSError(status, '无法恢复已绑定进程组的子进程')
+
     def stop(self):
         if not self.k.TerminateJobObject(self.h, 130):
             raise OSError(self.ct.get_last_error(), '取消本次进程组失败')
@@ -236,7 +247,7 @@ def group_empty(pid):
     except ProcessLookupError:
         return True
     except PermissionError:
-        return False
+        pass  # macOS 在组内只剩僵尸进程时也返回 EPERM；交给下面的 ps 判断（忽略僵尸）
     try:
         result = subprocess.run(['/bin/ps', '-eo', 'pgid=', '-o', 'stat='], capture_output=True, text=True)
     except OSError:
@@ -253,8 +264,8 @@ def stop_child(child, job):
     else:
         try:
             os.killpg(child.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        except (ProcessLookupError, PermissionError):
+            pass  # EPERM：macOS 组内只剩僵尸；是否清空由 group_empty 判定
         try:
             child.wait(timeout=3)
         except subprocess.TimeoutExpired:
@@ -262,7 +273,7 @@ def stop_child(child, job):
         if not group_empty(child.pid):
             try:
                 os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
     try:
         child.wait(timeout=5)
@@ -286,7 +297,9 @@ class OwnedProcess:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         self.stdout_path, self.stderr_path = directory / 'stdout.jsonl', directory / 'stderr.log'
-        options = {'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
+        # Windows：挂起创建，绑定 Job 后再恢复，子进程来不及在绑定前派生出 Job 之外的后代。
+        options = ({'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED}
+                   if os.name == 'nt' else {'start_new_session': True})
         # File stdin avoids blocking the agent's heartbeat on a full pipe.
         input_path = directory / 'stdin.txt'
         from ..artifacts import atomic_write
@@ -297,6 +310,7 @@ class OwnedProcess:
                                               stdout=out, stderr=err, close_fds=True, **options)
                 if os.name == 'nt':
                     self.job = WindowsJob(self.child)
+                    self.job.resume(self.child)
         except BaseException:
             if self.child:
                 self.child.kill()
@@ -307,25 +321,41 @@ class OwnedProcess:
         return self.child.poll()
 
     def pause(self):
-        if not self.paused and self.poll() is None:
+        # 不以组长是否在世为准：组长退出后，后代仍可能占着进程组/Job 并继续写工作区。
+        if not self.paused:
             if os.name == 'nt':
                 # No supported tree-wide suspend primitive in the stable launcher.
                 # Fail closed; the agent requires reconciliation before reporting.
                 self.stop()
                 return False
-            os.killpg(self.child.pid, signal.SIGSTOP)
+            try:
+                os.killpg(self.child.pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass  # 进程组已空
+            except PermissionError:
+                self.stop()  # 无法保证挂起：失败即关闭
+                return False
             self.paused = True
         return True
 
     def resume(self):
-        if self.paused and self.poll() is None:
-            os.killpg(self.child.pid, signal.SIGCONT)
+        if self.paused:
+            try:
+                os.killpg(self.child.pid, signal.SIGCONT)
+            except (ProcessLookupError, PermissionError):
+                pass  # macOS：对已停止进程投递 SIGTERM 会立即终止它，组内只剩僵尸时返回 EPERM
             self.paused = False
 
     def stop(self):
         if self.closed:
             return True
         try:
+            if self.paused and os.name != 'nt':
+                # 先投递 SIGTERM 再 SIGCONT：恢复后内核先处理挂起的终止信号，被挂起的后代不会先跑一段用户代码。
+                try:
+                    os.killpg(self.child.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
             self.resume()
             stopped = stop_child(self.child, self.job)
         except OSError:
@@ -388,6 +418,11 @@ class CodexAdapter:
             return
         stopped = self.process.stop()
         self.context.process_stopped(stopped)
+        if not stopped:
+            # 进程树未确认清空：隔离而不是上报可重试失败，避免控制器在旧进程仍可写工作区时安排替代执行。
+            self.context.quarantine('harness process termination could not be verified')
+            self.done = True
+            return
         self.state = parse_events(tail(self.process.stdout_path, 4 * 1024 * 1024), self.state)
         self.context.native_session_ref = self.state.get('session_id')
         self.context.observed = read_observed(self.codex_home, self.state.get('session_id'))

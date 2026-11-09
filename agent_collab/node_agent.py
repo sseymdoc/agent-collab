@@ -28,6 +28,7 @@ from .adapters.commands import resolve_commands, probe_auth
 from .release import VERSION, release_info, version_directory
 
 LOG = logging.getLogger(__name__)
+EVENT_BATCH_BYTES = 512 * 1024  # 远低于 controller 缺省 max_json_bytes（2 MiB），给 fenced_body 等外层字段留余量
 
 
 def load(path):
@@ -406,6 +407,9 @@ class Attempt:
             stopped = self.check_runner.stop() and stopped
         state = 'abandoned' if self.meta['state'] == 'abandoned' else 'quarantined'
         self.meta.update(state=state, quarantine_reason=reason, stop_verified=stopped)
+        if not stopped:
+            # 停止未能确认时，交给 refresh_restart 按记录的 PID/启动时间复查；进程确认退出后才解除领取阻塞。
+            self.meta['restart_unknown'] = True
         save(self.directory / 'quarantined.json', dict(reason=reason, at=now(), stop_verified=stopped))
         self.persist()
 
@@ -437,13 +441,24 @@ class Attempt:
                 self.finish('failed', failure, str(exc))
 
     def flush_events(self):
-        if not self.events:
-            return
-        response = self.agent.client.json('POST', '/attempts/' + self.id + '/events',
-                                          self.fenced_body(events=self.events))
-        acknowledged = set(response['accepted']) | set(response['duplicates'])
-        self.events = [event for event in self.events if event['event_id'] not in acknowledged]
-        atomic_write(self.events_path, b''.join(p.canonical_json(event) + b'\n' for event in self.events))
+        # 分区期间积压的事件可能超过 controller 的 max_json_bytes（缺省 2 MiB）；整批发送会一直 413，
+        # attempt 永远停在 finished_unreported。按大小分批，保留原 event_id，未确认的继续留在队列。
+        while self.events:
+            batch, size = [], 0
+            for event in self.events:
+                size += len(p.canonical_json(event)) + 1
+                if batch and size > EVENT_BATCH_BYTES:
+                    break
+                batch.append(event)
+            response = self.agent.client.json('POST', '/attempts/' + self.id + '/events',
+                                              self.fenced_body(events=batch))
+            acknowledged = set(response['accepted']) | set(response['duplicates'])
+            remaining = [event for event in self.events if event['event_id'] not in acknowledged]
+            atomic_write(self.events_path, b''.join(p.canonical_json(event) + b'\n' for event in remaining))
+            if len(remaining) == len(self.events):
+                self.events = remaining
+                break  # 本批一个都没确认：留待下个周期，不在此空转
+            self.events = remaining
 
     def upload_checkpoint(self, checkpoint):
         manifest = checkpoint['manifest']
@@ -681,66 +696,11 @@ class Agent:
 
     def integrations(self, items):
         for item in items:
-            # §11.10 routes items by authenticated heartbeat; tolerate an explicit
-            # target guard from a newer controller without requiring a new field.
-            if item.get('target_node_id', self.config['node_id']) != self.config['node_id']:
-                continue
-            job, checkpoint = p.check_uuid(item['job_id']), p.check_uuid(item['checkpoint_id'])
-            directory = self.directory / 'integrations' / job / checkpoint
-            path = directory / 'progress.json'
-            progress = load(path) if path.exists() else dict(item=item, started=False, reported=False,
-                record=dict(request_id=str(uuid.uuid4()), checkpoint_id=checkpoint,
-                            status='integration_pending', detail=dict(changed=[], conflicts=[], backup=None)))
-            if progress['item'] != item:
-                raise ValueError('integration identity changed')
-            if not path.exists():
-                # Import rc4 receipts/intents before creating an rc5 delivery. Never
-                # write twice when upgrading after an old execute-node integration.
-                for attempt in self.attempts.values():
-                    legacy = attempt.meta.get('integration')
-                    if (attempt.assignment['job_id'] == job and legacy and legacy['checkpoint_id'] == checkpoint):
-                        progress['record'] = legacy
-                        progress['started'] = bool(attempt.meta.get('integration_started'))
-                        break
-                save(path, progress)
-            if progress['reported']:
-                # A restored controller can offer an already acknowledged item.
-                # Replay the same receipt, never touch its target again.
-                self.client.json('POST', '/jobs/' + job + '/integration', progress['record'])
-                continue
-            record = progress['record']
-            if record['status'] == 'integration_pending':
-                if progress['started']:
-                    record.update(request_id=str(uuid.uuid4()), status='conflict', detail=dict(changed=[],
-                        conflicts=['Previous integration result unknown; manual review required'], backup=str(directory / 'backup')))
-                else:
-                    self.client.json('POST', '/jobs/' + job + '/integration', record)
-                    # Fetch/validate before recording write intent; network failure
-                    # before this boundary can be retried without touching target.
-                    manifests = []
-                    for key in ('base_manifest_sha256', 'manifest_sha256'):
-                        sha = item.get(key)
-                        manifest = checked_manifest(json.loads(self.fetch_blob(sha))) if sha else dict(EMPTY)
-                        if sha and p.manifest_sha256(manifest) != sha:
-                            raise ValueError('integration manifest is not canonical')
-                        manifests.append(manifest)
-                    for entry in manifests[1]['files']:
-                        self.fetch_blob(entry['sha256'])
-                    progress['started'] = True
-                    save(path, progress)
-                    try:
-                        result = integrate(item['target_path'], manifests[0], manifests[1], self.fetch_blob,
-                                           directory / 'backup', exclude=item.get('exclude', DEFAULT_EXCLUDES))
-                        detail = {key: result[key] for key in ('changed', 'conflicts', 'backup', 'errors') if key in result}
-                        status = result['status']
-                    except (ValueError, OSError):
-                        status, detail = 'conflict', dict(changed=[], conflicts=['Integration interrupted; manual review required'],
-                                                         backup=str(directory / 'backup'))
-                    record.update(request_id=str(uuid.uuid4()), status=status, detail=detail)
-                save(path, progress)
-            self.client.json('POST', '/jobs/' + job + '/integration', record)
-            progress['reported'] = True
-            save(path, progress)
+            try:
+                self.integrate_item(item)
+            except (ValueError, KeyError, TypeError) as exc:
+                # 单个坏条目（身份变化、manifest 不规范、哈希不符）只跳过并记录，不让整个心跳失败。
+                LOG.warning('Integration item %s rejected: %s', item.get('job_id') if isinstance(item, dict) else None, exc)
 
         # A controller may have committed a receipt but lost its response and
         # therefore stopped sending the item. Replay only outcomes, never writes.
@@ -752,9 +712,107 @@ class Agent:
                     record.update(request_id=str(uuid.uuid4()), status='conflict', detail=dict(changed=[],
                         conflicts=['Previous integration result unknown; manual review required'], backup=str(path.parent / 'backup')))
                     save(path, progress)
-                self.client.json('POST', '/jobs/' + progress['item']['job_id'] + '/integration', record)
-                progress['reported'] = True
+                outcome = self.report_integration(progress['item']['job_id'], record)
+                if outcome == 'lease':
+                    continue
+                progress.update(reported=True, superseded=outcome == 'superseded')
                 save(path, progress)
+
+    def integrate_item(self, item):
+        # §11.10 routes items by authenticated heartbeat; tolerate an explicit
+        # target guard from a newer controller without requiring a new field.
+        if item.get('target_node_id', self.config['node_id']) != self.config['node_id']:
+            return
+        job, checkpoint = p.check_uuid(item['job_id']), p.check_uuid(item['checkpoint_id'])
+        directory = self.directory / 'integrations' / job / checkpoint
+        path = directory / 'progress.json'
+        progress = load(path) if path.exists() else dict(item=item, started=False, reported=False,
+            record=dict(request_id=str(uuid.uuid4()), checkpoint_id=checkpoint,
+                        status='integration_pending', detail=dict(changed=[], conflicts=[], backup=None)))
+        if progress['item'] != item:
+            raise ValueError('integration identity changed')
+        if not path.exists():
+            # Import rc4 receipts/intents before creating an rc5 delivery. Never
+            # write twice when upgrading after an old execute-node integration.
+            for attempt in self.attempts.values():
+                legacy = attempt.meta.get('integration')
+                if (attempt.assignment['job_id'] == job and legacy and legacy['checkpoint_id'] == checkpoint):
+                    progress['record'] = legacy
+                    progress['started'] = bool(attempt.meta.get('integration_started'))
+                    break
+            save(path, progress)
+        if progress['reported']:
+            # A restored controller can offer an already acknowledged item.
+            # Replay the same receipt, never touch its target again.
+            self.report_integration(job, progress['record'])
+            return
+        record = progress['record']
+        if record['status'] == 'integration_pending':
+            if progress['started']:
+                record.update(request_id=str(uuid.uuid4()), status='conflict', detail=dict(changed=[],
+                    conflicts=['Previous integration result unknown; manual review required'], backup=str(directory / 'backup')))
+            else:
+                def current(fresh=False):
+                    # 被新交付替代则不写；协调租约占用则下次心跳再试。
+                    if fresh:
+                        record['request_id'] = str(uuid.uuid4())  # 新请求，不能命中上一次的幂等缓存
+                    outcome = self.report_integration(job, record)
+                    if outcome == 'superseded':
+                        progress.update(reported=True, superseded=True)
+                        save(path, progress)
+                    return outcome == 'accepted'
+                if not current():
+                    return
+                # Fetch/validate before recording write intent; network failure
+                # before this boundary can be retried without touching target.
+                manifests = []
+                for key in ('base_manifest_sha256', 'manifest_sha256'):
+                    sha = item.get(key)
+                    manifest = checked_manifest(json.loads(self.fetch_blob(sha))) if sha else dict(EMPTY)
+                    if sha and p.manifest_sha256(manifest) != sha:
+                        raise ValueError('integration manifest is not canonical')
+                    manifests.append(manifest)
+                for entry in manifests[1]['files']:
+                    self.fetch_blob(entry['sha256'])
+                # 取 blob 期间可能已有更新的发布替代本交付：写入前再确认一次。
+                # ponytail: 剩余窗口只有本地写入时长；彻底消除需要 controller 侧的目标写租约。
+                if not current(fresh=True):
+                    return
+                progress['started'] = True
+                save(path, progress)
+                try:
+                    result = integrate(item['target_path'], manifests[0], manifests[1], self.fetch_blob,
+                                       directory / 'backup', exclude=item.get('exclude', DEFAULT_EXCLUDES))
+                    detail = {key: result[key] for key in ('changed', 'conflicts', 'backup', 'errors') if key in result}
+                    status = result['status']
+                except (ValueError, OSError):
+                    status, detail = 'conflict', dict(changed=[], conflicts=['Integration interrupted; manual review required'],
+                                                     backup=str(directory / 'backup'))
+                record.update(request_id=str(uuid.uuid4()), status=status, detail=detail)
+            save(path, progress)
+        outcome = self.report_integration(job, record)
+        if outcome == 'lease':
+            return
+        progress.update(reported=True, superseded=outcome == 'superseded')
+        save(path, progress)
+
+    def report_integration(self, job, record):
+        """上报回写状态。返回 accepted、superseded（交付已被替代或回执被终态拒绝，不再重试）或 lease（协调租约占用，稍后重试）。
+
+        被替代的 409 若一直抛出，会让每次心跳都失败、节点再也领不到任务。
+        """
+        try:
+            self.client.json('POST', '/jobs/' + job + '/integration', record)
+            return 'accepted'
+        except APIError as exc:
+            # 400/404/409 是对这一份回执的终态拒绝（被替代、job 不存在或回执无效），重放也不会变；
+            # 401/403 等身份问题仍向上抛出，由 cycle() 断开重连。
+            if exc.status not in (400, 404, 409):
+                raise
+            if exc.status == 409 and exc.details.get('reason') == 'coordinator_lease':
+                return 'lease'
+            LOG.warning('Integration for job %s rejected (%s); not retrying', job, exc.code)
+            return 'superseded'
 
     def claim(self):
         used = sum(a.contract.get('resources', {}).get('slots', 1) for a in self.attempts.values()
@@ -818,6 +876,14 @@ class Agent:
                 self.reconciled = False
                 self.next_network = self.clock() + self.backoff.next()
                 self.last_error = self.clean(exc.body)
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                # 控制端回复形状不符（字段缺失、非 JSON、重复分配等）：按协议错误断开并退避，
+                # 不让异常逃出 serve() 终止节点，也不在服务重启后形成崩溃循环。
+                self.connected = False
+                self.reconciled = False
+                self.next_network = self.clock() + self.backoff.next()
+                self.last_error = p.error_body('invalid', 'Invalid controller response', reason='protocol')
+                LOG.warning('Controller response rejected (%s); awaiting reconciliation', type(exc).__name__)
         self.tick_local()
 
     def tick_local(self):

@@ -131,7 +131,25 @@ class CodexTests(unittest.TestCase):
         self.assertFalse(process.paused)
         self.assertTrue(process.stop())
 
-    def test_codex_adapter_uses_injected_process_and_requires_completed_event(self):
+    @unittest.skipIf(os.name == 'nt', 'POSIX process-group suspend/resume')
+    def test_pause_after_leader_exit_still_suspends_descendants(self):
+        marker = self.temp / 'late-write'
+        code = ('import subprocess, sys; subprocess.Popen([sys.executable, "-c", '
+                '"import time, pathlib; time.sleep(1.5); pathlib.Path(%r).write_text(\'x\')"])' % str(marker))
+        process = OwnedProcess([sys.executable, '-c', code], self.temp, self.temp / 'logs')
+        self.addCleanup(process.stop)
+        deadline = time.monotonic() + 10
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertIsNotNone(process.poll())
+        self.assertTrue(process.pause())
+        time.sleep(3)
+        self.assertFalse(marker.exists())  # 组长已退出，但后代被一并挂起
+        self.assertTrue(process.stop())
+        time.sleep(2)
+        self.assertFalse(marker.exists())  # stop 清掉整个进程组，后代不会在恢复后补写
+
+    def run_fake_codex(self, events):
         class Context:
             work = self.temp
             directory = self.temp
@@ -148,7 +166,7 @@ class CodexTests(unittest.TestCase):
             def __init__(inner, argv, cwd, directory, stdin, env):
                 inner.stdout_path = directory / 'stdout.jsonl'
                 inner.stderr_path = directory / 'stderr.log'
-                inner.stdout_path.write_text(json.dumps({'type': 'turn.completed', 'usage': {}}), encoding='utf-8')
+                inner.stdout_path.write_text(''.join(json.dumps(e) + '\n' for e in events), encoding='utf-8')
                 self.assertNotIn('resume', argv)
                 self.assertEqual(stdin, b'no real model')
             def resume(inner):
@@ -160,5 +178,14 @@ class CodexTests(unittest.TestCase):
         context = Context()
         adapter = CodexAdapter(context, codex_home=self.temp, process_factory=FakeProcess)
         adapter.tick()
+        return context
+
+    def test_codex_adapter_uses_injected_process_and_requires_completed_event(self):
+        context = self.run_fake_codex([{'type': 'turn.completed', 'usage': {}}])
         self.assertEqual(context.result, ('succeeded',))
         self.assertIsNone(context.observed)
+
+    def test_codex_exit_zero_without_turn_completed_fails(self):
+        # 退出码 0 但没有 turn.completed：不能当作成功（可能是中途被截断）。
+        context = self.run_fake_codex([{'type': 'thread.started', 'thread_id': SESSION}])
+        self.assertEqual(context.result[0], 'failed')

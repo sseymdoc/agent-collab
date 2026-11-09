@@ -61,7 +61,7 @@ Codex 模型固定为 `gpt-6-astra`；effort 仅 `high/xhigh/max`，默认 `xhig
 `/usr/local/bin`。Windows 使用 PATHEXT，排除 WindowsApps 应用执行别名。探测与执行共用绝对 argv 和环境，
 PATH 前置该可执行文件目录，不加载 shell rc；Codex 线程来源变量被清除，显式 codex_home 同时用于所有探测。
 `capabilities.harness_paths` 给出路径或 null；tools 与 harness 的版本来自同一次探测。
-启动及每个周期调用 `codex login status` / `claude auth status`（20 秒超时），只保留 ok/expired/unknown，
+启动时及之后每隔 `auth_probe_s`（缺省 900 秒）在后台调用 `codex login status` / `claude auth status`（20 秒超时），只保留 ok/expired/unknown，
 不保存账户标识、凭据或命令输出。超时及无法识别的结果为 unknown，明确未登录为 expired。
 Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.sandbox="elevated"`（可配置）。
 已有 model、effort、approval_policy、sandbox_workspace_write 隔离参数继续显式传递。
@@ -82,7 +82,7 @@ agent-data/
     quarantined.json             # 隔离原因与停止确认状态；保留全部工作文件
     stdin.txt, stdout.jsonl, stderr.log, result.txt   # Codex 本地运行文件
     step-<index>/                # stub run 的托管进程日志
-    checks/<name>/               # 契约检查的本地进程输入/输出
+    checks/<序号>/               # 契约检查的本地进程输入/输出（按序号建目录，检查名不参与路径）
   integrations/<job_id>/<checkpoint_id>/
     progress.json                # pending、写入意图、固定回执和上报确认
     backup/                      # 回写前原文件备份
@@ -102,6 +102,9 @@ Claude 的有效 decision 和 notes。未知值用 null，未执行步骤不伪�
 rc5 在 harness 成功之后按顺序执行 contract.checks：无 shell、空 stdin、工作区 cwd、服务环境，
 `{python}` 替换为 agent 解释器。检查由主循环轮询，心跳与取消继续工作；超时停止整个进程组。
 失败/超时/无法启动均记为检查证据，不改变成功的 harness outcome；无法确认检查进程停止时则隔离工作区。
+信任边界：检查以节点服务身份运行，**不在** Codex 沙箱内，可联网并读取该账户可读的文件（含 node.token、
+lease.token）。检查若导入模型刚写出的工作区代码（如 `{python} -m unittest`），等同以节点身份执行模型产物。
+只对可信契约启用会执行工作区代码的检查；隔离执行（独立低权限账户或 OS 沙箱）尚未实现，见已知限制。
 全部检查结束后才生成 final，report.checks 绑定该 manifest 的哈希，并记录节点、平台、argv、退出码、
 超时、耗时和脱敏输出尾部（各 ≤4 KiB）。harness 失败时不运行检查，checks=null。
 成功但未配置检查时 results=[]。64 KiB 总限制优先压缩检查尾部；极端超大 argv 仍可能使检查证据被清空，
@@ -114,10 +117,10 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 ```text
 [claude_command, -p, --model, <profile.model>, --effort, <profile.effort>,
  --output-format, json, --json-schema, <内联 JSON>, --permission-mode, dontAsk,
- --allowedTools, Read, --session-id, <新 UUID>]
+ --tools, "", --session-id, <新 UUID>]
 ```
 
-prompt 经 stdin 传入，要求读取 context.json 并仅返回结构化决策；不授予写文件或执行命令权限。适配器只解析 stdout JSON 的 structured_output，不从 result 自由文本猜测 JSON。固定 schema 由 controller/adapter 共用并在本地复核：follow_up 只是修复请求 `{title, goal, acceptance, instructions, effort}`，不含完整契约；完整的 codex 修复契约由 controller 基于被验收检查点与目标契约派生。结构化输出通过 schema 即由 agent 原子写入 decision.json，再走已有 final checkpoint 上传和 complete outbox；不合 schema 的结果失败且不写该文件。依赖目标状态的校验（租约归属、检查点、预算、副作用）只在 controller 进行：验收结论合法时一定记录，修复请求无法生成合法契约时写 coordinator.follow_up_rejected 而不是丢弃整个决策。
+prompt 经 stdin 传入，context.json 全文内嵌在 prompt 末尾，要求仅返回结构化决策；`--tools ""` 不授予任何工具（含读文件）。适配器只解析 stdout JSON 的 structured_output，不从 result 自由文本猜测 JSON。固定 schema 由 controller/adapter 共用并在本地复核：follow_up 只是修复请求 `{title, goal, acceptance, instructions, effort}`，不含完整契约；完整的 codex 修复契约由 controller 基于被验收检查点与目标契约派生。结构化输出通过 schema 即由 agent 原子写入 decision.json，再走已有 final checkpoint 上传和 complete outbox；不合 schema 的结果失败且不写该文件。依赖目标状态的校验（租约归属、检查点、预算、副作用）只在 controller 进行：验收结论合法时一定记录，修复请求无法生成合法契约时写 coordinator.follow_up_rejected 而不是丢弃整个决策。
 
 进程使用现有 OwnedProcess 生命周期管理；每次协调创建新的 session UUID，不 resume 旧 Claude 会话，不读取任何登录文件或 transcript。runtime.model/effort 记录请求的配置值，runtime.observed 为 null，不将请求值冒充模型实际观测。进程输出包含认证失败时分类 auth_expired；controller 可据此标记 claude 的 auth_health 为 expired。认证恢复沿用节点报告 ok/管理员处理的既有机制。
 
@@ -131,7 +134,8 @@ title/goal/acceptance/instructions 使用简体中文，字段名与结构化枚
 
 启动先注册、带本地 attempt 列表心跳，之后才能领取。心跳按配置加 ±20% 抖动，网络失败使用
 基数 1 秒、上限 60 秒的指数 full jitter。网络等待期间仍轮询本地 harness；恢复后先心跳对账。
-每个步骤/模型进程都属于独立 attempt；被撤销或 fenced 后停止进程组、隔离工作区、禁止发布。
+一个任务的全部步骤及其模型进程都在分配给它的那一个 attempt 内运行（租约与恢复都以 attempt 为界）；
+attempt 被撤销或 fenced 后停止其进程组、隔离工作区、禁止发布。
 事件仍可作为 stale 归档。`reconcile_required` 时隔离旧执行，刷新注册后再次心跳，期间不领取。
 
 重启不重新执行旧 harness，按持久化事实处理：
@@ -200,6 +204,8 @@ rc4 已有回执/写入意图会导入同一进度路径，避免升级后再次
   `7862865fadc8c2a1514744eb33cb2ef93b58d1f6e58823df38ecabd01a774921`。
   `workflow.py`（SHA-256 `a2d2364486800f8491fe853a31b9daed23cc547d89a5a9d888b5d7f0ec8d4e3e`）
   作为只读事实/验收分离参考，未复制工作流、递归派单或依赖它的运行环境。
+- 契约检查未沙箱化：以节点服务身份、完整服务环境与网络运行。需要隔离时应由独立低权限账户或 OS 沙箱
+  执行检查，并让该账户无法读取节点数据目录；本版未实现。
 - blob 与单次快照目前在内存中组装，没有分块传输或缓存 GC；适合受控小工作包。目录创建/删除本身
   不进入 manifest，仅跟踪文件。文件/目录形态切换可能保守报告冲突，跨平台非法文件名可能本地失败。
 - 子进程继承本机账户权限，stub run 不是操作系统沙箱；只应用于受信测试命令。Codex 使用固定沙箱参数。

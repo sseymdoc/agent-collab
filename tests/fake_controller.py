@@ -26,6 +26,7 @@ class FakeController:
         self.leases = {}
         self.events = {}
         self.checkpoints = {}
+        self.checkpoint_owner = {}
         self.completions = {}
         self.publications = {}
         self.integrations = []
@@ -42,6 +43,7 @@ class FakeController:
         self.lose_publish_response = False
         self.missing_once = False
         self.version_mismatch = False
+        self.integration_error = None
         self.fail_put_after = None
         self.puts = []
         self.checkpoint_requests = []
@@ -162,11 +164,14 @@ class FakeController:
                 if key in self.checkpoints and self.checkpoints[key] != value:
                     return self.error('conflict')
                 self.checkpoints[key] = copy.deepcopy(value)
+                self.checkpoint_owner[key] = identity
                 return self.response(200, dict(checkpoint_id=key, state='durable'))
             if operation == 'complete':
                 if value['outcome'] == 'succeeded':
                     checkpoint = self.checkpoints.get(value['output_checkpoint_id'])
-                    if not checkpoint or checkpoint['kind'] != 'final':
+                    # 与真实 controller 一致：成功完成只能引用本 attempt 自己的 final 检查点。
+                    if (not checkpoint or checkpoint['kind'] != 'final' or
+                            self.checkpoint_owner.get(value['output_checkpoint_id']) != identity):
                         return self.error('conflict')
                 if identity in self.completions and self.completions[identity] != value:
                     return self.error('conflict')
@@ -177,14 +182,18 @@ class FakeController:
             if operation == 'publish':
                 if self.fenced(value['attempt_id'], value):
                     return self.error('fenced')
-                if self.version_mismatch:
+                assignment = self.issued.get(job)
+                # 发布必须来自该 job 的 attempt、引用本 attempt 的检查点，且基于当前交付版本。
+                if (not assignment or assignment['attempt_id'] != value['attempt_id'] or
+                        self.checkpoint_owner.get(value['checkpoint_id']) != value['attempt_id']):
+                    return self.error('conflict')
+                if self.version_mismatch or value.get('expected_base_version') != assignment['delivery_version']:
                     return self.error('version_mismatch')
                 assert self.completions[value['attempt_id']]['outcome'] == 'succeeded'
                 key = value['request_id']
                 if key in self.publications and self.publications[key] != value:
                     return self.error('conflict')
                 self.publications[key] = copy.deepcopy(value)
-                assignment = self.issued[job]
                 spec = assignment['contract'].get('integration', {})
                 if spec.get('target_node_id') and spec.get('target_path') and job not in self.integration_items:
                     checkpoint = self.checkpoints[value['checkpoint_id']]
@@ -198,6 +207,8 @@ class FakeController:
                     raise ConnectionError('publication response lost')
                 return self.response(200, dict(job_id=job, delivery_version=1, checkpoint_id=value['checkpoint_id']))
             if operation == 'integration':
+                if self.integration_error is not None:
+                    return self.error('conflict', **self.integration_error)
                 self.integrations.append(value)
                 if value['status'] != 'integration_pending':
                     self.integration_items.pop(job, None)

@@ -105,7 +105,7 @@ class RestartTests(unittest.TestCase):
                 raise ConnectionError('integration response lost')
             return response
         self.agent.client.transport = transport
-        self.until(lambda: len(self.fake.integrations) == 2)
+        self.until(lambda: any(r['status'] == 'integrated' for r in self.fake.integrations))
         record = self.fake.integrations[-1]
         (target / 'result').write_bytes(b'manual after integration')
         self.restart()

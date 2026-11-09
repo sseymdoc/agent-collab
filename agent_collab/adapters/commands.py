@@ -21,8 +21,11 @@ def resolve_commands(config=None, env=None, system=None, home=None, mac_dirs=Non
     def find(command, explicit=False):
         # Preserve launcher/symlink directory for PATH, not its resolved target.
         if system == 'Windows':
-            suffixes = [s for s in environment.get('PATHEXT', '.COM;.EXE;.BAT;.CMD').split(';') if s]
-            names = [command] if Path(command).suffix.lower() in [s.lower() for s in suffixes] else [command + s for s in suffixes] + [command]
+            # CreateProcess 只能直接启动这几类；.VBS/.JS/.PS1 与无扩展名脚本（如 npm 的 sh 包装）会 WinError 193。
+            direct = ('.com', '.exe', '.bat', '.cmd')
+            suffixes = [s for s in environment.get('PATHEXT', '.COM;.EXE;.BAT;.CMD').split(';') if s.lower() in direct]
+            suffix = Path(command).suffix.lower()
+            names = ([command] if suffix in direct else []) if suffix else [command + s for s in suffixes]
             candidates = names if explicit else [str(Path(folder) / n) for folder in folders if folder for n in names]
             for value in candidates:
                 path = Path(value)
@@ -39,8 +42,11 @@ def resolve_commands(config=None, env=None, system=None, home=None, mac_dirs=Non
         return None
 
     disabled = config.get('disabled_harnesses', {})
-    if not isinstance(disabled, dict):
-        raise ValueError('disabled_harnesses must be an object')
+    # 原因值会作为 capabilities.harness_disabled 上报，controller 只接受字符串或 null；这里先拒绝，避免节点注册失败。
+    if not isinstance(disabled, dict) or any(not isinstance(v, (str, type(None))) for v in disabled.values()):
+        raise ValueError('disabled_harnesses must map harness names to a string reason or null')
+    if config.get('codex_home') is not None and (not isinstance(config['codex_home'], str) or not config['codex_home']):
+        raise ValueError('codex_home must be a nonempty path string')
     result = {}
     for name in HARNESSES:
         raw = config.get(name + '_command')

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from agent_collab import artifacts, protocol as p
 from agent_collab.adapters.commands import resolve_commands, probe_auth
+from agent_collab.client import ConnectionFailure
 from agent_collab.adapters.codex import build_argv
 from agent_collab.node_agent import Agent, AgentLock, bounded_report, detect, doctor, save
 from agent_collab.release import VERSION, release_info, version_directory
@@ -65,6 +66,12 @@ class ResolutionTests(unittest.TestCase):
         for command in ([], ['relative'], 1):
             with self.assertRaises(ValueError):
                 resolve_commands({'codex_command': command}, self.env, 'Linux')
+        # 原因值会上报给 controller：非字符串必须在本地就被拒绝；codex_home 必须是路径字符串。
+        for bad in ({'disabled_harnesses': {'codex': 1}}, {'disabled_harnesses': ['codex']},
+                    {'codex_home': 5}, {'codex_home': ''}):
+            with self.assertRaises(ValueError):
+                resolve_commands(bad, self.env, 'Linux')
+        self.assertIsNone(resolve_commands({'disabled_harnesses': {'codex': None}}, self.env, 'Linux')['codex']['argv'])
 
     def test_windows_pathext_and_alias_exclusion(self):
         alias = self.temp / 'WindowsApps'
@@ -73,6 +80,13 @@ class ResolutionTests(unittest.TestCase):
         real = self.executable(tool / 'codex.BAT')
         env = dict(self.env, PATH=str(alias) + os.pathsep + str(tool), PATHEXT='.BAT;.EXE', USERPROFILE=self.env['HOME'])
         self.assertEqual(resolve_commands(env=env, system='Windows')['codex']['argv'], [real])
+        # 解释器类扩展名与无扩展名脚本不能被 CreateProcess 直接启动：即使在 PATH 更前面也跳过。
+        early = self.temp / 'early'
+        self.executable(early / 'codex')
+        self.executable(early / 'codex.VBS')
+        env = dict(env, PATH=str(early) + os.pathsep + str(tool), PATHEXT='.VBS;.BAT')
+        self.assertEqual(resolve_commands(env=env, system='Windows')['codex']['argv'], [real])
+        self.assertIsNone(resolve_commands({'codex_command': str(early / 'codex.VBS')}, env, 'Windows')['codex']['argv'])
         self.assertIsNone(resolve_commands({'codex_command': str(alias / 'codex.BAT')}, env, 'Windows')['codex']['argv'])
 
     def test_auth_status_mapping_never_returns_account_output(self):
@@ -110,6 +124,43 @@ class ResolutionTests(unittest.TestCase):
             self.assertIn('--ignore-user-config', argv)
             self.assertIn('windows.sandbox="' + mode + '"', argv)
         self.assertFalse(any('windows.sandbox' in x for x in build_argv('codex', self.temp, self.temp, system='Linux')))
+
+
+class ClientAndAdapterTests(unittest.TestCase):
+    def test_transport_keeps_query_and_tolerates_malformed_error_body(self):
+        from agent_collab.client import APIError, Client
+        seen = []
+        class Connection:
+            def __init__(self, *args, **kwargs):
+                pass
+            def request(self, method, target, body=None, headers=None):
+                seen.append(target)
+            def getresponse(self):
+                return Mock(status=200, getheaders=lambda: [], read=lambda: b'{}')
+            def close(self):
+                pass
+        with patch('agent_collab.client.http.client.HTTPConnection', Connection):
+            Client('http://127.0.0.1:1')._transport('GET', 'http://127.0.0.1:1/api/v1/events?after=5', {}, b'')
+        self.assertEqual(seen, ['/api/v1/events?after=5'])
+        for body in ({'error': 'text'}, {'error': {'code': 3, 'details': ['x']}}, ['list'], None):
+            error = APIError(409, body)
+            self.assertEqual((error.code, error.details), ('invalid', {}))
+
+    def test_stub_run_with_unverified_stop_quarantines(self):
+        from agent_collab.adapters.stub import StubAdapter
+        temp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(temp))
+        context = Mock(work=temp, directory=temp, summary={}, contract={'harness_params': {'steps': [{'run': ['x']}]}})
+        context.can_execute.return_value = True
+        process = Mock(stdout_path=temp / 'out', stderr_path=temp / 'err')
+        process.poll.return_value = 0
+        process.stop.return_value = False
+        context.start_process.return_value = process
+        adapter = StubAdapter(context)
+        adapter.tick()
+        context.process_stopped.assert_called_with(False)
+        context.quarantine.assert_called_once()
+        context.finish.assert_not_called()
 
 
 class RuntimeRC5Tests(unittest.TestCase):
@@ -185,7 +236,7 @@ class RuntimeRC5Tests(unittest.TestCase):
         self.assertEqual(status['version_dir'], str(ROOT))
         before = (self.data / 'status.json').read_bytes()
         self.fake.offline = True
-        with self.assertRaises(Exception):
+        with self.assertRaises(ConnectionFailure):
             agent.heartbeat()
         self.assertEqual((self.data / 'status.json').read_bytes(), before)
 
@@ -320,8 +371,69 @@ class RuntimeRC5Tests(unittest.TestCase):
         (target / 'changed').write_bytes(b'human later')
         self.agent.integrations([dict(item, target_node_id='node-a')])
         self.assertEqual((target / 'changed').read_bytes(), b'human later')
-        self.assertEqual(len(self.fake.integrations), 3)
+        # 待写确认两次（取 blob 前后各一次）+ integrated + 重放同一回执
+        self.assertEqual([r['status'] for r in self.fake.integrations],
+                         ['integration_pending', 'integration_pending', 'integrated', 'integrated'])
         self.assertEqual(self.fake.integrations[-1], record)
+
+    def test_events_are_sent_in_bounded_batches(self):
+        task = self.fake.add([{'progress': {'n': i, 'pad': 'x' * 200}} for i in range(12)])
+        with patch('agent_collab.node_agent.EVENT_BATCH_BYTES', 1024):
+            complete = self.run_to_completion(task)
+        self.assertEqual(complete['outcome'], 'succeeded')
+        progress = [e for e in self.fake.events.values() if e['event']['type'] == 'attempt.progress']
+        self.assertEqual(len(progress), 12)
+        self.assertGreater(sum(path.endswith('/events') for _, path in self.fake.calls), 3)
+        self.assertFalse(self.attempt(task).events)
+
+    def test_malformed_controller_reply_disconnects_instead_of_crashing(self):
+        self.cycles()
+        with patch.object(self.agent, 'heartbeat', side_effect=KeyError('drain')):
+            self.agent.next_network = self.agent.next_heartbeat = 0  # 本周期必然发心跳
+            self.agent.cycle()
+        self.assertFalse(self.agent.connected)
+        self.assertEqual(self.agent.last_error['error']['details']['reason'], 'protocol')
+
+    def test_bad_integration_item_does_not_block_other_items(self):
+        good = self.integration_item()
+        bad = dict(self.integration_item(), checkpoint_id='not-a-uuid')
+        self.agent.integrations([bad, good])
+        self.assertEqual((Path(good['target_path']) / 'changed').read_bytes(), b'new')
+        self.assertEqual((Path(bad['target_path']) / 'changed').read_bytes(), b'old')
+
+    def test_superseded_integration_is_not_written_and_lease_is_retried(self):
+        item = self.integration_item()
+        changed = Path(item['target_path']) / 'changed'
+        self.fake.integration_error = dict(reason='coordinator_lease')
+        self.heartbeat_item(item)
+        self.assertEqual(changed.read_bytes(), b'old')
+        progress = json.loads(next((self.data / 'integrations').glob('*/*/progress.json')).read_text(encoding='utf-8'))
+        self.assertFalse(progress['reported'])
+        # 交付已被替代：409 不再让心跳失败，也绝不写目标目录。
+        self.fake.integration_error = dict(reason='superseded')
+        self.agent.heartbeat()
+        self.assertEqual(changed.read_bytes(), b'old')
+        progress = json.loads(next((self.data / 'integrations').glob('*/*/progress.json')).read_text(encoding='utf-8'))
+        self.assertTrue(progress['reported'] and progress['superseded'])
+        self.assertFalse(self.fake.integrations)
+
+    def test_delivery_superseded_while_fetching_blobs_is_not_written(self):
+        item = self.integration_item()
+        fetch = self.agent.fetch_blob
+        def fetch_then_supersede(sha):
+            self.fake.integration_error = dict(reason='superseded')  # 取 blob 期间有新发布
+            return fetch(sha)
+        with patch.object(self.agent, 'fetch_blob', side_effect=fetch_then_supersede):
+            self.agent.integrations([item])
+        self.assertEqual((Path(item['target_path']) / 'changed').read_bytes(), b'old')
+        self.assertEqual([r['status'] for r in self.fake.integrations], ['integration_pending'])
+
+    def test_check_named_dot_dot_stays_inside_attempt_directory(self):
+        task = self.fake.add()
+        task['contract']['checks'] = [dict(name='..', run=['{python}', '-c', 'print("ok")'])]
+        complete = self.run_to_completion(task)
+        self.assertEqual(complete['report']['checks']['results'][0]['exit_code'], 0)
+        self.assertTrue((self.attempt(task).directory / 'checks' / '0').is_dir())
 
     def test_conflict_does_not_overwrite_and_non_target_ignores(self):
         item = self.integration_item()

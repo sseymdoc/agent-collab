@@ -110,11 +110,15 @@ class StubAdapter:
             stopped = self.process.stop()
             self.context.process_stopped(stopped)
             self.capture(result, code)
-            self.process = None
-            if code != 0 or not stopped:
+            if not stopped:
+                # 进程树未确认清空：隔离（与 codex/claude/契约检查一致），不让控制器另起替代执行。
                 self.done = True
-                self.context.finish('failed', 'code_failure' if stopped else 'infra_retryable',
-                                    'stub command failed')
+                self.context.quarantine('stub process termination could not be verified')
+                return
+            self.process = None
+            if code != 0:
+                self.done = True
+                self.context.finish('failed', 'code_failure', 'stub command failed')
                 return
         else:
             raise ValueError('unknown stub step: ' + str(op))

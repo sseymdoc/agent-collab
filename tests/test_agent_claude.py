@@ -29,6 +29,7 @@ class ClaudeTests(unittest.TestCase):
         self.temp = Path(tempfile.mkdtemp(dir=str(ROOT / '.dev/tmp')))
         self.addCleanup(shutil.rmtree, str(self.temp))
         (self.temp / 'decision-schema.json').write_bytes(p.canonical_json(d.DECISION_SCHEMA))
+        (self.temp / 'context.json').write_bytes(p.canonical_json({'job': {}}))  # controller 提供的输入文件
 
     def test_exact_argv_has_configured_profile_read_only_and_inline_schema(self):
         session = uid()
@@ -36,7 +37,7 @@ class ClaudeTests(unittest.TestCase):
         argv = build_argv('/custom/claude', params, d.DECISION_SCHEMA, session)
         self.assertEqual(argv, ['/custom/claude', '-p', '--model', PROFILE['model'], '--effort', PROFILE['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(d.DECISION_SCHEMA).decode(),
-            '--permission-mode', 'dontAsk', '--allowedTools', 'Read', '--session-id', session])
+            '--permission-mode', 'dontAsk', '--tools', '', '--session-id', session])
         for value in ({}, {'model': 'x'}, {'model': 'x', 'effort': ''}):
             with self.assertRaises(ValueError):
                 build_argv('claude', value, d.DECISION_SCHEMA, session)
@@ -59,7 +60,7 @@ class ClaudeTests(unittest.TestCase):
             def __init__(self, argv, cwd, directory, stdin, env):
                 case.assertEqual(argv[0], '/custom/claude')
                 case.assertEqual(cwd, case.temp)
-                case.assertIn(b'Read context.json', stdin)
+                case.assertIn(b'<context.json>', stdin)
                 case.assertIn(b'Do not write files or execute commands', stdin)
                 case.assertIn(b'controller generates the complete Codex repair contract', stdin)
                 case.assertIn(b'Do not write a contract', stdin)
@@ -209,7 +210,7 @@ class ClaudeAgentControllerTests(ControllerCase):
         config_path.write_bytes(p.canonical_json(config))
         script = self.temp / 'claude_stub.py'
         script.write_text('import json, pathlib, sys\n'
-            'assert "Read context.json" in sys.stdin.read()\n'
+            'assert "<context.json>" in sys.stdin.read()\n'
             'c = json.loads(pathlib.Path("context.json").read_text())\n'
             'schema = json.loads(sys.argv[sys.argv.index("--json-schema")+1])\n'
             'assert "assessment" in schema["required"]\n'
@@ -229,7 +230,9 @@ class ClaudeAgentControllerTests(ControllerCase):
                       auth_runner=no_auth, commands=commands)
         self.addCleanup(agent.close)
         with patch('agent_collab.node_agent.ClaudeAdapter', side_effect=adapter):
-            for _ in range(100):
+            # 按挂钟时间等待：Windows 运行器上 Python 子进程启动可能超过 1 秒，固定 100 次循环不够。
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
                 agent.cycle()
                 self.clock.advance(.1)
                 if self.current(job)['acceptance']['status'] == 'passed':
