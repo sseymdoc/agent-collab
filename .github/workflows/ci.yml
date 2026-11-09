@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: '3.13' }
+          - { os: windows-latest, python: '3.13' }
+          - { os: macos-latest, python: '3.13' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: unittest
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          if [ -d tests ]; then python -B -m unittest discover -s tests -v; else echo "no tests yet"; fi
+
+  tests-py39:
+    # 最低支持版本：用官方镜像，不依赖托管运行器是否仍提供 3.9。
+    name: tests (python:3.9-slim)
+    runs-on: ubuntu-latest
+    container: python:3.9-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: unittest
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          if [ -d tests ]; then python -B -m unittest discover -s tests -v; else echo "no tests yet"; fi
+
+  ui:
+    name: ui build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: detect ui
+        id: ui
+        run: if [ -f ui/package.json ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/setup-node@v4
+        if: steps.ui.outputs.present == 'true'
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: type-check and build
+        if: steps.ui.outputs.present == 'true'
+        working-directory: ui
+        run: npm ci && node build.mjs

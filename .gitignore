@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+/build/
+/dist/
+*.egg-info/
+/.dev/
+/ui/node_modules/
+/ui/dist/
+/agent_collab/static/
+*.db
+*.db-wal
+*.db-shm
+admin.token
+node.token
