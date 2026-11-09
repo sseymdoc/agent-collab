@@ -133,20 +133,26 @@ class CodexTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == 'nt', 'POSIX process-group suspend/resume')
     def test_pause_after_leader_exit_still_suspends_descendants(self):
-        marker = self.temp / 'late-write'
-        code = ('import subprocess, sys; subprocess.Popen([sys.executable, "-c", '
-                '"import time, pathlib; time.sleep(1.5); pathlib.Path(%r).write_text(\'x\')"])' % str(marker))
+        ready, release, marker = self.temp / 'ready', self.temp / 'release', self.temp / 'late-write'
+        # 后代先报就绪，再等放行文件才写 marker：挂起前不会写，挂起后看不到放行，与机器快慢无关。
+        child = ('import pathlib, time\n'
+                 'pathlib.Path(%r).write_text("1")\n'
+                 'while not pathlib.Path(%r).exists(): time.sleep(.02)\n'
+                 'pathlib.Path(%r).write_text("x")\n') % (str(ready), str(release), str(marker))
+        code = 'import subprocess, sys; subprocess.Popen([sys.executable, "-c", %r])' % child
         process = OwnedProcess([sys.executable, '-c', code], self.temp, self.temp / 'logs')
         self.addCleanup(process.stop)
-        deadline = time.monotonic() + 10
-        while process.poll() is None and time.monotonic() < deadline:
+        deadline = time.monotonic() + 20
+        while (process.poll() is None or not ready.exists()) and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertIsNotNone(process.poll())
+        self.assertTrue(ready.exists())
         self.assertTrue(process.pause())
-        time.sleep(3)
+        release.write_text('go')
+        time.sleep(1)
         self.assertFalse(marker.exists())  # 组长已退出，但后代被一并挂起
         self.assertTrue(process.stop())
-        time.sleep(2)
+        time.sleep(1)
         self.assertFalse(marker.exists())  # stop 清掉整个进程组，后代不会在恢复后补写
 
     def run_fake_codex(self, events):

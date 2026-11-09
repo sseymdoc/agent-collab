@@ -163,6 +163,26 @@ class ClientAndAdapterTests(unittest.TestCase):
         context.finish.assert_not_called()
 
 
+    def test_check_spawn_failure_with_unverified_stop_stays_unverified(self):
+        from agent_collab.adapters.checks import ContractChecks
+        process = Mock()
+        process.stop.return_value = False
+        context = Mock(work=Path('.'), directory=Path('.'), contract={'checks': [{'name': 'c', 'run': ['x']}]})
+        context.can_execute.return_value = True
+        context.clock.return_value = 0
+        verdicts = []
+        context.process_stopped.side_effect = verdicts.append
+        runner = ContractChecks(context)
+        def start(*args):
+            runner.process = process  # 与 Attempt.start_process 一致：先登记句柄，再落盘失败
+            raise OSError('persist failed')
+        context.start_process.side_effect = start
+        context.quarantine.side_effect = lambda reason: runner.stop()  # 真实 quarantine 会再停一次
+        runner.tick()
+        context.quarantine.assert_called_once()
+        self.assertEqual(verdicts, [False, False])  # 第二次停止也如实记为未确认，不会被覆盖成 True
+
+
 class RuntimeRC5Tests(unittest.TestCase):
     setUp = runtime.RuntimeTests.setUp
     cycles = runtime.RuntimeTests.cycles
@@ -376,6 +396,34 @@ class RuntimeRC5Tests(unittest.TestCase):
                          ['integration_pending', 'integration_pending', 'integrated', 'integrated'])
         self.assertEqual(self.fake.integrations[-1], record)
 
+    def test_error_with_unverified_stop_quarantines_instead_of_failing(self):
+        task = self.fake.add([{'sleep': 100}])
+        self.until(lambda: task['attempt_id'] in self.agent.attempts and self.attempt(task).adapter is not None
+                   and self.attempt(task).meta['state'] == 'running')
+        attempt = self.attempt(task)
+        with patch.object(attempt.adapter, 'tick', side_effect=OSError('read failed')), \
+                patch.object(attempt.adapter, 'stop', return_value=False):
+            attempt.tick()
+        self.assertEqual(attempt.meta['state'], 'quarantined')
+        self.assertTrue(attempt.meta['restart_unknown'])
+        self.assertIsNone(attempt.meta.get('completion'))
+
+    def test_malformed_events_reply_disconnects_without_failing_attempt(self):
+        task = self.fake.add([{'progress': {'n': 1}}])
+        bad = {'on': True, 'hits': 0}
+        def transport(method, url, headers, body):
+            if bad['on'] and url.endswith('/events'):
+                bad['hits'] += 1
+                return 200, {}, b'<html>proxy error</html>'
+            return self.fake(method, url, headers, body)
+        self.agent.client.transport = transport
+        self.cycles(30)
+        self.assertGreater(bad['hits'], 0)
+        self.assertNotIn(task['attempt_id'], self.fake.completions)
+        bad['on'] = False
+        complete = self.run_to_completion(task)
+        self.assertEqual(complete['outcome'], 'succeeded')  # 不是 code_failure
+
     def test_events_are_sent_in_bounded_batches(self):
         task = self.fake.add([{'progress': {'n': i, 'pad': 'x' * 200}} for i in range(12)])
         with patch('agent_collab.node_agent.EVENT_BATCH_BYTES', 1024):
@@ -385,6 +433,15 @@ class RuntimeRC5Tests(unittest.TestCase):
         self.assertEqual(len(progress), 12)
         self.assertGreater(sum(path.endswith('/events') for _, path in self.fake.calls), 3)
         self.assertFalse(self.attempt(task).events)
+
+    def test_event_batch_halves_on_controller_size_limit(self):
+        # controller 的 max_json_bytes 比本地 512 KiB 分批上限还小：收到 413 后减半重试直到送达。
+        self.fake.max_json_bytes = 3000
+        task = self.fake.add([{'progress': {'n': i, 'pad': 'x' * 200}} for i in range(12)])
+        complete = self.run_to_completion(task)
+        self.assertEqual(complete['outcome'], 'succeeded')
+        progress = [e for e in self.fake.events.values() if e['event']['type'] == 'attempt.progress']
+        self.assertEqual(len(progress), 12)
 
     def test_malformed_controller_reply_disconnects_instead_of_crashing(self):
         self.cycles()
@@ -397,7 +454,7 @@ class RuntimeRC5Tests(unittest.TestCase):
     def test_bad_integration_item_does_not_block_other_items(self):
         good = self.integration_item()
         bad = dict(self.integration_item(), checkpoint_id='not-a-uuid')
-        self.agent.integrations([bad, good])
+        self.agent.integrations(['not-an-object', bad, good])
         self.assertEqual((Path(good['target_path']) / 'changed').read_bytes(), b'new')
         self.assertEqual((Path(bad['target_path']) / 'changed').read_bytes(), b'old')
 

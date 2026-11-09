@@ -47,12 +47,12 @@ class ContractChecks:
             except OSError:
                 # start_process 可能已启动并登记了子进程，随后才在落盘时失败：先停掉它，确认不了就隔离。
                 if self.process is not None:
-                    stopped = self.process.stop()
-                    self.process = None
-                    if not stopped:
+                    if not self.process.stop():
+                        # 保留 self.process：quarantine 会经 stop() 再试一次并如实记录，不能被当成“已确认停止”。
                         self.context.process_stopped(False)
                         self.context.quarantine('check process termination could not be verified')
                         return
+                    self.process = None
                 self.context.process_stopped(True)
                 self.results.append(dict(name=check['name'], argv=argv, exit_code=None, timed_out=False,
                     duration_s=max(0, self.context.clock() - self.started), stdout_tail='', stderr_tail='Check could not start'))

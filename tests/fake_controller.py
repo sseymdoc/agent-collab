@@ -44,6 +44,7 @@ class FakeController:
         self.missing_once = False
         self.version_mismatch = False
         self.integration_error = None
+        self.max_json_bytes = None
         self.fail_put_after = None
         self.puts = []
         self.checkpoint_requests = []
@@ -133,6 +134,8 @@ class FakeController:
             identity, operation = parts[1:]
             stale = self.fenced(identity, value)
             if operation == 'events':
+                if self.max_json_bytes is not None and len(body) > self.max_json_bytes:
+                    return self.response(413, p.error_body('too_large', 'request body too large', limit=self.max_json_bytes))
                 accepted, duplicates = [], []
                 for event in value['events']:
                     key = event['event_id']
@@ -185,7 +188,8 @@ class FakeController:
                 assignment = self.issued.get(job)
                 # 发布必须来自该 job 的 attempt、引用本 attempt 的检查点，且基于当前交付版本。
                 if (not assignment or assignment['attempt_id'] != value['attempt_id'] or
-                        self.checkpoint_owner.get(value['checkpoint_id']) != value['attempt_id']):
+                        self.checkpoint_owner.get(value['checkpoint_id']) != value['attempt_id'] or
+                        self.checkpoints[value['checkpoint_id']]['kind'] != 'final'):
                     return self.error('conflict')
                 if self.version_mismatch or value.get('expected_base_version') != assignment['delivery_version']:
                     return self.error('version_mismatch')

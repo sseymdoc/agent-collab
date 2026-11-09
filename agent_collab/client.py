@@ -132,7 +132,13 @@ class Client:
 
     def json(self, method, path, value=None):
         status, data = self.request(method, path, value)
-        return None if status == 204 else json.loads(data)
+        if status == 204:
+            return None
+        try:
+            return json.loads(data)
+        except ValueError:
+            # 代理/网关返回的 HTML 等：按控制端不可用处理（断开、退避、重新对账），不能让 attempt 记成代码失败。
+            raise ConnectionFailure('controller returned a non-JSON response') from None
 
     def fetch_blob(self, sha):
         p.check_sha256(sha)

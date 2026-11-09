@@ -247,7 +247,17 @@ def group_empty(pid):
     except ProcessLookupError:
         return True
     except PermissionError:
-        pass  # macOS 在组内只剩僵尸进程时也返回 EPERM；交给下面的 ps 判断（忽略僵尸）
+        pass  # macOS 在组内只剩僵尸进程时也返回 EPERM；交给下面按状态判断（忽略僵尸）
+    if Path('/proc/self/stat').exists():
+        # Linux 直接读 /proc：精简容器常没有 ps，且 PID 1 可能不回收孤儿，组内会长期留着僵尸。
+        for stat in Path('/proc').glob('[0-9]*/stat'):
+            try:
+                fields = stat.read_text().rsplit(')', 1)[1].split()  # comm 可含空格/括号，取最后一个 ')' 之后
+            except (OSError, IndexError):
+                continue  # 进程刚退出
+            if len(fields) > 2 and fields[2] == str(pid) and fields[0] not in ('Z', 'X'):
+                return False
+        return True
     try:
         result = subprocess.run(['/bin/ps', '-eo', 'pgid=', '-o', 'stat='], capture_output=True, text=True)
     except OSError:

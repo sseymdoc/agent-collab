@@ -433,25 +433,44 @@ class Attempt:
                 else:
                     self.adapter.tick()
             except (ValueError, OSError, KeyError, TypeError) as exc:
-                self.adapter.stop()
-                if self.check_runner:
-                    self.check_runner.stop()
-                failure = ('capability_missing' if isinstance(exc, FileNotFoundError) else
-                           'infra_retryable' if isinstance(exc, OSError) else 'code_failure')
-                self.finish('failed', failure, str(exc))
+                self.abort('capability_missing' if isinstance(exc, FileNotFoundError) else
+                           'infra_retryable' if isinstance(exc, OSError) else 'code_failure', str(exc))
+
+    def abort(self, failure, message):
+        """出错后停止 harness 与检查进程；停止无法确认时隔离（阻止领取并复查），否则以 failure 结束。"""
+        stopped = self.adapter.stop() if self.adapter else True
+        if self.check_runner:
+            stopped = self.check_runner.stop() and stopped
+        if not stopped:
+            self.quarantine('process termination could not be verified after error: ' + message)
+            return
+        self.finish('failed', failure, message)
 
     def flush_events(self):
         # 分区期间积压的事件可能超过 controller 的 max_json_bytes（缺省 2 MiB）；整批发送会一直 413，
         # attempt 永远停在 finished_unreported。按大小分批，保留原 event_id，未确认的继续留在队列。
+        limit = EVENT_BATCH_BYTES
         while self.events:
             batch, size = [], 0
             for event in self.events:
-                size += len(p.canonical_json(event)) + 1
-                if batch and size > EVENT_BATCH_BYTES:
+                item = len(p.canonical_json(event)) + 1
+                if batch and size + item > limit:
                     break
                 batch.append(event)
-            response = self.agent.client.json('POST', '/attempts/' + self.id + '/events',
-                                              self.fenced_body(events=batch))
+                size += item
+            try:
+                response = self.agent.client.json('POST', '/attempts/' + self.id + '/events',
+                                                  self.fenced_body(events=batch))
+            except APIError as exc:
+                # controller 的 max_json_bytes 可配得比本地分批上限小：413 时减半重试，单个事件仍超限才上抛。
+                if exc.status != 413 or len(batch) == 1:
+                    raise
+                limit = max(1, size // 2)
+                continue
+            if (not isinstance(response, dict) or not isinstance(response.get('accepted'), list)
+                    or not isinstance(response.get('duplicates'), list)):
+                # 回复形状不对是控制端/代理问题，不是这个 attempt 的代码失败：交给 cycle() 断开并退避。
+                raise ConnectionFailure('invalid controller response to events')
             acknowledged = set(response['accepted']) | set(response['duplicates'])
             remaining = [event for event in self.events if event['event_id'] not in acknowledged]
             atomic_write(self.events_path, b''.join(p.canonical_json(event) + b'\n' for event in remaining))
@@ -698,8 +717,8 @@ class Agent:
         for item in items:
             try:
                 self.integrate_item(item)
-            except (ValueError, KeyError, TypeError) as exc:
-                # 单个坏条目（身份变化、manifest 不规范、哈希不符）只跳过并记录，不让整个心跳失败。
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                # 单个坏条目（含非对象条目）（身份变化、manifest 不规范、哈希不符）只跳过并记录，不让整个心跳失败。
                 LOG.warning('Integration item %s rejected: %s', item.get('job_id') if isinstance(item, dict) else None, exc)
 
         # A controller may have committed a receipt but lost its response and
@@ -859,9 +878,7 @@ class Agent:
                             attempt.meta['error'] = self.clean(exc.body)
                             attempt.persist()
                     except (ValueError, OSError, KeyError, TypeError) as exc:
-                        if attempt.adapter:
-                            attempt.adapter.stop()
-                        attempt.finish('failed', 'code_failure', str(exc))
+                        attempt.abort('code_failure', str(exc))
                 if claim_allowed:
                     self.claim()
                 self.backoff.reset()

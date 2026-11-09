@@ -61,7 +61,8 @@ Codex 模型固定为 `gpt-6-astra`；effort 仅 `high/xhigh/max`，默认 `xhig
 `/usr/local/bin`。Windows 使用 PATHEXT，排除 WindowsApps 应用执行别名。探测与执行共用绝对 argv 和环境，
 PATH 前置该可执行文件目录，不加载 shell rc；Codex 线程来源变量被清除，显式 codex_home 同时用于所有探测。
 `capabilities.harness_paths` 给出路径或 null；tools 与 harness 的版本来自同一次探测。
-启动时及之后每隔 `auth_probe_s`（缺省 900 秒）在后台调用 `codex login status` / `claude auth status`（20 秒超时），只保留 ok/expired/unknown，
+启动时同步调用一次 `codex login status` / `claude auth status`（各 20 秒超时，最坏约 40 秒后才进入主循环），
+之后每隔 `auth_probe_s`（缺省 900 秒）在后台调用，只保留 ok/expired/unknown，
 不保存账户标识、凭据或命令输出。超时及无法识别的结果为 unknown，明确未登录为 expired。
 Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.sandbox="elevated"`（可配置）。
 已有 model、effort、approval_policy、sandbox_workspace_write 隔离参数继续显式传递。
