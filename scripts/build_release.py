@@ -69,18 +69,28 @@ def build_release(source, output, version):
     existing = [str(p) for p in paths if p.exists()]
     if existing:
         raise ValueError('release already exists; use a new version: ' + ', '.join(existing))
-    with tarfile.open(str(paths[0]), 'w:gz') as archive:
-        for name, data in sorted(files.items()):
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            info.mode = 0o755 if name.endswith('.sh') else 0o644
-            archive.addfile(info, io.BytesIO(data))
-    with zipfile.ZipFile(str(paths[1]), 'w', zipfile.ZIP_DEFLATED) as archive:
-        for name, data in sorted(files.items()):
-            info = zipfile.ZipInfo(name)
-            info.create_system = 3
-            info.external_attr = (0o100755 if name.endswith('.sh') else 0o100644) << 16
-            archive.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED)
+    # 两个包都先写到临时名，全部写完才改名发布：中途失败或被打断只留下会被清理的临时文件，
+    # 不会留下半个包挡住同版本重试。
+    stage = [Path('{}.partial-{}'.format(p, os.getpid())) for p in paths]
+    try:
+        with tarfile.open(str(stage[0]), 'w:gz') as archive:
+            for name, data in sorted(files.items()):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o755 if name.endswith('.sh') else 0o644
+                archive.addfile(info, io.BytesIO(data))
+        with zipfile.ZipFile(str(stage[1]), 'w', zipfile.ZIP_DEFLATED) as archive:
+            for name, data in sorted(files.items()):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (0o100755 if name.endswith('.sh') else 0o100644) << 16
+                archive.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED)
+        for temporary, final in zip(stage, paths):
+            os.replace(str(temporary), str(final))
+    finally:
+        for temporary in stage:
+            if temporary.exists():
+                temporary.unlink()
     return paths
 
 

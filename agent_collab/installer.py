@@ -144,12 +144,13 @@ def read_installed(directory):
     files = {}
     for path in directory.rglob('*'):
         relative = path.relative_to(directory)
+        # 符号链接先拒绝（含 __pycache__ 里的链接：Python 加载 .pyc 时会跟随它）。
+        if path.is_symlink():
+            raise ValueError('installed release contains a symlink')
         # 不带 -B 运行（如直接 python -m agent_collab）会生成 __pycache__：解释器缓存不是发行内容，
         # 不能因此让 doctor、同版本重装与回退判定版本目录被改动。
         if '__pycache__' in relative.parts:
             continue
-        if path.is_symlink():
-            raise ValueError('installed release contains a symlink')
         if path.is_file():
             files[relative.as_posix()] = path.read_bytes()
     return validate_payload(files)
@@ -838,8 +839,9 @@ def ensure_state(config, directory, manifest):
     if 'controller' in components(config):
         # 新前缀或卸载后重装时没有旧安装记录，但可能保留着旧数据库：先确认目标版本支持它，
         # 再运行目标代码初始化（admin-token 会打开数据库并写事件）。
-        if (state / 'controller/controller.db').exists():
-            compatible_schema(config, manifest, directory)
+        # 不在这里 exists()：安装器身份可能进不去 0700 的 controller 目录（3.9 抛 PermissionError，3.14 返回 False 而跳过检查）。
+        # compatible_schema 在受管 Linux 上以 controller 账户检查，数据库不存在时返回 unknown。
+        compatible_schema(config, manifest, directory)
         package_command(config, directory, 'controller', 'admin-token', '--data-dir', str(state / 'controller'), controller_user=True)
 
 

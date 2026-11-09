@@ -2,6 +2,9 @@
 
 安装、升级、回退、卸载的完整参数见 [install.md](install.md)。本页只列日常操作；`<CONTROLLER>` 为公开入口（如 `https://controller.example:8443`），`<DATA>` 为 controller 状态目录（Linux 默认 `/var/lib/agent-collab/controller`）。下述定时备份安装命令是待部署步骤，单元测试通过不代表已注册或已验证真实云端任务。
 
+本页的 `"$PREFIX/bin/agent-collab"` 是安装器生成的入口（使用安装记录的解释器并从 `current` 运行）；
+默认安装不会把 `agent_collab` 加入全局 Python 路径，在普通目录下 `python -m agent_collab` 无法导入。
+
 ## 访问与身份
 
 | 操作 | 命令 |
@@ -9,7 +12,7 @@
 | 健康检查（无需认证） | `curl -fsS <CONTROLLER>/healthz` |
 | 管理令牌位置 | `<DATA>/admin.token`（0600，属服务用户）；UI 登录与 CLI 管理调用使用；恢复到新目录后首次启动生成新令牌，原目录恢复保留原令牌 |
 | UI | 浏览器打开 `<CONTROLLER>/`，输入管理令牌；会话为 HttpOnly Cookie，刷新可自动取回 CSRF |
-| CLI 管理调用 | `python -m agent_collab api GET /overview --url <CONTROLLER> --token-file <DATA>/admin.token`（证书始终校验；非 loopback 必须 https） |
+| CLI 管理调用 | `"$PREFIX/bin/agent-collab" api GET /overview --url <CONTROLLER> --token-file <DATA>/admin.token`（证书始终校验；非 loopback 必须 https）。Linux 受管安装中令牌文件仅 `agent-collab` 可读：在 controller 主机上以 `runuser -u agent-collab --` 执行，或改用已安全交给执行用户、仅其可读的令牌副本 |
 | doctor | `"$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role controller` |
 
 ## 节点配对
@@ -23,10 +26,10 @@ cd /opt/agent-collab/current && runuser -u agent-collab -- python3 -B -m agent_c
 在节点上（Windows 与同机 WSL 使用相同 `--physical-host-id` / `--failure-domain`，`--host-slots` 为该主机总并发）：
 
 ```sh
-python3 -m agent_collab.node_agent pair --controller <CONTROLLER> --code <配对码> --node-id <节点名> \
+"$PREFIX/bin/agent-collab" agent pair --controller <CONTROLLER> --code <配对码> --node-id <节点名> \
   --data-dir <节点数据目录> --physical-host-id <主机> --failure-domain <故障域> --slots 1 --host-slots 2
-python3 -m agent_collab.node_agent doctor --data-dir <节点数据目录>
-python3 -m agent_collab.node_agent run --data-dir <节点数据目录> --foreground   # 由服务托管时不需手动运行
+"$PREFIX/bin/agent-collab" agent doctor --data-dir <节点数据目录>
+"$PREFIX/bin/agent-collab" agent run --data-dir <节点数据目录> --foreground   # 由服务托管时不需手动运行
 ```
 
 节点数据目录必须在本机磁盘。受管协调节点需在 `agent.json` 设置 `claude_command`（Claude Code 可执行文件路径），并由用户在该机本地完成官方登录；本系统不复制凭据。
@@ -35,14 +38,14 @@ python3 -m agent_collab.node_agent run --data-dir <节点数据目录> --foregro
 
 ```sh
 # 排空：不再领取新任务；migrate=true 时把可安全迁移的 attempt（已受保护、无外部副作用、有确认检查点或基线）迁到其他合格节点
-python -m agent_collab api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":true,"migrate":true}' --url <CONTROLLER> --token-file <DATA>/admin.token
+"$PREFIX/bin/agent-collab" api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":true,"migrate":true}' --url <CONTROLLER> --token-file <DATA>/admin.token
 # 解除排空
-python -m agent_collab api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":false}' --url <CONTROLLER> --token-file <DATA>/admin.token
+"$PREFIX/bin/agent-collab" api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":false}' --url <CONTROLLER> --token-file <DATA>/admin.token
 # 明确迁移/续接某个工作包（计入迁移预算，从最近确认检查点新建 attempt）。
 # 要离开当前节点就把它列入 exclude_node_ids；留空表示只续接，调度器仍可能选回原节点。
-python -m agent_collab api POST /jobs/<job_id>/retry --data '{"expected_version":<版本>,"reason":"<原因>","exclude_node_ids":["<源节点名>"]}' --url <CONTROLLER> --token-file <DATA>/admin.token
+"$PREFIX/bin/agent-collab" api POST /jobs/<job_id>/retry --data '{"expected_version":<版本>,"reason":"<原因>","exclude_node_ids":["<源节点名>"]}' --url <CONTROLLER> --token-file <DATA>/admin.token
 # 请求取消（不会触发自动恢复；节点确认后为 cancelled）
-python -m agent_collab api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file <DATA>/admin.token
+"$PREFIX/bin/agent-collab" api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file <DATA>/admin.token
 ```
 
 `<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点从确认检查点继续。
@@ -231,4 +234,4 @@ controller `config.json`：
 
 ## 旧任务
 
-codex-collaborate 旧任务继续由原 launcher 管理；只读查看：`python -m agent_collab legacy list --state-root <旧状态目录>`。
+codex-collaborate 旧任务继续由原 launcher 管理；只读查看：`"$PREFIX/bin/agent-collab" legacy list --state-root <旧状态目录>`。

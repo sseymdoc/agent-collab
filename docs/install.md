@@ -239,10 +239,12 @@ worker 的 status.json 必须来自新版本目录、匹配 version/git_commit�
 
 ```sh
 cd /opt/agent-collab/versions/<支持该备份的版本>
-runuser -u agent-collab -- python3 -B -m agent_collab.controller restore \
+runuser -u agent-collab -- <PYTHON> -B -m agent_collab.controller restore \
   --data-dir /var/lib/agent-collab/controller --from /var/lib/agent-collab/backups/upgrade-...
 ```
 
+`<PYTHON>` 用本次安装记录的解释器（安装时的 `--python`，见 `/opt/agent-collab/installation.json` 的
+`config.python`），不要换成系统里随手找到的 `python3`：它可能不存在或低于 3.9。
 非 Linux 受管安装换成对应的 `--prefix`/`--state-dir`，并以安装时的用户执行。
 
 restore 会递增 `authority_generation`、撤销旧租约、暂停派单，并要求人工对账；不要手工覆盖数据库或只改 current。

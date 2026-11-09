@@ -50,6 +50,12 @@ class WorkerInstallTests(unittest.TestCase):
         cache.mkdir(exist_ok=True)
         (cache / 'cli.cpython-313.pyc').write_bytes(b'cache')
         self.assertEqual(ins.read_installed(version)['version'], '1.0.0')
+        if os.name != 'nt':  # 缓存目录里的符号链接仍被拒绝（Windows 建链接需要特权）
+            (self.temp / 'elsewhere.pyc').write_bytes(b'tampered')
+            (cache / 'evil.cpython-313.pyc').symlink_to(self.temp / 'elsewhere.pyc')
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                ins.read_installed(version)
+            (cache / 'evil.cpython-313.pyc').unlink()
         (version / 'agent_collab/extra.py').write_text('x')  # 真正的多余文件仍被拒绝
         with self.assertRaises(ValueError):
             ins.read_installed(version)
@@ -302,6 +308,21 @@ class ReleaseAndCliReviewTests(unittest.TestCase):
                       ['agent_collab/x', 'agent_collab/x/y.py']):          # 文件又是目录
             with self.assertRaises(ValueError):
                 ins.check_release_tree(names)
+
+    def test_interrupted_build_leaves_no_partial_release(self):
+        out = self.temp / 'staged'
+        real = legacy.builder.zipfile.ZipFile
+
+        def broken(*args, **kwargs):
+            raise OSError('disk full')
+
+        with patch.object(legacy.builder.zipfile, 'ZipFile', side_effect=broken):
+            with self.assertRaises(OSError):
+                legacy.builder.build_release(self.root, out, '7.7.7')
+        self.assertEqual(list(out.iterdir()), [])  # 连 tar.gz 也没有发布，临时文件已清理
+        self.assertIs(legacy.builder.zipfile.ZipFile, real)
+        paths = legacy.builder.build_release(self.root, out, '7.7.7')  # 同版本可以直接重试
+        self.assertTrue(all(p.exists() for p in paths))
 
     def test_build_validates_before_writing_and_refuses_existing_version(self):
         out = self.temp / 'out'

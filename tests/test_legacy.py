@@ -69,6 +69,10 @@ class LegacyProjectionTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             legacy.main(['list', '--state-root', str(missing)])
         self.assertEqual(raised.exception.code, 2)
+        unrelated = self.root / 'unrelated'  # 存在但不是状态目录（没有 tasks/）
+        unrelated.mkdir()
+        with self.assertRaisesRegex(ValueError, 'tasks/'):
+            legacy.read_tasks(unrelated)
 
 
 if __name__ == '__main__':

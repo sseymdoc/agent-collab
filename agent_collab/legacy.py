@@ -54,6 +54,10 @@ def read_tasks(state_root):
         # 路径写错时不能输出 [] 并成功退出：那与“确实没有旧任务”无法区分。
         raise ValueError('state root not found: ' + str(state_root))
     root = Path(state_root) / 'tasks'
+    if not root.is_dir():
+        # 原 launcher 在第一个任务时才建 tasks/：没有它要么不是状态目录，要么从未运行过任务，都要明说。
+        raise ValueError('no tasks/ under state root (not a codex-collaborate state root, or no task has run): '
+                         + str(state_root))
     out = []
     for d in sorted(root.glob('*/*')):
         p = project(d) if d.is_dir() else None
