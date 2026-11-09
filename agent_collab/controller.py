@@ -1308,10 +1308,13 @@ class App:
         now = self.clock()
         job = self.get('job', attempt['job_id']) if attempt['job_id'] else None
         if job is None:
+            # 只计新事件：响应丢失后的重发会作为 duplicates 成功返回，不能重复消耗配额。
+            fresh = sum(1 for event in data['events'] if not isinstance(event, dict) or not self.store.db.execute(
+                'SELECT 1 FROM event_keys WHERE event_id=?', (str(event.get('event_id')),)).fetchone())
             used = self.store.get('archive_quota', attempt['node_id'], 0)
-            if used + len(data['events']) > ARCHIVE_EVENT_LIMIT:
+            if used + fresh > ARCHIVE_EVENT_LIMIT:
                 raise APIError('too_large', 'archive-only event quota exceeded for node', limit=ARCHIVE_EVENT_LIMIT)
-            self.store.put('archive_quota', attempt['node_id'], used + len(data['events']))
+            self.store.put('archive_quota', attempt['node_id'], used + fresh)
         for event in data['events']:
             ident = require_uuid(event['event_id'], 'event_id')
             if event['type'] not in p.NODE_EVENT_TYPES or not isinstance(event.get('payload'), dict):

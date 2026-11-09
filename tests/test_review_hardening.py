@@ -179,8 +179,12 @@ class ControllerHardeningTests(ControllerCase):
         meta['authority_generation'] = 2  # 等价于恢复过备份
         self.app.store.put('meta', 'controller', meta)
         with patch.object(c, 'ARCHIVE_EVENT_LIMIT', 3):
-            self.call('POST', '/attempts/' + uid() + '/events', self.events(2), token=node.token)
-            self.call('POST', '/attempts/' + uid() + '/events', self.events(2), token=node.token, status=413)
+            first, attempt = self.events(2), uid()
+            self.call('POST', '/attempts/' + attempt + '/events', first, token=node.token)
+            replay = self.call('POST', '/attempts/' + attempt + '/events', first, token=node.token)  # 响应丢失后的重发
+            self.assertEqual(len(replay['duplicates']), 2)
+            self.call('POST', '/attempts/' + uid() + '/events', self.events(1), token=node.token)  # 重发不占配额
+            self.call('POST', '/attempts/' + uid() + '/events', self.events(1), token=node.token, status=413)
 
 
 class StubAdmissionTests(unittest.TestCase):
@@ -201,9 +205,6 @@ class StubAdmissionTests(unittest.TestCase):
             with self.subTest(step=step), self.assertRaises(ValueError):
                 d.validate_contract(self.contract([step]))
 
-
-if __name__ == '__main__':
-    unittest.main()
 
 
 @unittest.skipIf(shutil.which('openssl') is None, 'needs openssl to create a throwaway certificate')
@@ -253,3 +254,7 @@ class DirectTlsTests(unittest.TestCase):
         self.addCleanup(stalled.close)
         time.sleep(0.5)
         self.assertEqual(health(), 200)
+
+
+if __name__ == '__main__':
+    unittest.main()
