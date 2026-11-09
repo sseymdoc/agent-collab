@@ -4,6 +4,9 @@
 
 本页的 `"$PREFIX/bin/agent-collab"` 是安装器生成的入口（使用安装记录的解释器并从 `current` 运行）；
 默认安装不会把 `agent_collab` 加入全局 Python 路径，在普通目录下 `python -m agent_collab` 无法导入。
+运行前先把 `PREFIX` 设为安装时的 `--prefix`：Linux 受管 controller/all-in-one 默认 `PREFIX=/opt/agent-collab`，
+其余 POSIX 安装默认 `PREFIX="$HOME/.local/share/agent-collab"`。Windows 的入口是 PowerShell 脚本
+`<前缀>\bin\agent-collab.ps1`（默认前缀 `$env:LOCALAPPDATA\agent-collab\code`），写法见下方节点配对。
 
 ## 访问与身份
 
@@ -30,6 +33,16 @@ cd /opt/agent-collab/current && runuser -u agent-collab -- python3 -B -m agent_c
   --data-dir <节点数据目录> --physical-host-id <主机> --failure-domain <故障域> --slots 1 --host-slots 2
 "$PREFIX/bin/agent-collab" agent doctor --data-dir <节点数据目录>
 "$PREFIX/bin/agent-collab" agent run --data-dir <节点数据目录> --foreground   # 由服务托管时不需手动运行
+```
+
+Windows 节点（PowerShell；安装器生成的是 `bin\agent-collab.ps1`）：
+
+```powershell
+$Prefix = "$env:LOCALAPPDATA\agent-collab\code"   # 安装时的 --prefix
+& "$Prefix\bin\agent-collab.ps1" agent pair --controller <CONTROLLER> --code <配对码> --node-id <节点名> `
+  --data-dir <节点数据目录> --physical-host-id <主机> --failure-domain <故障域> --slots 1 --host-slots 2
+& "$Prefix\bin\agent-collab.ps1" agent doctor --data-dir <节点数据目录>
+& "$Prefix\bin\agent-collab.ps1" agent run --data-dir <节点数据目录> --foreground   # 由计划任务托管时不需手动运行
 ```
 
 节点数据目录必须在本机磁盘。受管协调节点需在 `agent.json` 设置 `claude_command`（Claude Code 可执行文件路径），并由用户在该机本地完成官方登录；本系统不复制凭据。
