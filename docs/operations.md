@@ -46,8 +46,15 @@ $Prefix = "$env:LOCALAPPDATA\agent-collab\code"   # 安装时的 --prefix
 ```
 
 上面的 `agent pair` 只用于尚未配对的新数据目录。已经由安装器配对（`--pairing-code`，见 [install.md](install.md)）的节点不要再次配对：
-数据目录已有身份，会被拒绝。要调整并发，编辑节点数据目录中 `agent.json` 的 `slots` / `host_slots`，
-然后重启节点服务（节点在启动注册时读取这两个值）。
+数据目录已有身份，会被拒绝。要调整并发：
+
+1. 先排空该节点（`drain:true`，见下方“排空、迁移与恢复”），等 `api GET /nodes` 中它的 `active_attempts` 变为 0。
+   有活动 attempt 时 controller 拒绝资源变化的注册，直接重启也会中断任务。
+2. 停止节点服务，编辑节点数据目录中 `agent.json` 的 `slots` / `host_slots`，再启动服务（节点在启动注册时读取这两个值）。
+3. 解除排空（`drain:false`）。
+
+同一物理主机上的节点（如 Windows 与同机 WSL，共用 `physical_host_id`）按各节点 `host_slots` 的最小值限制主机总并发：
+调整主机上限时，所有同机节点都要按上述步骤改成同一个值，只改一个不会生效。
 
 组织策略禁止执行 PowerShell 脚本（如 `Restricted`）时，遵循该策略、不要自行放宽；改为直接用安装记录的解释器运行启动器：
 
