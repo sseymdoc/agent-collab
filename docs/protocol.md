@@ -138,14 +138,14 @@ agent 回写时同样忽略匹配路径，避免把快照省略误当成对目�
 | --- | --- | --- |
 | `POST /nodes/pair`（配对码，无需令牌） | `{"code", "node_id"}` | `{"node_id", "node_token", "controller_id", "authority_generation"}` |
 | `POST /nodes/register` | node 记录中除 `status/drain/last_seen_at/version` 外的字段 | `{"node", "authority_generation", "config": {"heartbeat_s", "lease_ttl_s"}}`；幂等 upsert；`node_id` 必须与令牌一致 |
-| `POST /nodes/{node_id}/heartbeat` | `{"authority_generation", "attempts": [{"attempt_id", "epoch", "state": "running|finished_unreported|unknown"}], "auth_health": {}}` | `{"server_time", "drain", "dispatch_paused", "renewed": [attempt_id], "revoked": [{"attempt_id", "reason"}], "cancel": [attempt_id], "reconcile_required": bool}` |
+| `POST /nodes/{node_id}/heartbeat` | `{"authority_generation", "attempts": [{"attempt_id", "epoch", "state": "running\|finished_unreported\|unknown"}], "auth_health": {}}` | `{"server_time", "drain", "dispatch_paused", "renewed": [attempt_id], "revoked": [{"attempt_id", "reason"}], "cancel": [attempt_id], "reconcile_required": bool}` |
 | `POST /nodes/{node_id}/claim` | `{}` | 200 `{"assignment"}`；无分配时 204 |
 | `POST /attempts/{attempt_id}/events` | `{"epoch", "lease_token", "events": [{"event_id", "type", "at", "payload"}]}` | `{"accepted": [], "duplicates": [], "stale": bool}` |
 | `HEAD /blobs/{sha256}` | — | 200 存在 / 404 |
 | `PUT /blobs/{sha256}` | 原始字节 | 201 新建 / 200 已存在；内容哈希不符 400 且不落盘；超限 413 |
 | `GET /blobs/{sha256}` | — | 原始字节（节点与客户端都可读） |
 | `POST /attempts/{attempt_id}/checkpoints` | `{"checkpoint_id", "epoch", "lease_token", "kind", "manifest", "summary", "native_session_ref"}` | 200 checkpoint（`durable`）；409 `missing_blobs`（`details.missing`，记录为 `uploading`）；409 `fenced` |
-| `POST /attempts/{attempt_id}/complete` | `{"epoch", "lease_token", "outcome": "succeeded|failed|cancelled", "failure_class", "failure_detail", "output_checkpoint_id", "report", "native_session_ref", "runtime"}` | attempt；相同请求重放返回同一结果，不同内容 409 |
+| `POST /attempts/{attempt_id}/complete` | `{"epoch", "lease_token", "outcome": "succeeded\|failed\|cancelled", "failure_class", "failure_detail", "output_checkpoint_id", "report", "native_session_ref", "runtime"}` | attempt；相同请求重放返回同一结果，不同内容 409 |
 | `POST /jobs/{job_id}/publish` | `{"request_id", "attempt_id", "epoch", "lease_token", "checkpoint_id", "expected_base_version"}` | publication 回执 |
 
 `assignment`：
@@ -195,11 +195,11 @@ agent 回写时同样忽略匹配路径，避免把快照省略误当成对目�
 | `GET /jobs/{id}` | job + `attempts`（谱系）+ `checkpoints` + `publications` + `assessments` + 最近 200 条 `events` |
 | `GET /jobs/{id}/explain` | 当前调度解释：`[{"node_id", "eligible", "reasons": [], "score", "breakdown": {}}]` 与选中节点 |
 | `POST /jobs/{id}/cancel` | `{"request_id", "expected_version"}`；未开始的直接 `cancelled`，执行中进入 `cancel_requested` |
-| `POST /jobs/{id}/assess` | `{"assessment_id", "checkpoint_id", "status": "passed|rework|blocked|unverified", "method", "result", "reviewer"}`；绑定 checkpoint 的 manifest 哈希 |
+| `POST /jobs/{id}/assess` | `{"assessment_id", "checkpoint_id", "status": "passed\|rework\|blocked\|unverified", "method", "result", "reviewer"}`；绑定 checkpoint 的 manifest 哈希 |
 | `POST /jobs/{id}/retry` | `{"request_id", "expected_version", "reason", "exclude_node_ids": []}`；显式迁移/续接，计入 `migrations` 预算 |
 | `POST /jobs/{id}/publish` | 同 §4，客户端发起 |
-| `POST /jobs/{id}/integration` | 客户端或 `integration.target_node_id` 对应节点令牌均可调用：`{"request_id", "checkpoint_id", "status": "integration_pending|integrated|conflict", "detail": {"changed": [], "conflicts": [], "backup": null}}`；`checkpoint_id` 必须等于 `delivery_checkpoint_id`，否则 409。只记录回写结果，不改变交付版本 |
-| `GET /checkpoints/{id}` / `GET /checkpoints/{id}/diff?against=<checkpoint_id|inputs>` | 检查点与 `added/modified/deleted` |
+| `POST /jobs/{id}/integration` | 客户端或 `integration.target_node_id` 对应节点令牌均可调用：`{"request_id", "checkpoint_id", "status": "integration_pending\|integrated\|conflict", "detail": {"changed": [], "conflicts": [], "backup": null}}`；`checkpoint_id` 必须等于 `delivery_checkpoint_id`，否则 409。只记录回写结果，不改变交付版本 |
+| `GET /checkpoints/{id}` / `GET /checkpoints/{id}/diff?against=<checkpoint_id\|inputs>` | 检查点与 `added/modified/deleted` |
 | `GET /nodes` | 节点列表，含当前活动 attempt 数与最近一次拒绝派单原因 |
 | `POST /nodes/{id}/drain` | `{"request_id", "expected_version", "drain": bool, "migrate": bool（可选）}` |
 | `POST /dispatch` | `{"request_id", "paused": bool, "expected_version"}` 全局暂停派单；`expected_version` 为控制元数据版本 |
@@ -287,7 +287,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /packages/{work_package_id}/coordinator` | 当前租约：`{"holder_kind", "holder_ref", "expires_at", "version"}` 或 `null` |
-| `POST /packages/{work_package_id}/coordinator` | `{"request_id", "holder_kind": "interactive|managed", "holder_ref", "ttl_s", "takeover": false, "reason"}` → `{"coordinator_token", "expires_at"}`；他人持有有效租约时 409 `conflict`，除非管理员 `takeover=true` 且给出 `reason`（写 `coordinator.takeover` 事件）；同一持有者带 `X-Coordinator-Token` 时为续租 |
+| `POST /packages/{work_package_id}/coordinator` | `{"request_id", "holder_kind": "interactive\|managed", "holder_ref", "ttl_s", "takeover": false, "reason"}` → `{"coordinator_token", "expires_at"}`；他人持有有效租约时 409 `conflict`，除非管理员 `takeover=true` 且给出 `reason`（写 `coordinator.takeover` 事件）；同一持有者带 `X-Coordinator-Token` 时为续租 |
 | `DELETE /packages/{work_package_id}/coordinator` | 带 `X-Coordinator-Token` 释放 |
 
 存在有效租约时，针对该根工作包的 `assess`、`publish`、`retry`、`integration` 与同根新 job 提交必须带匹配的 `X-Coordinator-Token`，否则 409 `conflict`（`details.reason="coordinator_lease"`）。用户取消不受此限制。旧协调者恢复连接后先读租约与交付版本，不能凭旧令牌继续。

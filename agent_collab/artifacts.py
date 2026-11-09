@@ -186,7 +186,9 @@ def integrate(target_dir, base_manifest, result_manifest, fetch_blob, backup_dir
             if entry is None:
                 if path.exists():
                     conflicts.append(relative)
-            elif not path.is_file() or not hmac.compare_digest(p.sha256_bytes(path.read_bytes()), entry['sha256']):
+            elif (not path.is_file() or not hmac.compare_digest(p.sha256_bytes(path.read_bytes()), entry['sha256'])
+                  # POSIX 上本地改过可执行位也是用户改动，不能被结果静默覆盖（Windows 无此位）。
+                  or (os.name != 'nt' and bool(path.stat().st_mode & 0o111) != entry['executable'])):
                 conflicts.append(relative)
         except (ValueError, OSError) as exc:
             # 无法检查（权限、路径不安全）不等于内容冲突：如实记录原因，同样不写入。

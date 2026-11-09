@@ -7,8 +7,9 @@ import time
 import unittest
 from unittest.mock import patch
 
-from agent_collab import artifacts as a, domain as d, protocol as p
+from agent_collab import artifacts as a, backup as b, controller as c, domain as d, protocol as p
 from agent_collab.blobstore import BlobStore
+from helpers import ControllerCase, contract, manifest, uid
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +21,10 @@ def entry(path, data=b'x'):
 class PathAndManifestTests(unittest.TestCase):
     def test_windows_unrepresentable_or_aliasing_names_rejected(self):
         for bad in ('foo.', 'foo ', 'dir./x', 'a:b', 'x?y', 'q"z', 'p|q', 'star*', 'CON', 'nul.txt', 'a/LPT1', 'com3.log', 'tab\there'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                p.check_rel_path(bad)
+        # Windows 工作区中，带盘符的路径段会被解析成盘符相对路径而逃出工作区。
+        for bad in ('a/C:../C:../outside.txt', 'x/D:evil', 'C:evil'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 p.check_rel_path(bad)
         for ok in ('normal.txt', 'a.b/c', 'CONFIG.md', 'console', '.gitignore', 'com10', '__pycache__/x.pyc'):
@@ -100,6 +105,84 @@ class WorkspaceTests(unittest.TestCase):
             store.read(digest)
 
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX executable bit')
+    def test_local_executable_bit_change_is_a_conflict(self):
+        target, work = self.temp / 'target', self.temp / 'work'
+        for root in (target, work):
+            root.mkdir()
+            (root / 'run.sh').write_text('echo 1')
+            os.chmod(str(root / 'run.sh'), 0o644)
+        base, blobs = a.snapshot(work)
+        (work / 'run.sh').write_text('echo 2')
+        result, new_blobs = a.snapshot(work, base)
+        blobs.update(new_blobs)
+        os.chmod(str(target / 'run.sh'), 0o755)  # 用户在本地改了可执行位
+        output = a.integrate(target, base, result, blobs.__getitem__, self.temp / 'backup')
+        self.assertEqual((output['status'], output['conflicts']), ('conflict', ['run.sh']))
+        self.assertEqual((target / 'run.sh').read_text(), 'echo 1')
+
+    def test_interrupted_prune_never_leaves_a_visible_broken_backup_set(self):
+        data, root = self.temp / 'ctl', self.temp / 'backups'
+        c.App(data).close()
+        for _ in range(2):
+            b.run_local(data, root, keep=10, max_bytes=10 ** 9)
+            time.sleep(0.01)
+        oldest = b.list_complete(root)[0]['id']
+        with patch.object(b.shutil, 'rmtree', side_effect=OSError('interrupted')), self.assertRaises(OSError):
+            b.prune_local(root, keep=1, max_bytes=10 ** 9)
+        self.assertNotIn(oldest, [item['id'] for item in b.list_complete(root)])  # 不抛错、残留不可见
+        self.assertTrue((root / ('.tmp-prune-' + oldest)).exists())
+        b.run_local(data, root, keep=1, max_bytes=10 ** 9)  # 下一轮回收残留
+        self.assertFalse((root / ('.tmp-prune-' + oldest)).exists())
+
+
+class ControllerHardeningTests(ControllerCase):
+    def integration_contract(self):
+        return contract(integration={'target_node_id': 'target', 'target_path': '/source'},
+                        budgets={'max_attempts': 8, 'max_repairs': 7})
+
+    def test_late_publication_of_older_revision_keeps_newer_pending(self):
+        worker, target = self.node('a-worker'), self.node('target')  # 评分相同按节点 ID 排序，先派给 a-worker
+        older = self.job(self.integration_contract())
+        a1 = worker.claim()
+        worker.upload(b'old')
+        cp_old = worker.checkpoint(a1, manifest(b'old', name='output.txt'), kind='final')
+        worker.complete(a1, checkpoint=cp_old)
+        newer = self.job(self.integration_contract(), work_package_id=older['work_package_id'])
+        a2 = worker.claim()
+        worker.upload(b'new')
+        cp_new = worker.checkpoint(a2, manifest(b'new', name='output.txt'), kind='final')
+        worker.complete(a2, checkpoint=cp_new)
+        worker.publish(a2, cp_new)
+        worker.publish(a1, cp_old)  # 旧修订迟到的发布
+        self.assertEqual([i['job_id'] for i in target.heartbeat()['integrations']], [newer['job_id']])
+        self.assertEqual(self.current(older)['integration_status'], 'none')
+
+    def test_retry_of_older_revision_rejected_while_newer_revision_is_active(self):
+        worker = self.node('worker')
+        older = self.job(contract(budgets={'max_attempts': 8, 'max_repairs': 7}))
+        a1 = worker.claim()
+        worker.upload(b'old')
+        worker.complete(a1, checkpoint=worker.checkpoint(a1, manifest(b'old', name='output.txt'), kind='final'))
+        self.job(contract(budgets={'max_attempts': 8, 'max_repairs': 7}), work_package_id=older['work_package_id'])
+        result = self.mutate(older, 'retry', expected_status=409, reason='retry the older revision')
+        self.assertIn('another revision', result['error']['message'])
+
+    def events(self, count):
+        return {'epoch': 1, 'lease_token': '', 'events': [
+            {'event_id': uid(), 'type': 'attempt.progress', 'payload': {'done': 1, 'total': 2}} for _ in range(count)]}
+
+    def test_events_for_unknown_attempts_need_a_restore_and_are_bounded(self):
+        node = self.node('a')
+        self.call('POST', '/attempts/' + uid() + '/events', self.events(1), token=node.token, status=404)
+        meta = self.app.store.get('meta', 'controller')
+        meta['authority_generation'] = 2  # 等价于恢复过备份
+        self.app.store.put('meta', 'controller', meta)
+        with patch.object(c, 'ARCHIVE_EVENT_LIMIT', 3):
+            self.call('POST', '/attempts/' + uid() + '/events', self.events(2), token=node.token)
+            self.call('POST', '/attempts/' + uid() + '/events', self.events(2), token=node.token, status=413)
+
+
 class StubAdmissionTests(unittest.TestCase):
     def contract(self, steps):
         return {'goal': 'g', 'harness': 'stub', 'harness_params': {'steps': steps}}
@@ -121,3 +204,49 @@ class StubAdmissionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipIf(shutil.which('openssl') is None, 'needs openssl to create a throwaway certificate')
+class DirectTlsTests(unittest.TestCase):
+    """直连 TLS：一个只连不握手的客户端不能阻塞其他请求（握手在处理线程中进行并受超时约束）。"""
+
+    def setUp(self):
+        (ROOT / '.dev/tmp').mkdir(parents=True, exist_ok=True)
+        self.temp = Path(tempfile.mkdtemp(dir=str(ROOT / '.dev/tmp')))
+        self.addCleanup(shutil.rmtree, str(self.temp), True)
+
+    def test_stalled_tls_client_does_not_block_other_requests(self):
+        import socket, ssl, subprocess, sys, urllib.request
+        key, cert = self.temp / 'key.pem', self.temp / 'cert.pem'
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(key), '-out', str(cert),
+                        '-days', '1', '-subj', '/CN=localhost'], check=True, capture_output=True, timeout=60)
+        probe = socket.socket()
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        server = subprocess.Popen([sys.executable, '-B', '-m', 'agent_collab.controller', 'serve', '--data-dir', str(self.temp / 'data'),
+                                   '--bind', '127.0.0.1:%d' % port, '--tls-cert', str(cert), '--tls-key', str(key)],
+                                  cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(server.wait, 10)
+        self.addCleanup(server.kill)
+        context = ssl.create_default_context(cafile=str(cert))
+        context.check_hostname = False
+        url = 'https://127.0.0.1:%d/healthz' % port
+
+        def health():
+            with urllib.request.urlopen(url, context=context, timeout=5) as r:
+                return r.status
+
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                self.assertEqual(health(), 200)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.2)
+        stalled = socket.create_connection(('127.0.0.1', port))  # 只建 TCP 连接，从不发送 ClientHello
+        self.addCleanup(stalled.close)
+        time.sleep(0.5)
+        self.assertEqual(health(), 200)

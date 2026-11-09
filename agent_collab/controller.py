@@ -62,6 +62,7 @@ def digest_token(token):
 
 # 与节点共用同一版本身份读取（§11.3）：versions/<v>/release-manifest.json，开发运行时回退到包版本。
 RELEASE = release_info()
+ARCHIVE_EVENT_LIMIT = 1000  # 每个节点可写入“恢复前 attempt”归档事件的总数上限
 
 
 def merge_health(old, new):
@@ -1080,6 +1081,10 @@ class App:
                 require_uuid(pieces[1], 'attempt_id')
                 # A restored snapshot may predate this entire attempt. Archive only;
                 # there is no authority row whose state this node can change.
+                # 只有恢复过备份（generation > 1）才可能出现这种 attempt；且每个节点的归档事件有上限，
+                # 防止持有节点令牌者向任意不存在的 attempt 无限写入。
+                if identity[0] != 'node' or self.meta()['authority_generation'] <= 1:
+                    raise APIError('not_found', 'attempt not found')
                 attempt = {'attempt_id': pieces[1], 'job_id': None, 'node_id': identity[1]}
             else:
                 attempt = self.get_attempt(pieces[1], data)
@@ -1302,6 +1307,11 @@ class App:
         accepted, duplicates = [], []
         now = self.clock()
         job = self.get('job', attempt['job_id']) if attempt['job_id'] else None
+        if job is None:
+            used = self.store.get('archive_quota', attempt['node_id'], 0)
+            if used + len(data['events']) > ARCHIVE_EVENT_LIMIT:
+                raise APIError('too_large', 'archive-only event quota exceeded for node', limit=ARCHIVE_EVENT_LIMIT)
+            self.store.put('archive_quota', attempt['node_id'], used + len(data['events']))
         for event in data['events']:
             ident = require_uuid(event['event_id'], 'event_id')
             if event['type'] not in p.NODE_EVENT_TYPES or not isinstance(event.get('payload'), dict):
@@ -1471,8 +1481,14 @@ class App:
                        'request_id': data['request_id'], 'created_at': d.timestamp(now)}
         self.store.put('publication', job['job_id'] + ':' + str(publication['delivery_version']), publication)
         target = job['contract']['integration']
+        superseded = False
         if target['target_node_id']:
             key, record = self._integration_target(job)
+            revisions = [j['job_id'] for j in self.store.all('job') if j['work_package_id'] == job['work_package_id']]
+            latest = (record.get('latest') or {}).get('job_id')
+            # 旧修订迟到的发布不能顶替同目标上较新修订的回写待办。
+            superseded = latest in revisions and revisions.index(latest) > revisions.index(job['job_id'])
+        if target['target_node_id'] and not superseded:
             root_job = next(j for j in self.store.all('job') if j['work_package_id'] == job['work_package_id'])
             record['latest'] = {'job_id': job['job_id'], 'checkpoint_id': cp['checkpoint_id']}
             record['pending'] = dict(record['latest'], manifest_sha256=cp['manifest_sha256'],
@@ -1482,7 +1498,7 @@ class App:
             self.store.put('integration_target', key, record)
         self.change('job', job, now, delivery_version=publication['delivery_version'],
                     delivery_checkpoint_id=cp['checkpoint_id'],
-                    integration_status='integration_pending' if target['target_node_id'] else 'none')
+                    integration_status='integration_pending' if target['target_node_id'] and not superseded else 'none')
         self.emit('job.published', publication, now, job=job, attempt=attempt)
         return response(publication)
 
@@ -1597,6 +1613,10 @@ class App:
         effects = self.store.get('effects', job['work_package_id'], {})
         if any(v in ('unknown', 'intent') for v in effects.values()):
             raise APIError('conflict', 'side effects require reconciliation before retry')
+        # 同根修订串行执行（与 _create_job 一致）：另一修订未结束时不能重试旧修订，否则两者会同时持有租约。
+        if any(j['job_id'] != job['job_id'] and j['work_package_id'] == job['work_package_id'] and
+               j['status'] not in ('completed', 'failed', 'cancelled') for j in self.store.all('job')):
+            raise APIError('conflict', 'another revision of this work package is not terminal')
         root = self.root(job)
         reason = d.budget_reason(job, root['counters'], now, root['created_at'], migration=True)
         if reason:
@@ -1956,6 +1976,14 @@ def parse_bind(value, tls_cert=None, tls_key=None):
 
 class HTTPHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+    # 连接建立后读取请求行与头部的上限；直连 TLS 时握手也在处理线程中受此限制，
+    # 不在主线程 accept() 里进行，避免一个不发 ClientHello 的连接阻塞所有请求。
+    timeout = 30
+
+    def setup(self):
+        super().setup()
+        if isinstance(self.connection, ssl.SSLSocket):
+            self.connection.do_handshake()
 
     def log_message(self, format, *args):
         # Paths, query strings and credentials never enter default stderr request logs.
@@ -2079,7 +2107,7 @@ def serve(data_dir, bind='127.0.0.1:18669', public_origin=None, tls_cert=None, t
             server = Server(address, HTTPHandler)
             server.app, server.stopping = app, threading.Event()
             if context:
-                server.socket = context.wrap_socket(server.socket, server_side=True)
+                server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
             def ticking():
                 while not server.stopping.wait(1):
                     try:

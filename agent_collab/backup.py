@@ -145,7 +145,12 @@ def prune_local(root, keep, max_bytes):
         if count <= keep and total <= max_bytes:
             break
         if item['id'] not in protected:
-            shutil.rmtree(str(Path(root) / item['id']))
+            # 先原子改名为 list_complete 不可见的临时名再删除：中途中断留下的残留由下一轮 .tmp-* 清理回收，
+            # 不会变成“COMPLETE.json 仍在但归档缺失”而让之后每一轮都失败。
+            doomed = Path(root) / ('.tmp-prune-' + item['id'])
+            os.replace(str(Path(root) / item['id']), str(doomed))
+            sync_directory(root)
+            shutil.rmtree(str(doomed))
             count -= 1
             total -= item['tar_bytes']
     sync_directory(root)
