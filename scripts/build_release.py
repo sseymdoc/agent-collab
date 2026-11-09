@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build local, dependency-free releases; never fetch or publish anything."""
 import argparse
+from contextlib import closing
 import ast
 from datetime import datetime, timezone
 import hashlib
@@ -17,7 +18,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT))
-from agent_collab.installer import safe_name, schema_fingerprint, validate_version
+from agent_collab.installer import safe_name, schema_fingerprint, validate_payload, validate_version
 
 
 def build_release(source, output, version):
@@ -42,7 +43,7 @@ def build_release(source, output, version):
     tree = ast.parse(files['agent_collab/store.py'].decode('utf-8'))
     ddl = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
                and any(isinstance(t, ast.Name) and t.id == 'SCHEMA' for t in n.targets))
-    with sqlite3.connect(':memory:') as db:
+    with closing(sqlite3.connect(':memory:')) as db:  # with 连接对象只提交不关闭
         db.executescript(ddl)
         fingerprint = schema_fingerprint(db)
     try:
@@ -59,9 +60,15 @@ def build_release(source, output, version):
     manifest['files'] = {name: dict(sha256=hashlib.sha256(data).hexdigest(), size=len(data))
                          for name, data in files.items()}
     files['release-manifest.json'] = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
+    # 与安装器同一套校验（大小写/Unicode 别名、文件/目录冲突等）：装不上的包不生成。
+    validate_payload(files)
     output.mkdir(parents=True, exist_ok=True)
     stem = output / ('agent-collab-' + version)
     paths = [Path(str(stem) + '.tar.gz'), Path(str(stem) + '.zip')]
+    # built_at 每次不同：同一版本重建会得到不同内容，而安装器拒绝已有版本内容变化。不覆盖，要求换版本号。
+    existing = [str(p) for p in paths if p.exists()]
+    if existing:
+        raise ValueError('release already exists; use a new version: ' + ', '.join(existing))
     with tarfile.open(str(paths[0]), 'w:gz') as archive:
         for name, data in sorted(files.items()):
             info = tarfile.TarInfo(name)

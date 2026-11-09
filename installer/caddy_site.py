@@ -4,6 +4,7 @@
 随后：diff 原文件 新文件 → 确认只少了该站点块 → caddy validate --config <新文件> --adapter caddyfile → 替换并 reload。
 """
 import argparse
+import re
 import sys
 
 
@@ -16,10 +17,12 @@ def remove_site(text, site):
         raise ValueError('site block is not unique: ' + site)
     depth, end = 0, None
     for i in range(start, len(lines)):
+        # 注释里的大括号不计入层级（"# }" 不能提前结束块，"# {" 不能把块延伸到后面的站点）。
+        code = re.sub(r'(^|\s)#.*$', r'\1', lines[i])
         # Caddyfile 引号内的大括号在本项目片段中不出现；遇到则拒绝自动处理。
-        if '"' in lines[i] and ('{' in lines[i] or '}' in lines[i]):
+        if '"' in code and ('{' in code or '}' in code):
             raise ValueError('quoted braces in block; edit manually')
-        depth += lines[i].count('{') - lines[i].count('}')
+        depth += code.count('{') - code.count('}')
         if depth == 0:
             end = i
             break

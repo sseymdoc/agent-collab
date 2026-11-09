@@ -26,8 +26,13 @@ def project(task_dir):
     state = _read(d / 'state.json')
     if not isinstance(state, dict) or 'task_id' not in state:
         return None
-    report = _read(d / 'report.json') or {}
-    assessment = _read(d / 'assessment.json') or {}
+    # 可选记录可能是合法 JSON 但不是对象（如数组）：归一为空对象，不让一条坏记录中断整个列表。
+    report = _read(d / 'report.json')
+    report = report if isinstance(report, dict) else {}
+    assessment = _read(d / 'assessment.json')
+    assessment = assessment if isinstance(assessment, dict) else {}
+    observed = state.get('observed')
+    observed = observed if isinstance(observed, dict) else {}
     p = {k: state.get(k) for k in _STATE_KEYS}
     p['work_package_id'] = p['work_package_id'] or p['task_id']
     p.update(
@@ -38,13 +43,16 @@ def project(task_dir):
         report_outcome=report.get('outcome'), report_status=report.get('status'),
         recorded_acceptance=assessment.get('status', 'unverified'),
         acceptance_note='产物版本未在此重新校验；stale 判断以原 launcher summary 为准',
-        observed={k: (state.get('observed') or {}).get(k) for k in ('model', 'effort', 'reasoning_effort')},
+        observed={k: observed.get(k) for k in ('model', 'effort', 'reasoning_effort')},
         pointer=str(d),
     )
     return p
 
 
 def read_tasks(state_root):
+    if not Path(state_root).is_dir():
+        # 路径写错时不能输出 [] 并成功退出：那与“确实没有旧任务”无法区分。
+        raise ValueError('state root not found: ' + str(state_root))
     root = Path(state_root) / 'tasks'
     out = []
     for d in sorted(root.glob('*/*')):
@@ -60,7 +68,11 @@ def main(argv=None):
     ap.add_argument('action', choices=['list'])
     ap.add_argument('--state-root', required=True)
     a = ap.parse_args(argv)
-    print(json.dumps(read_tasks(a.state_root), ensure_ascii=False, indent=2))
+    try:
+        tasks = read_tasks(a.state_root)
+    except ValueError as exc:
+        ap.exit(2, str(exc) + '\n')
+    print(json.dumps(tasks, ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':

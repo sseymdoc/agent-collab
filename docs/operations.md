@@ -1,6 +1,6 @@
 # 运维速查
 
-安装、升级、回退、卸载的完整参数见 [install.md](install.md)。本页只列日常操作；`<CONTROLLER>` 为公开入口（如 `https://controller.example:8443`），`<DATA>` 为 controller 状态目录（Linux 默认 `/var/lib/agent-collab/controller`）。历史验证见 [证据台账](evidence/ledger.md)；下述定时备份安装命令是待部署步骤，单元测试通过不代表已注册或已验证真实云端任务。
+安装、升级、回退、卸载的完整参数见 [install.md](install.md)。本页只列日常操作；`<CONTROLLER>` 为公开入口（如 `https://controller.example:8443`），`<DATA>` 为 controller 状态目录（Linux 默认 `/var/lib/agent-collab/controller`）。下述定时备份安装命令是待部署步骤，单元测试通过不代表已注册或已验证真实云端任务。
 
 ## 访问与身份
 
@@ -9,7 +9,7 @@
 | 健康检查（无需认证） | `curl -fsS <CONTROLLER>/healthz` |
 | 管理令牌位置 | `<DATA>/admin.token`（0600，属服务用户）；UI 登录与 CLI 管理调用使用；恢复到新目录后首次启动生成新令牌，原目录恢复保留原令牌 |
 | UI | 浏览器打开 `<CONTROLLER>/`，输入管理令牌；会话为 HttpOnly Cookie，刷新可自动取回 CSRF |
-| CLI 管理调用 | `python -m agent_collab api GET /overview --url <CONTROLLER> --token-file admin.token`（证书始终校验；非 loopback 必须 https） |
+| CLI 管理调用 | `python -m agent_collab api GET /overview --url <CONTROLLER> --token-file <DATA>/admin.token`（证书始终校验；非 loopback 必须 https） |
 | doctor | `"$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role controller` |
 
 ## 节点配对
@@ -35,13 +35,14 @@ python3 -m agent_collab.node_agent run --data-dir <节点数据目录> --foregro
 
 ```sh
 # 排空：不再领取新任务；migrate=true 时把可安全迁移的 attempt（已受保护、无外部副作用、有确认检查点或基线）迁到其他合格节点
-python -m agent_collab api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":true,"migrate":true}' --url <CONTROLLER> --token-file admin.token
+python -m agent_collab api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":true,"migrate":true}' --url <CONTROLLER> --token-file <DATA>/admin.token
 # 解除排空
-python -m agent_collab api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":false}' --url <CONTROLLER> --token-file admin.token
-# 明确迁移/续接某个工作包（计入迁移预算，从最近确认检查点新建 attempt）
-python -m agent_collab api POST /jobs/<job_id>/retry --data '{"expected_version":<版本>,"reason":"<原因>","exclude_node_ids":[]}' --url <CONTROLLER> --token-file admin.token
+python -m agent_collab api POST /nodes/<节点名>/drain --data '{"expected_version":<版本>,"drain":false}' --url <CONTROLLER> --token-file <DATA>/admin.token
+# 明确迁移/续接某个工作包（计入迁移预算，从最近确认检查点新建 attempt）。
+# 要离开当前节点就把它列入 exclude_node_ids；留空表示只续接，调度器仍可能选回原节点。
+python -m agent_collab api POST /jobs/<job_id>/retry --data '{"expected_version":<版本>,"reason":"<原因>","exclude_node_ids":["<源节点名>"]}' --url <CONTROLLER> --token-file <DATA>/admin.token
 # 请求取消（不会触发自动恢复；节点确认后为 cancelled）
-python -m agent_collab api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file admin.token
+python -m agent_collab api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file <DATA>/admin.token
 ```
 
 `<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点从确认检查点继续。
@@ -51,10 +52,11 @@ python -m agent_collab api POST /jobs/<job_id>/cancel --data '{"expected_version
 ```sh
 # 在线一致备份（服务运行中执行；sqlite backup API + 被引用 blob + manifest）
 install -d -o agent-collab -g agent-collab -m 0700 /var/lib/agent-collab/backups
+TS=$(date -u +%Y%m%dT%H%M%SZ)  # 备份目录与打包文件共用同一个时间戳
 cd /opt/agent-collab/current && runuser -u agent-collab -- python3 -B -m agent_collab.controller backup \
-  --data-dir <DATA> --dest /var/lib/agent-collab/backups/$(date -u +%Y%m%dT%H%M%SZ)
+  --data-dir <DATA> --dest /var/lib/agent-collab/backups/$TS
 # 打包并复制到实例外（同一实例上的其他目录不算实例外备份）
-tar -C /var/lib/agent-collab/backups -czf /root/backup-<时间>.tar.gz <时间>
+tar -C /var/lib/agent-collab/backups -czf /root/backup-$TS.tar.gz $TS
 ```
 
 恢复前必须确认原 controller 已停止或已隔离：

@@ -25,6 +25,12 @@ DEFAULT_URL = os.environ.get('AGENT_COLLAB_URL', 'http://127.0.0.1:18669')
 LOOPBACK = ('127.0.0.1', 'localhost', '::1')
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随重定向：urllib 会把 Authorization 头带到新地址，管理令牌可能被转发到别的主机。"""
+    def redirect_request(self, *args, **kwargs):
+        return None  # 3xx 原样作为 HTTPError 返回，由调用方当作失败
+
+
 def request(url, token, method, path, data=None, ca_file=None):
     u = urllib.parse.urlsplit(url)
     if u.scheme == 'http' and u.hostname not in LOOPBACK:
@@ -33,9 +39,10 @@ def request(url, token, method, path, data=None, ca_file=None):
     req = urllib.request.Request(url.rstrip('/') + '/api/v1' + path, data=body, method=method,
                                  headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json',
                                           **({'Content-Type': 'application/json'} if body else {})})
-    ctx = ssl.create_default_context(cafile=ca_file) if u.scheme == 'https' else None
+    handlers = [NoRedirect()] + ([urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_file))]
+                                 if u.scheme == 'https' else [])
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+        with urllib.request.build_opener(*handlers).open(req, timeout=30) as r:
             raw = r.read()
             return r.status, json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
@@ -72,7 +79,7 @@ def _client(argv, submit):
         data.setdefault('request_id', str(uuid.uuid4()))
     status, out = request(a.url, token, method, path, data, a.ca_file)
     print(json.dumps({'http_status': status, 'body': out}, ensure_ascii=False, indent=2))
-    return 0 if status < 400 else 2
+    return 0 if 200 <= status < 300 else 2  # 3xx 不算送达
 
 
 MODULES = {'controller': 'agent_collab.controller', 'agent': 'agent_collab.node_agent', 'legacy': 'agent_collab.legacy'}

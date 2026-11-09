@@ -7,7 +7,7 @@ import getpass
 import json
 import os
 import ntpath
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import platform
 import plistlib
 import re
@@ -31,6 +31,11 @@ MAX_RELEASE_BYTES = 512 * 1024 * 1024
 def validate_version(value):
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,99}', value):
         raise ValueError('invalid release version')
+    # 版本号会成为 versions/<version> 目录名：Windows 设备名（CON、nul.1）与结尾的点不能用。
+    try:
+        safe_name(value)
+    except ValueError:
+        raise ValueError('invalid release version') from None
     return value
 
 
@@ -69,27 +74,38 @@ def validate_payload(files):
     declared = manifest.get('files')
     if not isinstance(declared, dict) or set(files) != set(declared) | {MANIFEST}:
         raise ValueError('archive and manifest file lists differ')
-    aliases = {}
     for name, entry in declared.items():
         safe_name(name)
         if name.split('/')[0] not in ('agent_collab', 'installer'):
             raise ValueError('unexpected release root: ' + name)
-        # Include directory aliases: A/file and a/other collide on Windows/macOS.
-        for index in range(1, len(name.split('/')) + 1):
-            partial = '/'.join(name.split('/')[:index])
-            alias = unicodedata.normalize('NFC', partial).casefold()
-            if alias in aliases and aliases[alias] != partial:
-                raise ValueError('case-colliding release paths')
-            aliases[alias] = partial
         if (len(files[name]) != entry.get('size')
                 or hashlib.sha256(files[name]).hexdigest() != entry.get('sha256')):
             raise ValueError('release hash/size mismatch: ' + name)
-        if any(str(parent) in declared for parent in PurePosixPath(name).parents):
-            raise ValueError('release file/directory collision')
+    check_release_tree(declared)
     for required in ('agent_collab/installer.py', 'agent_collab/cli.py', 'installer/entry.py'):
         if required not in declared:
             raise ValueError('incomplete release: ' + required)
     return manifest
+
+
+def check_release_tree(names):
+    """逐段建树检查别名与文件/目录冲突，时间与内存都与路径段总数成线性（不为每个前缀拼接字符串）。
+
+    - 任一级文件或目录名在 NFC 归一并折叠大小写后相同：Windows/macOS 无法同时容纳；
+    - 同一路径既是文件又是某个文件的父目录。
+    """
+    root = {}
+    for name in names:
+        node, parts = root, name.split('/')
+        for index, part in enumerate(parts):
+            entry = node.setdefault(unicodedata.normalize('NFC', part).casefold(), [part, {}, False])
+            if entry[0] != part:
+                raise ValueError('case-colliding release paths')
+            last = index == len(parts) - 1
+            if entry[1] if last else entry[2]:
+                raise ValueError('release file/directory collision')
+            entry[2] = entry[2] or last
+            node = entry[1]
 
 
 def read_release(path):
@@ -127,10 +143,15 @@ def read_installed(directory):
         raise ValueError('version directory is missing or is a symlink')
     files = {}
     for path in directory.rglob('*'):
+        relative = path.relative_to(directory)
+        # 不带 -B 运行（如直接 python -m agent_collab）会生成 __pycache__：解释器缓存不是发行内容，
+        # 不能因此让 doctor、同版本重装与回退判定版本目录被改动。
+        if '__pycache__' in relative.parts:
+            continue
         if path.is_symlink():
             raise ValueError('installed release contains a symlink')
         if path.is_file():
-            files[path.relative_to(directory).as_posix()] = path.read_bytes()
+            files[relative.as_posix()] = path.read_bytes()
     return validate_payload(files)
 
 
@@ -351,9 +372,10 @@ def configure_worker_workspace(config, runner=None):
         return
     path = Path(root).expanduser().absolute()
     if config['system'] == 'Windows':
-        # Only the dedicated default shared root may have its ACL changed.
-        # Custom workspace parents are operator-owned and remain untouched.
-        shared = path.parent if path.parent.name.casefold() == 'agent-collab-work' else path
+        # 只有生成的缺省工作区（%SystemDrive%\agent-collab-work\<用户名>）才改共享父目录的 ACL；
+        # 自定义路径即使父目录恰好也叫 agent-collab-work，也属于运维自有目录，只改它自己。
+        default = os.path.normcase(default_windows_workspace())
+        shared = path.parent if os.path.normcase(str(path)) == default else path
         protected = {Path(path.anchor), Path.home(), Path(config['prefix']), Path(config['state_dir'])}
         if path in protected or shared in protected:
             raise ValueError('workspace ACL requires a dedicated directory, not a drive/profile/code/state root')
@@ -630,7 +652,8 @@ sys.exit(main())
         # .ps1 avoids cmd.exe percent/ampersand expansion in user-selected paths.
         quote = lambda value: "'" + str(value).replace("'", "''") + "'"
         text = '& {} -B {} @args\nexit $LASTEXITCODE\n'.format(quote(config['python']), quote(prefix / 'launcher.py'))
-        atomic_write(folder / 'agent-collab.ps1', text.encode(), 0o644)
+        # 带 BOM：Windows PowerShell 5.1 没有 BOM 时按 ANSI 代码页读脚本，路径里的非 ASCII 字符会变成乱码。
+        atomic_write(folder / 'agent-collab.ps1', text.encode('utf-8-sig'), 0o644)
     else:
         import shlex
         text = '#!/bin/sh\nexec {} -B {} "$@"\n'.format(shlex.quote(config['python']), shlex.quote(str(prefix / 'launcher.py')))
@@ -782,7 +805,7 @@ def wait_lock(factory, timeout=30, clock=time.monotonic, sleep=time.sleep):
         try:
             lock.__enter__()
             return lock
-        except ValueError:
+        except (ValueError, RuntimeError):  # AgentLock 抛 ValueError，ControllerLock 抛 RuntimeError
             if clock() >= deadline:
                 raise
             sleep(.5)
@@ -804,7 +827,7 @@ def backup_controller(config, directory):
     print('Controller backup: ' + str(backup))
 
 
-def ensure_state(config, directory):
+def ensure_state(config, directory, manifest):
     state = Path(config['state_dir'])
     state.mkdir(parents=True, exist_ok=True, mode=0o711)
     for kind in components(config):
@@ -813,6 +836,10 @@ def ensure_state(config, directory):
     manager = Services(config, directory)
     manager.prepare_account()
     if 'controller' in components(config):
+        # 新前缀或卸载后重装时没有旧安装记录，但可能保留着旧数据库：先确认目标版本支持它，
+        # 再运行目标代码初始化（admin-token 会打开数据库并写事件）。
+        if (state / 'controller/controller.db').exists():
+            compatible_schema(config, manifest, directory)
         package_command(config, directory, 'controller', 'admin-token', '--data-dir', str(state / 'controller'), controller_user=True)
 
 
@@ -885,7 +912,7 @@ def transaction(config, old, manifest, files, args):
             stopped = True
             old_manager.stop()
         if not previous:
-            ensure_state(config, directory)
+            ensure_state(config, directory, manifest)
         with stopped_locks(old_config, old_directory):
             if previous:
                 refuse_active_worker(config, args.allow_active)
@@ -1025,7 +1052,9 @@ def configuration(args, old, system):
             value = defaults[key]
             if key == 'python':
                 value = shutil.which(value) or value
-            defaults[key] = str(Path(value).expanduser().resolve())
+            path = Path(value).expanduser()
+            # 令牌文件只取绝对路径、不跟随链接：/dev/stdin 经 /proc/self/fd/0 会解析成不存在的 pipe:[N]。
+            defaults[key] = str(path.absolute() if key == 'admin_token_file' else path.resolve())
     return defaults
 
 

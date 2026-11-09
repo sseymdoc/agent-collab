@@ -7,7 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stderr
+from contextlib import closing, redirect_stderr, redirect_stdout
+import sqlite3
 from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
 
@@ -27,6 +28,48 @@ class WorkerInstallTests(unittest.TestCase):
         self.invoke('--release', str(self.v1), '--workspace-root', str(self.temp / 'workspace'), role='worker')
         old = ins.read_json(self.prefix / 'installation.json')
         return old, dict(old['config'])
+
+    def test_new_prefix_with_retained_incompatible_db_refuses_before_target_code(self):
+        self.invoke('--release', str(self.v1))  # controller
+        database, token = self.state / 'controller/controller.db', self.state / 'controller/admin.token'
+        with closing(sqlite3.connect(str(database))) as db, db:
+            db.execute('PRAGMA user_version=99')
+            events = db.execute('SELECT count(*) FROM events').fetchone()[0]
+        token.unlink()
+        self.prefix = self.temp / 'another prefix'  # 新前缀：没有旧安装记录，但数据目录保留着旧数据库
+        output = self.invoke('--release', str(self.v1), status=1)
+        self.assertIn('unsupported', output)
+        self.assertFalse(token.exists())  # 目标代码没有运行 admin-token
+        with closing(sqlite3.connect(str(database))) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM events').fetchone()[0], events)
+
+    def test_bytecode_cache_is_not_release_payload(self):
+        self.invoke('--release', str(self.v1))
+        version = self.prefix / 'versions/1.0.0'
+        cache = version / 'agent_collab/__pycache__'
+        cache.mkdir(exist_ok=True)
+        (cache / 'cli.cpython-313.pyc').write_bytes(b'cache')
+        self.assertEqual(ins.read_installed(version)['version'], '1.0.0')
+        (version / 'agent_collab/extra.py').write_text('x')  # 真正的多余文件仍被拒绝
+        with self.assertRaises(ValueError):
+            ins.read_installed(version)
+
+    def test_windows_launcher_has_utf8_bom(self):
+        old, config = self.installed_worker()
+        config.update(system='Windows', python='C:\\Users\\Jos\u00e9\\Python\\python.exe')
+        ins.write_launchers(config)
+        data = (Path(config['prefix']) / 'bin/agent-collab.ps1').read_bytes()
+        self.assertTrue(data.startswith(b'\xef\xbb\xbf'))  # PowerShell 5.1 才会按 UTF-8 读
+        self.assertIn('Jos\u00e9', data.decode('utf-8-sig'))
+
+    @unittest.skipIf(os.name == 'nt', 'symlink creation needs privileges on Windows')
+    def test_admin_token_file_symlink_is_not_resolved(self):
+        target = self.temp / 'real.token'
+        target.write_text('t')
+        link = self.temp / 'link.token'
+        link.symlink_to(target)
+        args = ins.parser().parse_args(['--role', 'worker', '--no-service', '--admin-token-file', str(link)])
+        self.assertEqual(ins.configuration(args, None, 'Linux')['admin_token_file'], str(link))
 
     def test_task_uses_pythonw_and_unbounded_repetition_with_ignore_new(self):
         old, config = self.installed_worker()
@@ -82,10 +125,16 @@ class WorkerInstallTests(unittest.TestCase):
         def runner(argv, **kwargs):
             calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, '"user","S-1-5-21-1-2-3-4"\n', '')
-        ins.configure_worker_workspace(config, runner)
+        with patch.object(ins, 'default_windows_workspace', return_value=str(workspace)):
+            ins.configure_worker_workspace(config, runner)  # 生成的缺省路径：共享父目录与用户目录都设 ACL
         self.assertEqual(path.read_bytes(), before)
         self.assertTrue(workspace.is_dir())
         self.assertEqual([c[0] for c in calls], ['whoami', 'net', 'icacls', 'icacls', 'icacls', 'icacls'])
+        self.assertEqual({c[1] for c in calls if c[0] == 'icacls'}, {str(workspace.parent), str(workspace)})
+        calls.clear()
+        ins.configure_worker_workspace(config, runner)  # 同一路径但不是缺省值：只改它自己
+        self.assertEqual({c[1] for c in calls if c[0] == 'icacls'}, {str(workspace)})
+        calls.clear()
         custom.pop('workspace_root')
         save(path, custom)
         config['workspace_root'] = str(workspace)
@@ -182,6 +231,21 @@ class WorkerInstallTests(unittest.TestCase):
 class WaitLockTests(unittest.TestCase):
     """Windows schtasks /End 返回时进程可能尚未退出：锁短暂被占用不应中止升级。"""
 
+    def test_retries_while_controller_lock_is_held(self):
+        attempts = []
+
+        class ControllerBusy:
+            def __enter__(self):
+                attempts.append(1)
+                if len(attempts) < 3:  # ControllerLock 被占用时抛 RuntimeError
+                    raise RuntimeError('controller.lock is held; stop the controller before restore/another serve')
+                return self
+
+        clock = iter(range(100))
+        self.assertIsInstance(ins.wait_lock(ControllerBusy, timeout=10, clock=lambda: next(clock), sleep=lambda s: None),
+                              ControllerBusy)
+        self.assertEqual(len(attempts), 3)
+
     def test_retries_until_released_then_times_out(self):
         attempts = []
 
@@ -207,3 +271,84 @@ class WaitLockTests(unittest.TestCase):
         clock = iter(range(100))
         with self.assertRaisesRegex(ValueError, 'another agent'):
             ins.wait_lock(Held, timeout=3, clock=lambda: next(clock), sleep=lambda s: None)
+
+
+class ReleaseAndCliReviewTests(unittest.TestCase):
+    def setUp(self):
+        import shutil
+        import tempfile
+        root = Path(__file__).resolve().parents[1]
+        (root / '.dev/tmp').mkdir(parents=True, exist_ok=True)
+        self.temp = Path(tempfile.mkdtemp(dir=str(root / '.dev/tmp')))
+        self.addCleanup(shutil.rmtree, str(self.temp))
+        self.root = root
+
+    def test_version_rejects_windows_device_names_and_trailing_dots(self):
+        for good in ('1.0.0', '0.1.0rc7', 'ui-test'):
+            self.assertEqual(ins.validate_version(good), good)
+        for bad in ('CON', 'nul', 'Nul.1', 'COM1', '1.0.', 'lpt9.tar'):
+            with self.assertRaises(ValueError):
+                ins.validate_version(bad)
+
+    def test_release_tree_check_is_linear_and_finds_collisions(self):
+        import time
+        deep = 'agent_collab/' + '/'.join(['d'] * 20000) + '/f.py'
+        started = time.monotonic()
+        ins.check_release_tree([deep, 'agent_collab/x.py'])
+        self.assertLess(time.monotonic() - started, 2)  # 旧实现按前缀拼接字符串，深度 2 万时为平方级
+        for names in (['agent_collab/A/x.py', 'agent_collab/a/y.py'],      # 目录别名
+                      ['agent_collab/x.py', 'agent_collab/X.py'],          # 文件别名
+                      ['agent_collab/caf\u00e9.py', 'agent_collab/cafe\u0301.py'],  # NFC 后相同
+                      ['agent_collab/x', 'agent_collab/x/y.py']):          # 文件又是目录
+            with self.assertRaises(ValueError):
+                ins.check_release_tree(names)
+
+    def test_build_validates_before_writing_and_refuses_existing_version(self):
+        out = self.temp / 'out'
+        with patch.object(legacy.builder, 'validate_payload', side_effect=ValueError('collision')):
+            with self.assertRaises(ValueError):
+                legacy.builder.build_release(self.root, out, '9.9.9')
+        self.assertFalse(list(out.glob('*')) if out.exists() else [])  # 校验失败时一个包都不生成
+        legacy.builder.build_release(self.root, out, '9.9.9')
+        with self.assertRaisesRegex(ValueError, 'new version'):
+            legacy.builder.build_release(self.root, out, '9.9.9')
+
+    def test_caddy_comment_braces_do_not_change_block_depth(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('caddy_site', self.root / 'installer/caddy_site.py')
+        caddy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(caddy)
+        text = ('a.example {\n\trespond ok\n}\n# controller\nhttps://x.example:8443 {\n\t# 上游见下 }\n'
+                '\treverse_proxy 127.0.0.1:18669 # 本机 {端口}\n}\nb.example {\n\trespond b\n}\n')
+        self.assertEqual(caddy.remove_site(text, 'https://x.example:8443'),
+                         'a.example {\n\trespond ok\n}\nb.example {\n\trespond b\n}\n')
+
+    def test_cli_counts_only_2xx_as_success_and_never_follows_redirects(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+        from agent_collab import cli
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get('Authorization')))
+                self.send_response(302)
+                self.send_header('Location', 'http://127.0.0.1:%d/elsewhere' % self.server.server_port)
+                self.end_headers()
+            do_POST = do_GET
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        status, _ = cli.request('http://127.0.0.1:%d' % server.server_port, 'secret', 'GET', '/overview')
+        self.assertEqual(status, 302)
+        self.assertEqual([path for path, _ in seen], ['/api/v1/overview'])  # 令牌不会被带到重定向目标
+        token = self.temp / 'admin.token'
+        token.write_text('secret')
+        for code, expected in ((200, 0), (204, 0), (307, 2), (308, 2), (404, 2)):
+            with patch.object(cli, 'request', return_value=(code, None)), redirect_stdout(io.StringIO()):
+                self.assertEqual(cli._client(['GET', '/overview', '--token-file', str(token)], False), expected)

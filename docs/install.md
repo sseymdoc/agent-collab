@@ -234,11 +234,16 @@ worker 的 status.json 必须来自新版本目录、匹配 version/git_commit�
 `user_version`，同时更新 `installer/release-schema.json` 的最低/最高支持版本；安装器不会伪造 schema 迁移。
 当前 schema 超出目标范围，或版本 0 指纹不同，回退拒绝执行；自动失败回退也遵守相同规则。
 
-需要恢复数据时，停止 controller 后使用支持该备份的版本执行：
+需要恢复数据时，停止 controller 后，在支持该备份的版本目录中以 controller 服务账户执行
+（`agent_collab` 只在版本目录里可导入；Linux 受管安装的 controller 数据目录属 `agent-collab` 账户、权限 0700）：
 
 ```sh
-python3 -B -m agent_collab.controller restore --data-dir /local/state/controller --from /local/state/backups/upgrade-...
+cd /opt/agent-collab/versions/<支持该备份的版本>
+runuser -u agent-collab -- python3 -B -m agent_collab.controller restore \
+  --data-dir /var/lib/agent-collab/controller --from /var/lib/agent-collab/backups/upgrade-...
 ```
+
+非 Linux 受管安装换成对应的 `--prefix`/`--state-dir`，并以安装时的用户执行。
 
 restore 会递增 `authority_generation`、撤销旧租约、暂停派单，并要求人工对账；不要手工覆盖数据库或只改 current。
 安装过程中断或 schema 不兼容导致自动回退拒绝时，安装器保留不一致的指针/记录并拒绝继续猜测；
