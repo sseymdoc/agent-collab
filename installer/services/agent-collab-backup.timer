@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-collab backup every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00 UTC
+Persistent=true
+RandomizedDelaySec=10min
+Unit=agent-collab-backup.service
+
+[Install]
+WantedBy=timers.target

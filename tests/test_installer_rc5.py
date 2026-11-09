@@ -1,0 +1,209 @@
+"""Windows commands and worker upgrade safety without registering real services."""
+import datetime
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+from contextlib import redirect_stderr
+from unittest.mock import Mock, patch
+import xml.etree.ElementTree as ET
+
+from agent_collab import installer as ins
+from agent_collab.node_agent import save
+import test_installer as legacy
+
+
+class WorkerInstallTests(unittest.TestCase):
+    setUpClass = classmethod(legacy.InstallerTests.setUpClass.__func__)
+    tearDownClass = classmethod(legacy.InstallerTests.tearDownClass.__func__)
+    setUp = legacy.InstallerTests.setUp
+    args = legacy.InstallerTests.args
+    invoke = legacy.InstallerTests.invoke
+
+    def installed_worker(self):
+        self.invoke('--release', str(self.v1), '--workspace-root', str(self.temp / 'workspace'), role='worker')
+        old = ins.read_json(self.prefix / 'installation.json')
+        return old, dict(old['config'])
+
+    def test_task_uses_pythonw_and_unbounded_repetition_with_ignore_new(self):
+        old, config = self.installed_worker()
+        python = self.temp / 'Python/python.exe'
+        python.parent.mkdir()
+        python.write_bytes(b'fixture')
+        pythonw = python.with_name('pythonw.exe')
+        config.update(system='Windows', python=str(python))
+        directory = self.prefix / 'versions' / old['version']
+        def task():
+            return ET.fromstring(ins.render_services(config, directory, 'S-1-5-21-1-2-3-4')['agent-collab-worker.xml'])
+        self.assertEqual(task().find('.//{*}Command').text, str(python))
+        pythonw.write_bytes(b'fixture')
+        xml = task()
+        self.assertEqual(xml.find('.//{*}Command').text, str(pythonw))
+        repetition = xml.find('.//{*}LogonTrigger/{*}Repetition')
+        self.assertEqual(repetition.find('{*}Interval').text, 'PT5M')
+        self.assertEqual(repetition.find('{*}StopAtDurationEnd').text, 'false')
+        self.assertIsNone(repetition.find('{*}Duration'))
+        self.assertEqual(xml.find('.//{*}MultipleInstancesPolicy').text, 'IgnoreNew')
+        self.assertIsNotNone(xml.find('.//{*}RestartOnFailure'))
+        self.assertEqual(ins.worker_python(r'C:\Python315\python.exe', exists=lambda path: True), r'C:\Python315\pythonw.exe')
+
+    def test_windows_default_and_override_workspace_config(self):
+        self.assertEqual(ins.default_windows_workspace({'SystemDrive': 'D:'}, 'user'), r'D:\agent-collab-work\user')
+        args = ins.parser().parse_args(['--workspace-root', str(self.temp / 'explicit'), '--no-service'])
+        config = ins.configuration(args, None, 'Windows')
+        self.assertEqual(config['workspace_root'], str(self.temp / 'explicit'))
+
+    def test_acl_command_builder_limits_sandbox_group_to_folder_rx(self):
+        sid = 'S-1-5-21-1-2-3-4'
+        commands = ins.workspace_acl_commands(r'C:\agent-collab-work', r'C:\agent-collab-work\user', sid, True)
+        self.assertEqual(len(commands), 4)
+        for index in (1, 3):
+            self.assertIn('/inheritance:r', commands[index])
+            self.assertIn('*' + sid + ':(OI)(CI)F', commands[index])
+            self.assertIn('*S-1-5-18:(OI)(CI)F', commands[index])
+            self.assertIn('*S-1-5-32-544:(OI)(CI)F', commands[index])
+            self.assertIn('CodexSandboxUsers:RX', commands[index])
+            self.assertNotIn('/T', commands[index])
+        self.assertFalse(any('CodexSandboxUsers' in arg for command in ins.workspace_acl_commands('root', 'user', sid) for arg in command))
+
+    def test_workspace_setup_uses_injected_acl_runner_and_preserves_all_custom_keys(self):
+        old, config = self.installed_worker()
+        workspace = self.temp / 'agent-collab-work/user'
+        custom = dict(node_id='worker', codex_command=['custom', 'arg'], labels=['private'], auth_probe_s=120,
+                      workspace_root=str(workspace), extension={'future': True})
+        path = self.state / 'worker/agent.json'
+        save(path, custom)
+        before = path.read_bytes()
+        config.update(system='Windows', workspace_root=str(self.temp / 'ignored'))
+        calls = []
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, '"user","S-1-5-21-1-2-3-4"\n', '')
+        ins.configure_worker_workspace(config, runner)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(workspace.is_dir())
+        self.assertEqual([c[0] for c in calls], ['whoami', 'net', 'icacls', 'icacls', 'icacls', 'icacls'])
+        custom.pop('workspace_root')
+        save(path, custom)
+        config['workspace_root'] = str(workspace)
+        ins.configure_worker_workspace(config, runner)
+        data = ins.read_json(path)
+        self.assertEqual(data.pop('workspace_root'), str(workspace))
+        self.assertEqual(data, custom)
+        save(path, dict(custom, workspace_root=None))
+        calls.clear()
+        ins.configure_worker_workspace(config, runner)
+        self.assertFalse(calls)
+        self.assertIsNone(ins.read_json(path)['workspace_root'])
+
+    def test_active_attempt_refuses_upgrade_before_service_or_staging_and_allow_override(self):
+        old, config = self.installed_worker()
+        meta = self.state / 'worker/attempts/fixture/meta.json'
+        for state in ('preparing', 'running'):
+            save(meta, {'state': state})
+            with patch.object(ins.Services, 'stop', side_effect=AssertionError('must not stop')):
+                output = self.invoke('--release', str(self.v2), role='worker', status=1)
+            self.assertIn('drain first', output)
+            self.assertFalse((self.prefix / 'versions/2.0.0').exists())
+        self.invoke('--release', str(self.v2), '--allow-active', role='worker')
+        self.assertEqual(ins.current_version(self.prefix), '2.0.0')
+        self.invoke('--rollback', role='worker', status=1)
+        self.assertEqual(ins.current_version(self.prefix), '2.0.0')
+        self.invoke('--rollback', '--allow-active', role='worker')
+        self.assertEqual(ins.current_version(self.prefix), '1.0.0')
+
+    def test_new_worker_status_must_be_fresh_and_match_directory_version_commit(self):
+        old, config = self.installed_worker()
+        directory = self.prefix / 'versions/2.0.0'
+        manifest = dict(version='2.0.0', git_commit='new-commit')
+        started = 1804800000.0
+        at = datetime.datetime.fromtimestamp(started + 1, datetime.timezone.utc).isoformat()
+        good = dict(version='2.0.0', git_commit='new-commit', version_dir=str(directory), pid=42, last_heartbeat_ok_at=at)
+        path = self.state / 'worker/status.json'
+        for changed in (dict(version='1.0.0'), dict(git_commit='old'), dict(version_dir=str(directory.parent / '1.0.0')),
+                        dict(pid=0), dict(last_heartbeat_ok_at='2020-01-01T00:00:00Z')):
+            save(path, dict(good, **changed))
+            with self.assertRaisesRegex(RuntimeError, 'successful heartbeat'):
+                ins.wait_worker_status(config, directory, manifest, started, timeout=0)
+        save(path, good)
+        self.assertEqual(ins.wait_worker_status(config, directory, manifest, started, timeout=0), good)
+
+    def test_status_deadline_never_exceeds_sixty_seconds(self):
+        old, config = self.installed_worker()
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        with self.assertRaises(RuntimeError):
+            ins.wait_worker_status(config, self.prefix / 'new', {'version': '2'}, 0,
+                                   timeout=600, clock=lambda: clock[0], sleep=sleep)
+        self.assertEqual(clock[0], 60)
+
+    def test_missing_new_heartbeat_rolls_back_pointer_and_restarts_previous_worker(self):
+        old, config = self.installed_worker()
+        config['service'] = True
+        old['config'] = config
+        manifest, files = ins.read_release(self.v2)
+        new_manager, old_manager = Mock(), Mock()
+        with patch.object(ins, 'Services', side_effect=[new_manager, old_manager]), \
+             patch.object(ins, 'wait_worker_status', side_effect=RuntimeError('health confirmation failed')) as health, \
+             patch.object(ins, 'wait_doctor', side_effect=AssertionError('must check running code first')), \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'health confirmation failed'):
+                ins.transaction(config, old, manifest, files, ins.parser().parse_args([]))
+        health.assert_called_once()
+        new_manager.start.assert_called_once()
+        new_manager.stop.assert_called_once()
+        old_manager.start.assert_called_once()
+        self.assertEqual(ins.current_version(self.prefix), old['version'])
+        self.assertEqual(ins.read_json(self.prefix / 'installation.json')['version'], old['version'])
+
+    def test_successful_upgrade_keeps_agent_configuration_bytes(self):
+        old, config = self.installed_worker()
+        path = self.state / 'worker/agent.json'
+        custom = dict(node_id='node-a', controller='https://example.invalid', disabled_harnesses={'codex': 'review'},
+                      labels=['custom'], provider_account_refs={'codex': 'local'}, extension={'untouched': [1, 2]},
+                      workspace_root=str(self.temp / 'workspace'))
+        save(path, custom)
+        (self.state / 'worker/node.token').write_text('fixture')
+        before = path.read_bytes()
+        setup = ins.configure_worker_workspace
+        def acl_runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, '"user","S-1-5-21-1-2-3-4"\n', '')
+        with patch.object(ins, 'drain_client', return_value=(object(), 'node-a')), \
+             patch.object(ins, 'drain_and_wait', return_value=False), patch.object(ins, 'set_drain'), \
+             patch.object(ins, 'configure_worker_workspace', side_effect=lambda c: setup(c, acl_runner)):
+            self.invoke('--release', str(self.v2), role='worker')
+        self.assertEqual(path.read_bytes(), before)
+
+
+class WaitLockTests(unittest.TestCase):
+    """Windows schtasks /End 返回时进程可能尚未退出：锁短暂被占用不应中止升级。"""
+
+    def test_retries_until_released_then_times_out(self):
+        attempts = []
+
+        class Busy:
+            def __enter__(self):
+                attempts.append(1)
+                if len(attempts) < 3:
+                    raise ValueError('another agent owns this data directory')
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        clock = iter(range(100))
+        lock = ins.wait_lock(Busy, timeout=10, clock=lambda: next(clock), sleep=lambda s: None)
+        self.assertIsInstance(lock, Busy)
+        self.assertEqual(len(attempts), 3)
+
+        class Held(Busy):
+            def __enter__(self):
+                raise ValueError('another agent owns this data directory')
+
+        clock = iter(range(100))
+        with self.assertRaisesRegex(ValueError, 'another agent'):
+            ins.wait_lock(Held, timeout=3, clock=lambda: next(clock), sleep=lambda s: None)
