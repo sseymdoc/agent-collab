@@ -43,6 +43,12 @@ class PathAndManifestTests(unittest.TestCase):
         p.validate_manifest({'version': 1, 'base': None, 'files': files, 'deleted': []})
         self.assertLess(time.monotonic() - started, 3.0)
 
+    def test_manifest_rejects_case_only_collisions_in_files_and_directories(self):
+        for files in ([entry('A.txt'), entry('a.txt')], [entry('Dir/a'), entry('dir/b')]):
+            with self.subTest(files=[f['path'] for f in files]), self.assertRaises(ValueError):
+                p.validate_manifest({'version': 1, 'base': None, 'files': files, 'deleted': []})
+        p.validate_manifest({'version': 1, 'base': None, 'files': [entry('dir/a'), entry('dir/b')], 'deleted': []})
+
     def test_manifest_diff_accepts_missing_new_manifest(self):
         old = {'version': 1, 'base': None, 'files': [entry('a')], 'deleted': []}
         self.assertEqual(p.manifest_diff(old, None), {'added': [], 'modified': [], 'deleted': ['a']})

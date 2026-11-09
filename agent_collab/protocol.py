@@ -174,6 +174,14 @@ def validate_manifest(manifest):
         raise ValueError('无 base 的 manifest 不能有 deleted')
     if len(set(deleted)) != len(deleted) or set(deleted) & set(paths):
         raise ValueError('deleted 重复或与 files 重叠')
+    # 文件路径及各级目录前缀不能只差大小写：Windows/macOS 默认文件系统无法同时容纳，
+    # 否则检查点会被标为 durable，却在物化或回写时被拒绝。
+    names = set()
+    for path in paths:
+        parts = path.split('/')
+        names.update('/'.join(parts[:i]) for i in range(1, len(parts) + 1))
+    if case_collisions(sorted(names)):
+        raise ValueError('case-conflicting paths（仅大小写不同，Windows/macOS 无法同时容纳）：' + str(case_collisions(sorted(names))[0]))
     # 线性检查：每个路径的真前缀都不能同时是文件（大 manifest 在全局事务锁内校验）。
     path_set = set(paths)
     for path in paths:
