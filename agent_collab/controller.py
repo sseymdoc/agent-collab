@@ -1309,8 +1309,10 @@ class App:
         job = self.get('job', attempt['job_id']) if attempt['job_id'] else None
         if job is None:
             # 只计新事件：响应丢失后的重发会作为 duplicates 成功返回，不能重复消耗配额。
-            fresh = sum(1 for event in data['events'] if not isinstance(event, dict) or not self.store.db.execute(
-                'SELECT 1 FROM event_keys WHERE event_id=?', (str(event.get('event_id')),)).fetchone())
+            # 同一批内重复的 event_id 只会写入一次，先去重再计数。
+            ids = {str(event.get('event_id')) for event in data['events'] if isinstance(event, dict)}
+            fresh = sum(1 for ident in ids if not self.store.db.execute(
+                'SELECT 1 FROM event_keys WHERE event_id=?', (ident,)).fetchone())
             used = self.store.get('archive_quota', attempt['node_id'], 0)
             if used + fresh > ARCHIVE_EVENT_LIMIT:
                 raise APIError('too_large', 'archive-only event quota exceeded for node', limit=ARCHIVE_EVENT_LIMIT)

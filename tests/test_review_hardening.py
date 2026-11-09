@@ -172,6 +172,19 @@ class ControllerHardeningTests(ControllerCase):
         return {'epoch': 1, 'lease_token': '', 'events': [
             {'event_id': uid(), 'type': 'attempt.progress', 'payload': {'done': 1, 'total': 2}} for _ in range(count)]}
 
+    def test_duplicate_event_ids_within_a_batch_count_once_toward_archive_quota(self):
+        node = self.node('a')
+        meta = self.app.store.get('meta', 'controller')
+        meta['authority_generation'] = 2
+        self.app.store.put('meta', 'controller', meta)
+        with patch.object(c, 'ARCHIVE_EVENT_LIMIT', 2):
+            batch = self.events(1)
+            batch['events'] = batch['events'] * 2  # 同一事件在一批里出现两次
+            result = self.call('POST', '/attempts/' + uid() + '/events', batch, token=node.token)
+            self.assertEqual((len(result['accepted']), len(result['duplicates'])), (1, 1))
+            self.call('POST', '/attempts/' + uid() + '/events', self.events(1), token=node.token)  # 仍剩 1 个名额
+            self.call('POST', '/attempts/' + uid() + '/events', self.events(1), token=node.token, status=413)
+
     def test_events_for_unknown_attempts_need_a_restore_and_are_bounded(self):
         node = self.node('a')
         self.call('POST', '/attempts/' + uid() + '/events', self.events(1), token=node.token, status=404)
