@@ -129,7 +129,7 @@ def check_rel_path(path):
 
 
 WINDOWS_FORBIDDEN = re.compile(r'[<>:"|?*\x00-\x1f]')
-WINDOWS_RESERVED = re.compile(r'^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\.[^.]*)?$', re.IGNORECASE)
+WINDOWS_RESERVED = re.compile(r'^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$', re.IGNORECASE)  # 含多段扩展名，如 nul.tar.gz
 
 
 def case_collisions(paths):

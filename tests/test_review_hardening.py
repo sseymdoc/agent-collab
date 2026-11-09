@@ -20,7 +20,7 @@ def entry(path, data=b'x'):
 
 class PathAndManifestTests(unittest.TestCase):
     def test_windows_unrepresentable_or_aliasing_names_rejected(self):
-        for bad in ('foo.', 'foo ', 'dir./x', 'a:b', 'x?y', 'q"z', 'p|q', 'star*', 'CON', 'nul.txt', 'a/LPT1', 'com3.log', 'tab\there'):
+        for bad in ('foo.', 'foo ', 'dir./x', 'a:b', 'x?y', 'q"z', 'p|q', 'star*', 'CON', 'nul.txt', 'nul.tar.gz', 'con.a.b', 'a/LPT1', 'com3.log', 'tab\there'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 p.check_rel_path(bad)
         # Windows 工作区中，带盘符的路径段会被解析成盘符相对路径而逃出工作区。
@@ -201,7 +201,8 @@ class StubAdmissionTests(unittest.TestCase):
     def test_malformed_or_unknown_steps_rejected(self):
         for step in ({'bogus': {}}, {'write': {'path': 'a.txt'}}, {'write': {'path': '../x', 'content': ''}},
                      {'sleep': -1}, {'sleep': True}, {'run': []}, {'run': 'echo hi'}, {'fail': 'not-a-class'},
-                     {'side_effect': {'state': 'done'}}, {'write': {}, 'run': ['x']}, 'write'):
+                     {'side_effect': {'state': 'done'}}, {'side_effect': {'op_id': '', 'state': 'done'}},
+                     {'side_effect': {'op_id': 'op', 'state': 'maybe'}}, {'write': {}, 'run': ['x']}, 'write'):
             with self.subTest(step=step), self.assertRaises(ValueError):
                 d.validate_contract(self.contract([step]))
 

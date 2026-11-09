@@ -52,8 +52,10 @@ def validate_stub_step(step):
         raise ValueError('stub fail requires a failure class')
     elif op == 'run' and (not value or any(not isinstance(arg, str) or not arg for arg in value)):
         raise ValueError('stub run requires a nonempty string argv')
-    elif op == 'side_effect' and not isinstance(value.get('op_id'), str):
-        raise ValueError('stub side_effect requires op_id')
+    elif op == 'side_effect' and (not isinstance(value.get('op_id'), str) or not value['op_id']
+                                  or value.get('state') not in ('intent', 'done', 'unknown')):
+        # 与 controller 受理 attempt.side_effect 事件的条件一致，避免派单后才被拒。
+        raise ValueError('stub side_effect requires nonempty op_id and state intent/done/unknown')
 
 
 def validate_contract(value):
