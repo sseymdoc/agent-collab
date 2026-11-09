@@ -31,6 +31,31 @@ def string_list(value, name):
         raise ValueError(name + ' must be a string list')
 
 
+STUB_STEPS = {'write': dict, 'delete': dict, 'sleep': (int, float), 'checkpoint': dict,
+              'progress': dict, 'side_effect': dict, 'fail': str, 'run': list}
+
+
+def validate_stub_step(step):
+    """§9 stub 步骤在受理时校验形状，避免畸形契约被派单后才在节点上失败。"""
+    if not isinstance(step, dict) or len(step) != 1:
+        raise ValueError('stub step must contain exactly one operation')
+    op, value = next(iter(step.items()))
+    if op not in STUB_STEPS or isinstance(value, bool) or not isinstance(value, STUB_STEPS[op]):
+        raise ValueError('unsupported or malformed stub step: ' + str(op))
+    if op in ('write', 'delete'):
+        p.check_rel_path(value.get('path'))
+        if op == 'write' and not isinstance(value.get('content'), str):
+            raise ValueError('stub write requires string content')
+    elif op == 'sleep' and (not math.isfinite(value) or value < 0):
+        raise ValueError('stub sleep must be a nonnegative number')
+    elif op == 'fail' and value not in p.FAILURE_CLASSES:
+        raise ValueError('stub fail requires a failure class')
+    elif op == 'run' and (not value or any(not isinstance(arg, str) or not arg for arg in value)):
+        raise ValueError('stub run requires a nonempty string argv')
+    elif op == 'side_effect' and not isinstance(value.get('op_id'), str):
+        raise ValueError('stub side_effect requires op_id')
+
+
 def validate_contract(value):
     if not isinstance(value, dict):
         raise ValueError('contract must be an object')
@@ -81,6 +106,9 @@ def validate_contract(value):
             raise ValueError('claude requires explicit model and effort')
     elif set(params) - {'steps'} or not isinstance(params.get('steps', []), list):
         raise ValueError('invalid stub parameters')
+    else:
+        for step in params.get('steps', []):
+            validate_stub_step(step)
     if 'coordinates' in c:
         coordinates = c['coordinates']
         if not isinstance(coordinates, dict) or set(coordinates) != {'job_id', 'work_package_id'} or c['harness'] != 'claude':

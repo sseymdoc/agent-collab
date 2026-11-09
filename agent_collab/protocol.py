@@ -118,7 +118,18 @@ def check_rel_path(path):
     parts = path.split('/')
     if any(p in ('', '.', '..') for p in parts):
         raise ValueError('路径含空段、. 或 ..：' + path)
+    # 工作区会在 Windows 节点物化：Windows 无法表示或会映射成别名的名称一律拒绝，
+    # 否则 "foo" 与 "foo." 会在 Windows 上互相覆盖，"a:b" 会变成备用数据流。
+    if WINDOWS_FORBIDDEN.search(path):
+        raise ValueError('路径含 Windows 不允许的字符：' + path)
+    for part in parts:
+        if part[-1] in '. ' or WINDOWS_RESERVED.match(part):
+            raise ValueError('路径段以点或空格结尾，或为 Windows 保留设备名：' + path)
     return path
+
+
+WINDOWS_FORBIDDEN = re.compile(r'[<>:"|?*\x00-\x1f]')
+WINDOWS_RESERVED = re.compile(r'^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\.[^.]*)?$', re.IGNORECASE)
 
 
 def case_collisions(paths):
@@ -138,8 +149,8 @@ def validate_manifest(manifest):
     """
     if not isinstance(manifest, dict) or set(manifest) != {'version', 'base', 'files', 'deleted'}:
         raise ValueError('manifest 需要且只允许 version/base/files/deleted')
-    if manifest['version'] != 1:
-        raise ValueError('manifest.version 必须为 1')
+    if type(manifest['version']) is not int or manifest['version'] != 1:
+        raise ValueError('manifest.version 必须为整数 1')
     if manifest['base'] is not None:
         check_sha256(manifest['base'], 'manifest.base')
     if not isinstance(manifest['files'], list) or not isinstance(manifest['deleted'], list):
@@ -163,9 +174,14 @@ def validate_manifest(manifest):
         raise ValueError('无 base 的 manifest 不能有 deleted')
     if len(set(deleted)) != len(deleted) or set(deleted) & set(paths):
         raise ValueError('deleted 重复或与 files 重叠')
-    for parent in paths:
-        if any(p.startswith(parent + '/') for p in paths):
-            raise ValueError('路径既是文件又是目录：' + parent)
+    # 线性检查：每个路径的真前缀都不能同时是文件（大 manifest 在全局事务锁内校验）。
+    path_set = set(paths)
+    for path in paths:
+        parts = path.split('/')
+        for i in range(1, len(parts)):
+            prefix = '/'.join(parts[:i])
+            if prefix in path_set:
+                raise ValueError('路径既是文件又是目录：' + prefix)
     files.sort(key=lambda f: f['path'])
     return {'version': 1, 'base': manifest['base'], 'files': files, 'deleted': sorted(deleted)}
 
@@ -177,7 +193,7 @@ def manifest_sha256(manifest):
 def manifest_diff(old, new):
     """old/new 为已校验 manifest 或 None；返回 added/modified/deleted 路径列表。"""
     a = {f['path']: f for f in (old or {}).get('files', [])}
-    b = {f['path']: f for f in new['files']}
+    b = {f['path']: f for f in (new or {}).get('files', [])}
     return {
         'added': sorted(set(b) - set(a)),
         'modified': sorted(p for p in set(a) & set(b) if (a[p]['sha256'], a[p]['executable']) != (b[p]['sha256'], b[p]['executable'])),

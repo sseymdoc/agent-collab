@@ -76,9 +76,10 @@ def checked_manifest(manifest):
 def safe_path(root, relative):
     p.check_rel_path(relative)
     root = Path(root).absolute()
-    for parent in [root] + list(root.parents):
-        if parent.is_symlink():
-            raise ValueError('symbolic link in workspace root')
+    # 工作区根本身不能是符号链接；系统祖先目录（如 macOS 的 /tmp -> /private/tmp）按真实路径解析。
+    if root.is_symlink():
+        raise ValueError('symbolic link in workspace root')
+    root = root.parent.resolve() / root.name
     current = root
     for component in relative.split('/'):
         if current.exists() and not current.is_dir():
@@ -116,6 +117,10 @@ def materialize(target_dir, manifest, fetch_blob):
     return manifest
 
 
+def _raise(error):
+    raise error
+
+
 def snapshot(work_dir, base_manifest=None, windows=None, exclude=None):
     """Return (complete manifest, hash -> bytes), including canonical manifest blob."""
     root = Path(work_dir)
@@ -127,7 +132,8 @@ def snapshot(work_dir, base_manifest=None, windows=None, exclude=None):
     patterns = validate_excludes(DEFAULT_EXCLUDES if exclude is None else exclude)
     windows = os.name == 'nt' if windows is None else windows
     files, blobs, names = [], {}, []
-    for directory, dirs, filenames in os.walk(str(root), followlinks=False):
+    # 读不了的子目录必须让快照失败：静默跳过会把其中的基线文件记成 deleted，恢复时丢文件。
+    for directory, dirs, filenames in os.walk(str(root), followlinks=False, onerror=_raise):
         for name in dirs + filenames:
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
@@ -168,7 +174,7 @@ def integrate(target_dir, base_manifest, result_manifest, fetch_blob, backup_dir
     after = {f['path']: f for f in result['files']}
     diff = p.manifest_diff(base, result)
     # A snapshot omission must never become a deletion of excluded baseline files.
-    patterns = validate_excludes(exclude or [])
+    patterns = validate_excludes(DEFAULT_EXCLUDES if exclude is None else exclude)  # 与 snapshot() 的缺省一致
     diff = {kind: [path for path in paths if not workspace_excluded(path, patterns)]
             for kind, paths in diff.items()}
     changed = sorted(diff['added'] + diff['modified'] + diff['deleted'])

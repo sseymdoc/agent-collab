@@ -172,7 +172,7 @@ agent 回写时同样忽略匹配路径，避免把快照省略误当成对目�
 
 **complete.report（WP5）**：agent 在每次 complete 中提供 JSON 对象，经 `agent.clean` 移除已知节点/租约令牌，
 以 canonical JSON 的 UTF-8 字节计不超过 65536 bytes。controller 原样保存 report（包括 usage 的 token 计数字段）；
-显式非对象（含 null）返回 400，超过上限返回 413；为兼容旧调用方，省略 report 字段仍允许。历史 report=null 不改写。
+显式非对象（null 除外）返回 400，超过上限返回 413；为兼容旧调用方，省略 report 字段或显式 `report=null` 仍允许。历史 report=null 不改写。
 
 - stub：`{"harness":"stub","steps":[{"index":0,"op":"run","status":"done|skipped_from_checkpoint|failed","exit_code":0,"stdout_tail":"...","stderr_tail":"..."}]}`。
   steps 按 index 排序，记录实际执行/尝试及检查点跳过的步骤；未触及的步骤不伪造结果。非 run 或无退出码时 exit_code=null；run 两个输出尾部各 ≤4096 UTF-8 bytes。

@@ -36,7 +36,9 @@ class ContractTest(unittest.TestCase):
 
     def test_auth_unknown_schedulable_expired_not_and_sticky(self):
         n = node(harness={'stub': '0.1', 'codex': '0.167.0'})
-        self.assertNotIn('auth_unhealthy:codex', reasons(job('codex'), n))
+        self.assertNotIn('auth_unhealthy:codex', reasons(job('codex'), n))  # 未上报
+        n['auth_health'] = {'codex': 'unknown'}
+        self.assertNotIn('auth_unhealthy:codex', reasons(job('codex'), n))  # 显式 unknown 仍可调度
         n['auth_health'] = merge_health({'codex': 'expired'}, {'codex': 'unknown'})
         self.assertIn('auth_unhealthy:codex', reasons(job('codex'), n))
         self.assertEqual(merge_health({'codex': 'expired'}, {'codex': 'ok'}), {'codex': 'ok'})

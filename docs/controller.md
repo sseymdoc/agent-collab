@@ -51,7 +51,7 @@ serve 全生命周期持有 OS 文件锁 `controller.lock`；第二个 serve 或
 }
 ```
 
-未知配置键、非正/非有限时间或尺寸、错误公开源均拒绝。时间由 controller 的 `clock()` 决定；生产默认 wall clock，需保持主机时钟正常。以上间隔是协议默认值，不是实测 RTO/RPO。重启不会增加 generation；会延长已有活动租约并记录 `controller.started`，不重复建立 attempt。后台每秒 tick；claim/heartbeat 也调度。心跳正常而没有输出不会判为失联。
+顶层未知配置键、非正/非有限时间或尺寸、错误公开源均拒绝。`managed_coordinator` 与 `standby_profiles` 内部只读取已定义字段：未知子键被忽略，字段缺失或非法时 overview 显示 `profile_missing`（不报配置错误），请据此核对拼写。时间由 controller 的 `clock()` 决定；生产默认 wall clock，需保持主机时钟正常。以上间隔是协议默认值，不是实测 RTO/RPO。重启不会增加 generation；会延长已有活动租约并记录 `controller.started`，不重复建立 attempt。后台每秒 tick；claim/heartbeat 也调度。心跳正常而没有输出不会判为失联。
 
 SQLite 事务同时提交权威状态、事件和幂等回执。请求错误回滚该请求；已发生的到期处理是独立事实。blob 是不可变外部文件，数据库回滚可能留下未引用 blob，不会产生引用未写完 blob 的 durable 状态。上传中的 checkpoint 只有文件哈希已验证且长度匹配后才能 durable，并与 job 指针同事务提交；晚完成的旧 checkpoint 不会覆盖较新的指针。
 

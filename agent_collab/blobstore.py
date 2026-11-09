@@ -22,12 +22,20 @@ class BlobStore:
         return path.is_file() and (size is None or path.stat().st_size == size)
 
     def read(self, digest):
-        return self.path(digest).read_bytes()
+        # 写入时已校验哈希；读取时再校验，静置期间的损坏不会被当作正确内容返回。
+        data = self.path(digest).read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError('stored blob is corrupted: ' + digest)
+        return data
 
     def put(self, digest, data):
         target = self.path(digest)
         if len(data) > self.max_bytes:
             raise OverflowError('blob exceeds max_blob_bytes')
+        created, missing = [], target.parent
+        while not missing.exists():
+            created.append(missing)
+            missing = missing.parent
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix='.upload-', dir=str(target.parent))
         try:
@@ -42,11 +50,13 @@ class BlobStore:
             existed = target.exists()
             os.replace(temporary, str(target))
             if os.name == 'posix':
-                directory = os.open(str(target.parent), os.O_RDONLY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
+                # 文件所在目录，以及本次新建的分片目录在其父目录中的条目，都要落盘。
+                for path in [target.parent] + [d.parent for d in created]:
+                    directory = os.open(str(path), os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
             return not existed
         finally:
             if os.path.exists(temporary):
