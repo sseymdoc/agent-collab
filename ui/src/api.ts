@@ -35,9 +35,22 @@ function setCoord(wp: string, v: CoordHeld | null) {
   coordMem.set(wp, v)
   try { v ? sessionStorage.setItem(coordKey(wp), JSON.stringify(v)) : sessionStorage.removeItem(coordKey(wp)) } catch { /* 忽略 */ }
 }
-// 取得请求的响应丢失（网络错误）时保留请求体，下次原样重放：controller 按 request_id 返回同一令牌，
-// 而不是因租约已被（自己）占用而拒绝。收到 controller 的明确答复后丢弃。
+// 取得请求的响应丢失（网络错误）时保留请求体，由用户显式“恢复”时原样重放：controller 按 request_id 返回同一令牌，
+// 而不是因租约已被（自己）占用而拒绝。新的取得/接管总是新请求，不会悄悄重放旧请求。收到 controller 的明确答复后丢弃。
 const pendingTake = new Map<string, J>()
+export const pendingTakeOf = (wp: string) => pendingTake.get(wp) ?? null
+
+async function sendTake(wp: string, body: J) {
+  pendingTake.set(wp, body)
+  let d: any
+  try { d = await call('POST', '/packages/' + wp + '/coordinator', body, coordHeader(wp)) } catch (e) {
+    if (e instanceof ApiError) pendingTake.delete(wp)
+    throw e
+  }
+  pendingTake.delete(wp)
+  setCoord(wp, typeof d?.coordinator_token === 'string' ? { token: d.coordinator_token, version: d.version } : null)
+  return d
+}
 
 // 任何请求得到 401 都表示会话已失效（如超过会话有效期），由 App 切回登录页。
 let unauthorized = () => {}
@@ -88,18 +101,9 @@ export const api = {
   assess: (id: string, wp: string, v: number, body: J) =>
     call('POST', '/jobs/' + id + '/assess', { request_id: uuid(), expected_version: v, assessment_id: uuid(), ...body }, coordHeader(wp)),
   coordinator: (wp: string) => call('GET', '/packages/' + wp + '/coordinator'),
-  takeCoordinator: async (wp: string, takeover: boolean, reason: string) => {
-    const body = pendingTake.get(wp) ?? { request_id: uuid(), holder_kind: 'interactive', holder_ref: 'web-console', ttl_s: 1800, takeover, reason }
-    pendingTake.set(wp, body)
-    let d: any
-    try { d = await call('POST', '/packages/' + wp + '/coordinator', body, coordHeader(wp)) } catch (e) {
-      if (e instanceof ApiError) pendingTake.delete(wp)
-      throw e
-    }
-    pendingTake.delete(wp)
-    setCoord(wp, typeof d?.coordinator_token === 'string' ? { token: d.coordinator_token, version: d.version } : null)
-    return d
-  },
+  takeCoordinator: (wp: string, takeover: boolean, reason: string) =>
+    sendTake(wp, { request_id: uuid(), holder_kind: 'interactive', holder_ref: 'web-console', ttl_s: 1800, takeover, reason }),
+  resumeTake: (wp: string) => { const body = pendingTake.get(wp); return body ? sendTake(wp, body) : Promise.reject(new Error('没有待恢复的请求')) },
   // 成功后才清除令牌：失败或响应丢失时保留，便于重试释放。
   releaseCoordinator: async (wp: string) => {
     const d = await call('DELETE', '/packages/' + wp + '/coordinator', undefined, coordHeader(wp))

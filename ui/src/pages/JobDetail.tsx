@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { api, blobUrl, coordHeld } from '../api'
+import { api, blobUrl, coordHeld, pendingTakeOf } from '../api'
 import { Action, Badge, Json, Section, errText, show, short, useData, when } from '../ui'
 
 export function JobDetail({ id, tick }: { id: string; tick: number }) {
@@ -139,6 +139,7 @@ function Coordinator({ job, tick }: { job: any; tick: number }) {
   const held = coordHeld(wp)
   // 只凭本地令牌不够：别人接管后旧令牌仍在。租约版本与取得时一致才算本页持有。
   const mine = !!(held && l && held.version === l.version)
+  const pending = pendingTakeOf(wp)
   const target = job.contract?.coordinates?.job_id
   return <Section title="协调权" extra={<span className="muted">同一根工作包同时只允许一个协调者（交互或受管 Claude）</span>}>
     {target && <p>本任务是受管协调回合，目标任务：<a href={'#/jobs/' + target}>{short(target)}</a></p>}
@@ -146,13 +147,16 @@ function Coordinator({ job, tick }: { job: any; tick: number }) {
     <p>{l ? <>当前持有：<b>{l.holder_kind === 'managed' ? '受管协调者' : '交互协调者'}</b>（{show(l.holder_ref)}），到期 {when(l.expires_at)}{mine ? '；由本页持有' : ''}</>
       : '当前无人持有协调权。'}</p>
     {held && l && !mine && <p className="warn-text">本页之前取得的协调令牌已失效（已被接管或已过期）。</p>}
+    {pending && !mine && <p className="warn-text">上次{pending.takeover ? '接管' : '取得'}请求没有收到响应，可能已在服务端生效。
+      “恢复”会原样重发那次请求：若已生效，本页取回同一令牌，不会再记一次接管；若未生效，按原请求重新处理。</p>}
     <div className="actions">
-      {/* 取得租约不发事件：成功后主动重读，令牌在 sessionStorage 中也不会触发重渲染。 */}
-      {!l && <Action label="取得协调权" run={() => api.takeCoordinator(wp, false, '').then(lease.reload)} />}
+      {/* 取得租约不发事件：完成后主动重读（失败也重读，以便显示“恢复”入口），令牌在 sessionStorage 中也不会触发重渲染。 */}
+      {pending && !mine && <Action label="恢复上次未确认的请求" run={() => api.resumeTake(wp).finally(lease.reload)} />}
+      {!l && <Action label="取得协调权" run={() => api.takeCoordinator(wp, false, '').finally(lease.reload)} />}
       {l && !mine && <span className="inline-form">
         <input placeholder="接管原因（必填，写入事件）" value={reason} onChange={e => setReason(e.target.value)} />
         <Action label="接管协调权" danger disabled={!reason.trim()} confirm="接管会使当前协调者的令牌失效，其后续验收/发布将被拒绝。确定？"
-          run={() => api.takeCoordinator(wp, true, reason.trim()).then(lease.reload)} />
+          run={() => api.takeCoordinator(wp, true, reason.trim()).finally(lease.reload)} />
       </span>}
       {mine && <Action label="释放协调权" run={() => api.releaseCoordinator(wp).finally(lease.reload)} />}
     </div>

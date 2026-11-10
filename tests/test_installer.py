@@ -106,6 +106,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(files['agent_collab/THIRD_PARTY.md'], b'# notices\n')
         self.assertFalse(any('secret' in name or name.endswith('.token') for name in files))
 
+    @unittest.skipIf(os.name == 'nt', 'symlink creation needs privileges on Windows')
+    def test_builder_rejects_symlinked_notice_files(self):
+        source = self.temp / 'source-link'
+        for folder in ('agent_collab', 'installer'):
+            shutil.copytree(str(ROOT / folder), str(source / folder))
+        (self.temp / 'outside.txt').write_text('not a license')
+        (source / 'LICENSE').symlink_to(self.temp / 'outside.txt')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            builder.build_release(source, self.temp / 'out-link', 'link-test')
+
     def test_tamper_rejected_before_any_prefix_or_state_write(self):
         def tamper(manifest, files):
             files['agent_collab/__init__.py'] += b'\n# tampered'
