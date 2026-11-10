@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ApiError } from './api'
 
 export const UNKNOWN = '未知'
@@ -51,11 +51,15 @@ export function errText(e: unknown) {
   return e instanceof Error ? e.message : String(e)
 }
 
-// 取数：tick 变化（SSE 事件）时重新拉取快照。
+// 取数：tick 变化（SSE 事件）时重新拉取快照。请求重叠时只采用最后一次发起的结果。
 export function useData<T>(load: () => Promise<T>, deps: unknown[]) {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const reload = useCallback(() => load().then(d => { setData(d); setError(null) }, e => setError(errText(e))), deps) // eslint-disable-line
+  const gen = useRef(0)
+  const reload = useCallback(() => {
+    const g = ++gen.current
+    return load().then(d => { if (g === gen.current) { setData(d); setError(null) } }, e => { if (g === gen.current) setError(errText(e)) })
+  }, deps) // eslint-disable-line
   useEffect(() => { void reload() }, [reload])
   return { data, error, reload }
 }

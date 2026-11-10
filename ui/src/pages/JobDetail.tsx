@@ -143,13 +143,14 @@ function Coordinator({ job, tick }: { job: any; tick: number }) {
     <p>{l ? <>当前持有：<b>{l.holder_kind === 'managed' ? '受管协调者' : '交互协调者'}</b>（{show(l.holder_ref)}），到期 {when(l.expires_at)}{mine ? '；由本页持有' : ''}</>
       : '当前无人持有协调权。'}</p>
     <div className="actions">
-      {!l && <Action label="取得协调权" run={() => api.takeCoordinator(wp, false, '')} />}
+      {/* 取得租约不发事件：成功后主动重读，令牌在 sessionStorage 中也不会触发重渲染。 */}
+      {!l && <Action label="取得协调权" run={() => api.takeCoordinator(wp, false, '').then(lease.reload)} />}
       {l && !mine && <span className="inline-form">
         <input placeholder="接管原因（必填，写入事件）" value={reason} onChange={e => setReason(e.target.value)} />
         <Action label="接管协调权" danger disabled={!reason.trim()} confirm="接管会使当前协调者的令牌失效，其后续验收/发布将被拒绝。确定？"
-          run={() => api.takeCoordinator(wp, true, reason.trim())} />
+          run={() => api.takeCoordinator(wp, true, reason.trim()).then(lease.reload)} />
       </span>}
-      {mine && <Action label="释放协调权" run={() => api.releaseCoordinator(wp)} />}
+      {mine && <Action label="释放协调权" run={() => api.releaseCoordinator(wp).finally(lease.reload)} />}
     </div>
   </Section>
 }

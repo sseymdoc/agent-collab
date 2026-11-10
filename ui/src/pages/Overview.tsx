@@ -8,7 +8,7 @@ const GROUPS: [string, string[]][] = [
 ]
 
 export function Overview({ tick }: { tick: number }) {
-  const { data: o, error } = useData(() => api.overview(), [tick])
+  const { data: o, error, reload } = useData(() => api.overview(), [tick])
   if (error) return <p className="err">{error}</p>
   if (!o) return <p className="muted">加载中…</p>
   const counts = o.job_counts ?? o.counts ?? {}
@@ -54,7 +54,7 @@ export function Overview({ tick }: { tick: number }) {
     <Section title="派单" extra={<Badge v={o.dispatch_paused ? 'blocked' : 'running'} />}>
       <p>{o.dispatch_paused ? '全局派单已暂停：新任务受理后排队，不分配节点；执行中的任务不受影响。' : '派单正常。'}</p>
       <Action label={o.dispatch_paused ? '恢复派单' : '暂停派单'} danger={!o.dispatch_paused}
-        run={() => api.dispatch(!o.dispatch_paused, ctl.metadata_version)} />
+        run={() => api.dispatch(!o.dispatch_paused, ctl.metadata_version).then(reload)} />
     </Section>
     <Section title="节点摘要">
       <table><thead><tr><th>节点</th><th>物理主机</th><th>状态</th><th>排空</th><th>最近联系</th></tr></thead>

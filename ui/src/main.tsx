@@ -1,6 +1,6 @@
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, ApiError } from './api'
+import { api, ApiError, onUnauthorized } from './api'
 import { useLive } from './live'
 import { errText } from './ui'
 import { Overview } from './pages/Overview'
@@ -39,11 +39,14 @@ function App() {
   const live = useLive(authed === true)
   const [bootErr, setBootErr] = useState<string | null>(null)
   useEffect(() => {
+    onUnauthorized(() => setAuthed(false))
     api.resume().then(() => setAuthed(true), e => {
       if (e instanceof ApiError && (e.status === 401 || e.status === 403)) setAuthed(false)
       else setBootErr(errText(e))
     })
   }, [])
+  // 事件流断开时探测会话；页面空闲时会话过期也能由 401 切回登录页。
+  useEffect(() => { if (authed && live.state === 'retrying') api.resume().catch(() => {}) }, [authed, live.state])
   if (bootErr) return <main className="login"><p className="err">无法连接 controller：{bootErr}</p></main>
   if (authed === null) return <main className="login"><p className="muted">连接 controller…</p></main>
   if (!authed) return <Login onDone={() => setAuthed(true)} />
@@ -55,7 +58,8 @@ function App() {
       <strong>agent-collab</strong>
       <nav>{nav.map(([k, t]) => <a key={k} href={'#/' + k} className={page === k ? 'on' : ''}>{t}</a>)}</nav>
       <span className={'badge ' + conn[0]} title={'最后事件序号 ' + (live.lastSeq ?? '无')}>{conn[1]}</span>
-      <button className="link" onClick={async () => { await api.logout(); setAuthed(false) }}>退出</button>
+      {/* 服务端会话可能已失效（DELETE 返回 401），无论结果都回到登录页。 */}
+      <button className="link" onClick={() => { void api.logout().catch(() => {}).finally(() => setAuthed(false)) }}>退出</button>
     </header>
     <main>
       {page === 'nodes' ? <Nodes tick={live.tick} />

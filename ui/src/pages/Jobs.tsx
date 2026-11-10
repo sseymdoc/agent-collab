@@ -1,12 +1,21 @@
 import { useState } from 'react'
-import { api } from '../api'
+import { api, JOBS_PAGE } from '../api'
 import { Badge, Section, show, short, useData, when } from '../ui'
 
 export function Jobs({ tick }: { tick: number }) {
   const [status, setStatus] = useState('')
-  const { data, error } = useData(() => api.jobs(status), [tick, status])
+  // 分页游标栈：每项是对应页的 before（上一页最后一个 job_id）；空栈为最新一页。
+  const [pages, setPages] = useState<string[]>([])
+  const before = pages[pages.length - 1] ?? ''
+  const { data, error } = useData(() => api.jobs(status, before), [tick, status, before])
   const jobs: any[] = data ? (data.jobs ?? data) : []
-  return <Section title="工作包" extra={<select value={status} onChange={e => setStatus(e.target.value)}>
+  const pager = <p className="actions">
+    {pages.length > 0 && <button onClick={() => setPages(p => p.slice(0, -1))}>上一页（较新）</button>}
+    {pages.length > 1 && <button onClick={() => setPages([])}>回到最新</button>}
+    {jobs.length >= JOBS_PAGE && <button onClick={() => setPages(p => [...p, jobs[jobs.length - 1].job_id])}>下一页（更早）</button>}
+    <small className="muted">第 {pages.length + 1} 页，每页最多 {JOBS_PAGE} 个，按创建时间从新到旧</small>
+  </p>
+  return <Section title="工作包" extra={<select value={status} onChange={e => { setStatus(e.target.value); setPages([]) }}>
     <option value="">全部状态</option>
     {['queued', 'waiting_capability', 'running', 'recovering', 'waiting_reconcile', 'cancel_requested', 'cancelled', 'completed', 'failed'].map(s => <option key={s} value={s}>{s}</option>)}
   </select>}>
@@ -25,6 +34,7 @@ export function Jobs({ tick }: { tick: number }) {
         <td>{when(j.updated_at)}</td>
       </tr>)}</tbody>
     </table>
-    {data && !jobs.length && <p className="muted">没有工作包。</p>}
+    {data && !jobs.length && <p className="muted">{pages.length ? '没有更早的工作包。' : '没有工作包。'}</p>}
+    {pager}
   </Section>
 }

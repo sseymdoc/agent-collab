@@ -26,6 +26,10 @@ function setCoordToken(wp: string, v: string | null) {
   try { v ? sessionStorage.setItem(coordKey(wp), v) : sessionStorage.removeItem(coordKey(wp)) } catch { /* 忽略 */ }
 }
 
+// 任何请求得到 401 都表示会话已失效（如超过会话有效期），由 App 切回登录页。
+let unauthorized = () => {}
+export function onUnauthorized(f: () => void) { unauthorized = f }
+
 async function call(method: string, path: string, body?: unknown, extra: Record<string, string> = {}): Promise<any> {
   const headers: Record<string, string> = { Accept: 'application/json', ...extra }
   if (body !== undefined) headers['Content-Type'] = 'application/json'
@@ -39,6 +43,7 @@ async function call(method: string, path: string, body?: unknown, extra: Record<
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { data = { raw: text } }
   if (!r.ok) {
+    if (r.status === 401) { setCsrf(null); unauthorized() }
     const e = data?.error ?? {}
     throw new ApiError(r.status, e.code ?? 'http_' + r.status, e.message ?? text.slice(0, 200), e.details ?? {})
   }
@@ -46,6 +51,7 @@ async function call(method: string, path: string, body?: unknown, extra: Record<
 }
 
 export const uuid = () => crypto.randomUUID()
+export const JOBS_PAGE = 200
 
 export const api = {
   login: async (token: string) => { const d = await call('POST', '/session', { token }); setCsrf(d?.csrf_token ?? null); return d },
@@ -53,7 +59,8 @@ export const api = {
   // 刷新页面后凭 HttpOnly Cookie 取回 CSRF 令牌；401 表示需要重新登录。
   resume: async () => { const d = await call('GET', '/session'); setCsrf(d?.csrf_token ?? null); return d },
   overview: () => call('GET', '/overview'),
-  jobs: (status = '') => call('GET', '/jobs?limit=200' + (status ? '&status=' + encodeURIComponent(status) : '')),
+  // 按创建时间倒序分页：before 为上一页最后一个 job_id。
+  jobs: (status = '', before = '') => call('GET', '/jobs?limit=' + JOBS_PAGE + (status ? '&status=' + encodeURIComponent(status) : '') + (before ? '&before=' + encodeURIComponent(before) : '')),
   job: (id: string) => call('GET', '/jobs/' + id),
   explain: (id: string) => call('GET', '/jobs/' + id + '/explain'),
   nodes: () => call('GET', '/nodes'),
