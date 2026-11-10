@@ -29,6 +29,19 @@ $blockPattern = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
 
 function Read-Config { if (Test-Path -LiteralPath $config) { [IO.File]::ReadAllText($config) } else { '' } }
 function Write-Config([string]$text) { [IO.File]::WriteAllText($config, $text, [Text.Encoding]::ASCII) }
+# Accounts outside $allowed that own $path or may change it.
+function Get-OtherWriters([string]$path, [string[]]$allowed) {
+    $acl = Get-Acl -LiteralPath $path
+    # 0x50000000 is generic write and generic all, as stored on entries that only children inherit.
+    $write = [int][Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership' -bor 0x50000000
+    $others = @($acl.Access | Where-Object {
+            $_.AccessControlType -eq 'Allow' -and ([int]$_.FileSystemRights -band $write) -and
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin $allowed } |
+        ForEach-Object { "$($_.IdentityReference)" })
+    # The owner can rewrite the permissions whatever the entries say.
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { $others += "$($acl.Owner) (owner)" }
+    $others | Select-Object -Unique
+}
 
 if ($Remove) {
     Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
@@ -73,13 +86,25 @@ $overridable = 'PubkeyAuthentication|PasswordAuthentication|KbdInteractiveAuthen
     'AuthenticationMethods|PermitEmptyPasswords|AllowTcpForwarding|AllowAgentForwarding|X11Forwarding|PermitTunnel|MaxAuthTries'
 $matchScope = [regex]::Match($preserved, '(?ims)^[ \t]*Match\b.*').Value
 $conflicts += @([regex]::Matches($matchScope, "(?im)^[ \t]*($overridable)\b") | ForEach-Object { 'Match ' + $_.Groups[1].Value })
-# The key goes where the stock configuration reads it. Any other AuthorizedKeysFile would make
-# sshd ignore that file or honour keys this script never saw.
-$conflicts += @([regex]::Matches($preserved, '(?im)^[ \t]*AuthorizedKeysFile[ \t=]+(.*?)[ \t]*\r?$') |
-    Where-Object { $_.Groups[1].Value -notmatch '^(\.ssh/authorized_keys|__PROGRAMDATA__/ssh/administrators_authorized_keys)$' } |
-    ForEach-Object { 'AuthorizedKeysFile ' + $_.Groups[1].Value })
+# The key goes where the stock configuration reads it: the account's own file, set outside any
+# Match block, or the shared file through the stock Match block for administrators. An
+# AuthorizedKeysFile anywhere else would make sshd ignore that file or honour keys this script
+# never saw.
+$stockMatch = '(?im)^[ \t]*Match[ \t]+Group[ \t]+administrators[ \t]*\r?\n[ \t]*AuthorizedKeysFile[ \t]+__PROGRAMDATA__/ssh/administrators_authorized_keys[ \t]*\r?$'
+$keysFile = '(?im)^[ \t]*AuthorizedKeysFile[ \t=]+(.*?)[ \t]*\r?$'
+$conflicts += @([regex]::Matches($preserved.Substring(0, $preserved.Length - $matchScope.Length), $keysFile) |
+    Where-Object { $_.Groups[1].Value -ne '.ssh/authorized_keys' } | ForEach-Object { 'AuthorizedKeysFile ' + $_.Groups[1].Value })
+$conflicts += @([regex]::Matches([regex]::Replace($matchScope, $stockMatch, ''), $keysFile) |
+    ForEach-Object { 'Match AuthorizedKeysFile ' + $_.Groups[1].Value })
 if ($conflicts) {
     throw "sshd_config has directives outside the managed block that add to or override it ($(($conflicts | Select-Object -Unique) -join ', ')); remove or merge them by hand, then rerun"
+}
+
+# The key file is prepared next to sshd_config. That protects it only while nobody but
+# Administrators and SYSTEM can write to that directory, which is how OpenSSH creates it.
+if (Test-Path -LiteralPath $sshDir) {
+    $others = @(Get-OtherWriters $sshDir 'S-1-5-32-544', 'S-1-5-18')
+    if ($others) { throw "$sshDir can be written by $($others -join ', '); restrict it to Administrators and SYSTEM, then rerun" }
 }
 
 try {
@@ -91,7 +116,6 @@ try {
 # Administrators' keys live in the shared file only while the stock Match block is in place (a
 # configuration that does not exist yet is created with it). Without it sshd reads the account's
 # own file, as it does for every other user.
-$stockMatch = '(?im)^[ \t]*Match[ \t]+Group[ \t]+administrators[ \t]*\r?\n[ \t]*AuthorizedKeysFile[ \t]+__PROGRAMDATA__/ssh/administrators_authorized_keys[ \t]*\r?$'
 $shared = $administrator -and (-not (Test-Path -LiteralPath $config) -or $preserved -match $stockMatch)
 $writers = @('S-1-5-32-544', 'S-1-5-18')
 if ($shared) {
@@ -103,18 +127,13 @@ if ($shared) {
 # Existing keys are kept, so they must come from a file nobody else could have written. sshd
 # ignores a file that others own or can write; tightening it would bring every line in it to life.
 $existing = @()
+$previousKeys = $null
 if (Test-Path -LiteralPath $keys) {
-    $acl = Get-Acl -LiteralPath $keys
-    $writeRights = [Security.AccessControl.FileSystemRights]'Write, Delete, ChangePermissions, TakeOwnership'
-    $others = @($acl.Access | Where-Object {
-            $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $writeRights) -and
-            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin $writers } |
-        ForEach-Object { "$($_.IdentityReference)" })
-    # The owner can rewrite the permissions whatever the entries say.
-    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $writers) { $others += "$($acl.Owner) (owner)" }
+    $others = @(Get-OtherWriters $keys $writers)
     if ($others) {
-        throw "$keys can be written by $(($others | Select-Object -Unique) -join ', '); review its contents, then restrict or remove the file and rerun"
+        throw "$keys can be written by $($others -join ', '); review its contents, then restrict or remove the file and rerun"
     }
+    $previousKeys = [IO.File]::ReadAllBytes($keys)
     $existing = @(Get-Content -LiteralPath $keys)
 }
 
@@ -140,7 +159,10 @@ $block = @($begin, "Port $Port", 'PubkeyAuthentication yes', 'PasswordAuthentica
     'KbdInteractiveAuthentication no', 'AuthenticationMethods publickey', 'PermitEmptyPasswords no',
     "AllowUsers $allowUsers", 'AllowTcpForwarding no', 'AllowAgentForwarding no', 'X11Forwarding no',
     'PermitTunnel no', 'MaxAuthTries 3', 'LoginGraceTime 30', $end) -join "`r`n"
+$stage = $null
+$movedKeys = $false
 $createdRule = $false
+$oldRule = $null
 # sshd uses the first value of each of these keywords (the accumulating ones were rejected above
 # when already present): the managed block goes before the defaults.
 Write-Config ($block + "`r`n" + [regex]::Replace($previous, $blockPattern, ''))
@@ -161,16 +183,16 @@ try {
     if (-not $shared) { $grant += "${User}:F" }
     & icacls.exe $stage /inheritance:r /grant $grant | Out-Null
     if ($LASTEXITCODE -eq 0 -and -not $shared) { & icacls.exe $stage /setowner $User | Out-Null }
-    if ($LASTEXITCODE -ne 0) {
-        Remove-Item -LiteralPath $stage -Force
-        throw "cannot set the permissions of the authorized keys for $User"
-    }
+    if ($LASTEXITCODE -ne 0) { throw "cannot set the permissions of the authorized keys for $User" }
     [void](New-Item -ItemType Directory -Force -Path (Split-Path $keys))
     Move-Item -LiteralPath $stage -Destination $keys -Force
+    $movedKeys = $true
 
     # An existing rule is updated in place: if that fails, the old rule is still there.
     $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
     if ($rule) {
+        $oldRule = @{ LocalPort = ($rule | Get-NetFirewallPortFilter).LocalPort
+            RemoteAddress = ($rule | Get-NetFirewallAddressFilter).RemoteAddress; Profile = $rule.Profile }
         $rule | Set-NetFirewallRule -LocalPort $Port -RemoteAddress $AllowFrom -Profile Private, Domain
     } else {
         New-NetFirewallRule -Name $ruleName -DisplayName 'agent-collab SSH management (listed sources only)' `
@@ -189,18 +211,27 @@ try {
             Where-Object { $_.RemotePort -eq 0 -and (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName -eq 'sshd' })
     }
     if (-not $listening) { throw "sshd is not listening on port $Port; see the OpenSSH/Operational event log" }
+    # sshd now runs with the managed block, so nothing it should admit depends on the any-source rule.
+    Get-NetFirewallRule -Name $stockRule -ErrorAction SilentlyContinue | Disable-NetFirewallRule
 } catch {
-    # An entry that worked before this run keeps working: its configuration, the rule this run
-    # added and the service state are put back. A key already moved into place stays; it is tied
-    # to the listed sources.
+    # An entry that worked before this run keeps working: its configuration, authorized keys,
+    # firewall rule and service state are put back as they were.
     Write-Config $previous
-    if ($createdRule) { Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule }
+    if ($stage) { Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue }
+    if ($movedKeys) {
+        try {
+            if ($null -ne $previousKeys) { [IO.File]::WriteAllBytes($keys, $previousKeys) } else { Remove-Item -LiteralPath $keys -Force }
+        } catch { Write-Warning "could not restore ${keys}: $_" }
+    }
+    if ($createdRule) {
+        Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    } elseif ($oldRule) {
+        Set-NetFirewallRule -Name $ruleName @oldRule -ErrorAction SilentlyContinue
+    }
     Set-Service sshd -StartupType $startType -ErrorAction SilentlyContinue
     if ($wasRunning) { Restart-Service sshd -Force -ErrorAction SilentlyContinue } else { Stop-Service sshd -Force -ErrorAction SilentlyContinue }
     throw
 }
-# sshd now runs with the managed block, so nothing it should admit depends on the any-source rule.
-Get-NetFirewallRule -Name $stockRule -ErrorAction SilentlyContinue | Disable-NetFirewallRule
 
 $hostKey = & (Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe') -lf (Join-Path $sshDir 'ssh_host_ed25519_key.pub')
 [ordered]@{ user = $User; port = $Port; allow_from = $AllowFrom; authorized_keys = $keys

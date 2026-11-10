@@ -232,16 +232,18 @@ Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1`
 脚本安装 OpenSSH Server 能力（若缺少），在 `sshd_config` 顶部写入受管段（关闭口令与转发，`AllowUsers <账户>@<来源>`），
 把公钥连同 `from="<来源>",restrict,pty` 写入授权文件，新增或就地更新只放行这些来源的防火墙规则，最后停用能力自带的全放行规则
 （全新安装时在 sshd 第一次启动之前就停用）。端口已被其他进程占用时中止。配置写入之后任何一步失败（包括 `sshd -t` 不通过），
-脚本恢复原配置、撤掉本次新增的规则，并把服务恢复到运行前的状态。
+脚本把配置、授权文件、防火墙规则和服务状态恢复到运行前的样子，本次新增的规则撤掉。
 
-授权文件先在 `%ProgramData%\ssh`（只有 Administrators 与 SYSTEM 可写）里准备好并设好权限，再移到位。管理员账户在默认配置下用共享的
+授权文件先在 `%ProgramData%\ssh` 里准备好并设好权限，再移到位。这个目录由 OpenSSH 创建，只有 Administrators 与 SYSTEM 可写；
+它若属于其他账户或能被其他账户写入，脚本不做任何改动就中止。管理员账户在默认配置下用共享的
 `administrators_authorized_keys`，只留 Administrators 与 SYSTEM；默认的 `Match Group administrators` 段被去掉时的管理员账户，以及普通账户，
 用账户自己的 `.ssh\authorized_keys`，只留该账户、Administrators 与 SYSTEM，属主是该账户。已有授权文件里的密钥会保留，
 所以它若属于其他账户或能被其他账户写入，脚本不做任何改动就中止，要求先检查文件内容。
 
 受管段只在 sshd 对同一关键字“取第一个值”时才压得住后面的配置。原有配置在受管段之外含有下列指令时，脚本不做任何改动就中止，
 需要先手工清理或合并：`AllowUsers`、`Port`（多条是累加的）、`Include`（被包含的文件脚本不检查）、`AuthorizedKeysCommand`、
-`TrustedUserCAKeys`（会让别的密钥通过认证）、`ForceCommand`（会替换管理命令）、默认值以外的 `AuthorizedKeysFile`，
+`TrustedUserCAKeys`（会让别的密钥通过认证）、`ForceCommand`（会替换管理命令）、默认配置那两处之外的 `AuthorizedKeysFile`
+（只接受 `Match` 块之外的 `.ssh/authorized_keys`，和 `Match Group administrators` 段里的共享文件），
 以及 `Match` 块里对受管段所设认证与转发项的改写（对匹配的连接生效）。系统自带的默认配置不含这些指令。
 它不修改 DefaultShell，调用时显式写出解释器和安装前缀（下例对应上文 Windows 安装示例的前缀）：
 
