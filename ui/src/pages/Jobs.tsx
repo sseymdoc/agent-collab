@@ -15,7 +15,7 @@ export function Jobs({ tick }: { tick: number }) {
     {jobs.length >= JOBS_PAGE && <button onClick={() => setPages(p => [...p, jobs[jobs.length - 1].job_id])}>下一页（更早）</button>}
     <small className="muted">第 {pages.length + 1} 页，每页最多 {JOBS_PAGE} 个，按创建时间从新到旧</small>
   </p>
-  return <Section title="工作包" extra={<select value={status} onChange={e => { setStatus(e.target.value); setPages([]) }}>
+  return <Section title="工作包" extra={<select aria-label="按状态筛选工作包" value={status} onChange={e => { setStatus(e.target.value); setPages([]) }}>
     <option value="">全部状态</option>
     {['queued', 'waiting_capability', 'running', 'recovering', 'waiting_reconcile', 'cancel_requested', 'cancelled', 'completed', 'failed'].map(s => <option key={s} value={s}>{s}</option>)}
   </select>}>

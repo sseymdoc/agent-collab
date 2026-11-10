@@ -38,16 +38,20 @@ function App() {
   const hash = useHash()
   const live = useLive(authed === true)
   const [bootErr, setBootErr] = useState<string | null>(null)
-  useEffect(() => {
-    onUnauthorized(() => setAuthed(false))
+  const boot = () => {
+    setBootErr(null)
     api.resume().then(() => setAuthed(true), e => {
       if (e instanceof ApiError && (e.status === 401 || e.status === 403)) setAuthed(false)
       else setBootErr(errText(e))
     })
-  }, [])
+  }
+  useEffect(() => { onUnauthorized(() => setAuthed(false)); boot() }, []) // eslint-disable-line
   // 事件流断开时探测会话；页面空闲时会话过期也能由 401 切回登录页。
   useEffect(() => { if (authed && live.state === 'retrying') api.resume().catch(() => {}) }, [authed, live.state])
-  if (bootErr) return <main className="login"><p className="err">无法连接 controller：{bootErr}</p></main>
+  if (bootErr) return <main className="login"><div className="card">
+    <p className="err">无法连接 controller：{bootErr}</p>
+    <div className="actions"><button onClick={boot}>重试</button><button className="link" onClick={() => { setBootErr(null); setAuthed(false) }}>改用令牌登录</button></div>
+  </div></main>
   if (authed === null) return <main className="login"><p className="muted">连接 controller…</p></main>
   if (!authed) return <Login onDone={() => setAuthed(true)} />
   const [, page, id] = hash.split('/')
@@ -63,7 +67,7 @@ function App() {
     </header>
     <main>
       {page === 'nodes' ? <Nodes tick={live.tick} />
-        : page === 'jobs' && id ? <JobDetail id={id} tick={live.tick} />
+        : page === 'jobs' && id ? <JobDetail key={id} id={id} tick={live.tick} />
         : page === 'jobs' ? <Jobs tick={live.tick} />
         : page === 'settings' ? <Settings tick={live.tick} />
         : <Overview tick={live.tick} />}

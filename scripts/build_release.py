@@ -36,6 +36,10 @@ def build_release(source, output, version):
             if path.is_file():
                 safe_name(relative)
                 files[relative] = path.read_bytes()
+    # 许可证与第三方清单随包分发；放在 agent_collab/ 下，发行包根目录仍只有 agent_collab/ 与 installer/。
+    for name in ('LICENSE', 'THIRD_PARTY.md'):
+        if (source / name).is_file() and 'agent_collab/' + name not in files:
+            files['agent_collab/' + name] = (source / name).read_bytes()
     if 'agent_collab/installer.py' not in files or 'installer/entry.py' not in files:
         raise ValueError('source is missing the installer')
     schema = json.loads(files['installer/release-schema.json'])

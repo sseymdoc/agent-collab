@@ -1,5 +1,5 @@
 :root {
-  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6ec;
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5b6475; --line: #e3e6ec;
   --accent: #2f5bd3; --good: #1c7c4a; --good-bg: #e3f5ea; --warn: #9a5b00; --warn-bg: #fff3d6;
   --bad: #b42318; --bad-bg: #fde8e6; --info: #1f5fa8; --info-bg: #e5effa; --muted-bg: #eef0f3;
   color-scheme: light;
@@ -52,7 +52,7 @@ label { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
 .muted { color: var(--muted); } .err { color: var(--bad); } .ok { color: var(--good); } .warn-text { color: var(--warn); }
 .timeline { list-style: none; padding: 0; margin: 0; }
 .timeline li { padding: 4px 0; border-bottom: 1px dashed var(--line); }
-.timeline li.stale { opacity: .6; }
+.timeline li.stale { border-left: 3px solid var(--warn); padding-left: 8px; }
 pre.json { background: var(--muted-bg); padding: 8px; border-radius: 6px; overflow: auto; max-height: 300px; }
 .login { display: grid; place-items: center; min-height: 80vh; }
 .login form { width: min(420px, 100%); }

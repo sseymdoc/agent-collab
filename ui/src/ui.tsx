@@ -60,7 +60,8 @@ export function useData<T>(load: () => Promise<T>, deps: unknown[]) {
     const g = ++gen.current
     return load().then(d => { if (g === gen.current) { setData(d); setError(null) } }, e => { if (g === gen.current) setError(errText(e)) })
   }, deps) // eslint-disable-line
-  useEffect(() => { void reload() }, [reload])
+  // 依赖变化或卸载时作废在途请求。
+  useEffect(() => { void reload(); return () => { gen.current++ } }, [reload])
   return { data, error, reload }
 }
 
@@ -69,16 +70,18 @@ export function Section({ title, children, extra }: { title: string; children: R
 }
 
 // 变更按钮：执行期间禁用，防止重复提交；服务端幂等键兜底。
-export function Action({ label, run, danger, disabled, confirm: ask }: { label: string; run: () => Promise<unknown>; danger?: boolean; disabled?: boolean; confirm?: string }) {
+// done 可把成功响应里的部分结果（如未迁移的 attempt）显示为提醒，返回 null 表示完全成功。
+export function Action({ label, run, danger, disabled, confirm: ask, done }: { label: string; run: () => Promise<unknown>; danger?: boolean; disabled?: boolean; confirm?: string; done?: (r: any) => string | null }) {
   const [busy, setBusy] = useState(false)
-  const [msg, setMsg] = useState<string | null>(null)
+  const [msg, setMsg] = useState<[string, string] | null>(null)
   return <span className="action">
     <button className={danger ? 'danger' : ''} disabled={busy || disabled} onClick={async () => {
       if (ask && !window.confirm(ask)) return
       setBusy(true); setMsg(null)
-      try { await run(); setMsg('已提交') } catch (e) { setMsg(errText(e)) } finally { setBusy(false) }
+      // 先执行 run 再格式化结果：不能写成 done?.(await run())，done 缺省时可选调用会连参数一起跳过。
+      try { const r = await run(); const note = done ? done(r) : null; setMsg(note ? [note, 'warn-text'] : ['已提交', 'ok']) } catch (e) { setMsg([errText(e), 'err']) } finally { setBusy(false) }
     }}>{busy ? '提交中…' : label}</button>
-    {msg && <small className={msg === '已提交' ? 'ok' : 'err'}>{msg}</small>}
+    {msg && <small className={msg[1]}>{msg[0]}</small>}
   </span>
 }
 

@@ -1,17 +1,17 @@
 import { api } from '../api'
-import { Action, Badge, Section, show, useData, when } from '../ui'
+import { Action, Badge, Section, short, show, useData, when } from '../ui'
 // 能力分层显示：在线（心跳）≠ CLI 已发现（版本）≠ 认证可用（探测）≠ 近期执行成功（绑定 agent/CLI 版本的证据）。
 
 export function Nodes({ tick }: { tick: number }) {
   const { data, error } = useData(() => api.nodes(), [tick])
-  if (error) return <p className="err">{error}</p>
-  if (!data) return <p className="muted">加载中…</p>
+  if (!data) return error ? <p className="err">{error}</p> : <p className="muted">加载中…</p>
   const nodes: any[] = data.nodes ?? data
   const hosts = new Map<string, any[]>()
   for (const n of nodes) hosts.set(n.physical_host_id ?? '未知主机', [...(hosts.get(n.physical_host_id ?? '未知主机') ?? []), n])
   return <>
+    {error && <p className="err">刷新失败，以下为上次成功加载的内容：{error}</p>}
     {[...hosts].map(([host, list]) => <Section key={host} title={'物理主机 ' + host}
-      extra={<span className="muted">同一主机的节点共享 host_slots 与故障域；不能互为断电备份</span>}>
+      extra={<span className="muted">同一主机的节点共享 host_slots，不能互为断电备份；“故障域”列是各节点自行上报的标签，恢复评分按它区分</span>}>
       <table>
         <thead><tr><th>节点</th><th>环境</th><th>故障域</th><th>状态</th><th>最近联系</th><th>槽位（节点/主机）</th><th>活动</th><th>工具与 harness</th><th>认证（不调用模型的探测）</th><th>执行证据（绑定当前版本）</th><th>账户分组</th><th>拒绝派单原因</th><th>排空</th></tr></thead>
         <tbody>{list.map(n => {
@@ -36,13 +36,13 @@ export function Nodes({ tick }: { tick: number }) {
             <td><small>{(n.last_rejections ?? n.last_rejection_reasons ?? []).join('，') || '无'}</small></td>
             <td>{n.drain
               ? <Action label="取消排空" run={() => api.drain(n.node_id, n.version, false)} />
-              : <>
-                <Action label="排空" danger confirm="排空后该节点不再领取新任务，已运行的任务继续到结束。确定？"
-                  run={() => api.drain(n.node_id, n.version, true)} />
-                <Action label="排空并迁移" danger
-                  confirm="排空，并把可安全迁移的任务（已受保护、无外部副作用、有确认检查点）从最近检查点迁到其他节点；不满足条件的继续在本节点运行。确定？"
-                  run={() => api.drain(n.node_id, n.version, true, true)} />
-              </>}</td>
+              : <Action label="排空" danger confirm="排空后该节点不再领取新任务，已运行的任务继续到结束。确定？"
+                  run={() => api.drain(n.node_id, n.version, true)} />}
+              {/* 已排空的节点也可再迁移剩余任务；响应里的 not_migrated 列出留在本节点的 attempt 及原因。 */}
+              <Action label={n.drain ? '迁移剩余任务' : '排空并迁移'} danger
+                confirm="排空，并把可安全迁移的任务（已受保护、无外部副作用、有确认检查点）从最近检查点迁到其他节点；不满足条件的继续在本节点运行。确定？"
+                run={() => api.drain(n.node_id, n.version, true, true)}
+                done={r => (r?.not_migrated ?? []).length ? '未迁移：' + r.not_migrated.map((x: any) => short(x.attempt_id) + '（' + (x.reasons ?? []).filter(Boolean).join('、') + '）').join('；') : null} /></td>
           </tr>
         })}</tbody>
       </table>

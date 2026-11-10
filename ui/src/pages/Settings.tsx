@@ -12,13 +12,13 @@ export function Settings({ tick }: { tick: number }) {
   return <>
     <Section title="运行 profile 与服务身份">
       <dl className="kv">
-        <dt>controller 版本</dt><dd>{show(ctl.version)}{ctl.git_commit ? <> · 提交 <code>{String(ctl.git_commit).slice(0, 10)}</code></> : '（源码运行，非发行包）'}</dd>
+        <dt>controller 版本</dt><dd>{show(ctl.version)}{ctl.git_commit ? <> · 提交 <code>{String(ctl.git_commit).slice(0, 10)}</code></> : '（提交信息不可用）'}</dd>
         <dt>controller_id</dt><dd><code>{show(ctl.controller_id)}</code></dd>
         <dt>authority_generation</dt><dd>{show(ctl.authority_generation)}</dd>
         <dt>部署 profile</dt><dd>{show(ctl.deployment_profile)}</dd>
         <dt>公开入口</dt><dd>{show(doc.public_origin)}{doc.tls === false ? '（controller 直接监听未启用 TLS；生产应在反向代理终止 TLS）' : ''}</dd>
         <dt>最近备份</dt><dd>{doc.backup_age_s === 'unknown' || doc.backup_age_s == null ? '未知（尚未配置或未完成实例外备份）' : show(doc.backup_age_s) + ' 秒前'}</dd>
-        <dt>当前页面来源</dt><dd><code>{location.origin}</code>{location.protocol === 'https:' ? '（TLS，浏览器已校验证书）' : '（非 TLS，仅限本机 loopback）'}</dd>
+        <dt>当前页面来源</dt><dd><code>{location.origin}</code>{location.protocol === 'https:' ? '（TLS，浏览器已校验证书）' : '（非 TLS，连接未加密）'}</dd>
         <dt>部署保障</dt><dd>{show(ctl.guarantees)}</dd>
       </dl>
     </Section>

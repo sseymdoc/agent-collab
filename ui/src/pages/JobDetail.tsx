@@ -1,12 +1,12 @@
 import { useState } from 'react'
-import { api, blobUrl, coordToken } from '../api'
+import { api, blobUrl, coordHeld } from '../api'
 import { Action, Badge, Json, Section, errText, show, short, useData, when } from '../ui'
 
 export function JobDetail({ id, tick }: { id: string; tick: number }) {
   const { data: d, error } = useData(() => api.job(id), [id, tick])
   const explain = useData(() => api.explain(id).catch(() => null), [id, tick])
-  if (error) return <p className="err">{error}</p>
-  if (!d) return <p className="muted">加载中…</p>
+  // 刷新失败时保留已加载的页面（含表单输入），只在顶部提示。
+  if (!d) return error ? <p className="err">{error}</p> : <p className="muted">加载中…</p>
   const job = d.job ?? d
   const attempts: any[] = d.attempts ?? []
   const checkpoints: any[] = d.checkpoints ?? []
@@ -16,6 +16,7 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
   const progress = [...events].reverse().find(e => e.type === 'attempt.progress' && !e.stale && e.attempt_id === job.current_attempt_id)
   const finals = checkpoints.filter(k => k.kind === 'final' && k.state !== 'uploading' && k.attempt_id === job.current_attempt_id)
   return <>
+    {error && <p className="err">刷新失败，以下为上次成功加载的内容：{error}</p>}
     <Section title={job.title || '工作包 ' + short(job.job_id)} extra={<a href="#/jobs">返回列表</a>}>
       <div className="badges">
         <span>运行 <Badge v={job.status} /></span>
@@ -134,14 +135,17 @@ function Coordinator({ job, tick }: { job: any; tick: number }) {
   const wp = job.work_package_id
   const lease = useData(() => api.coordinator(wp), [wp, tick])
   const [reason, setReason] = useState('')
-  const mine = !!coordToken(wp)
   const l = lease.data
+  const held = coordHeld(wp)
+  // 只凭本地令牌不够：别人接管后旧令牌仍在。租约的 expires_at 与取得时一致才算本页持有。
+  const mine = !!(held && l && held.expires_at === l.expires_at)
   const target = job.contract?.coordinates?.job_id
   return <Section title="协调权" extra={<span className="muted">同一根工作包同时只允许一个协调者（交互或受管 Claude）</span>}>
     {target && <p>本任务是受管协调回合，目标任务：<a href={'#/jobs/' + target}>{short(target)}</a></p>}
     {lease.error && <p className="err">{lease.error}</p>}
     <p>{l ? <>当前持有：<b>{l.holder_kind === 'managed' ? '受管协调者' : '交互协调者'}</b>（{show(l.holder_ref)}），到期 {when(l.expires_at)}{mine ? '；由本页持有' : ''}</>
       : '当前无人持有协调权。'}</p>
+    {held && l && !mine && <p className="warn-text">本页之前取得的协调令牌已失效（已被接管或已过期）。</p>}
     <div className="actions">
       {/* 取得租约不发事件：成功后主动重读，令牌在 sessionStorage 中也不会触发重渲染。 */}
       {!l && <Action label="取得协调权" run={() => api.takeCoordinator(wp, false, '').then(lease.reload)} />}

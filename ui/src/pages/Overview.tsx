@@ -3,17 +3,17 @@ import { Action, Badge, Section, show, useData, when } from '../ui'
 
 const GROUPS: [string, string[]][] = [
   ['排队', ['queued']], ['执行', ['running']], ['恢复', ['recovering']],
-  ['等待输入/能力', ['waiting_capability', 'waiting_reconcile']], ['取消中', ['cancel_requested']],
-  ['失败', ['failed']], ['待验收', ['completed']],
+  ['等待能力', ['waiting_capability']], ['待对账（需人工）', ['waiting_reconcile']], ['取消中', ['cancel_requested']],
+  ['失败', ['failed']], ['待验收', ['completed']], ['已取消', ['cancelled']],
 ]
 
 export function Overview({ tick }: { tick: number }) {
   const { data: o, error, reload } = useData(() => api.overview(), [tick])
-  if (error) return <p className="err">{error}</p>
-  if (!o) return <p className="muted">加载中…</p>
+  if (!o) return error ? <p className="err">{error}</p> : <p className="muted">加载中…</p>
   const counts = o.job_counts ?? o.counts ?? {}
   const ctl = o.controller ?? {}
   return <>
+    {error && <p className="err">刷新失败，以下为上次成功加载的内容：{error}</p>}
     <div className="tiles">
       {GROUPS.map(([label, keys]) => {
         const n = keys.reduce((s, k) => s + (Number(counts[k]) || 0), 0)
@@ -51,7 +51,7 @@ export function Overview({ tick }: { tick: number }) {
         </dl>
       })()}
     </Section>
-    <Section title="派单" extra={<Badge v={o.dispatch_paused ? 'blocked' : 'running'} />}>
+    <Section title="派单" extra={<Badge v={o.dispatch_paused ? 'blocked' : 'ok'} />}>
       <p>{o.dispatch_paused ? '全局派单已暂停：新任务受理后排队，不分配节点；执行中的任务不受影响。' : '派单正常。'}</p>
       <Action label={o.dispatch_paused ? '恢复派单' : '暂停派单'} danger={!o.dispatch_paused}
         run={() => api.dispatch(!o.dispatch_paused, ctl.metadata_version).then(reload)} />

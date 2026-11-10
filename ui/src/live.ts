@@ -5,10 +5,10 @@ import { streamUrl } from './api'
 // 服务端游标过期时发 snapshot_required，这里整体刷新，再从它给出的 min_seq 续读。
 export type Live = { state: 'connecting' | 'open' | 'retrying'; lastSeq: number | null; tick: number; lastAt: number | null }
 
-// SSE 没有通配订阅；与 controller 实际发出的事件类型一致（2026-11-09 按 controller.emit 调用核对）。
+// SSE 没有通配订阅；与 controller 实际发出的事件类型一致（2026-11-10 按 controller.emit 与 store.event 调用核对）。
 // 不订阅 attempt.renewed：它随每次心跳出现，不改变页面上的事实。
 export const EVENT_TYPES = [
-  'controller.started', 'job.created', 'job.updated', 'job.published', 'job.assessed', 'job.integration', 'job.evidence_gap',
+  'controller.started', 'controller.backup', 'controller.restored', 'job.created', 'job.updated', 'job.published', 'job.assessed', 'job.integration', 'job.evidence_gap',
   'attempt.assigned', 'attempt.leased', 'attempt.updated', 'attempt.started', 'attempt.progress', 'attempt.log',
   'attempt.side_effect', 'attempt.succeeded', 'attempt.failed', 'attempt.cancelled', 'attempt.lost', 'attempt.superseded',
   'checkpoint.uploading', 'checkpoint.durable', 'node.paired', 'node.registered', 'node.updated', 'meta.updated',

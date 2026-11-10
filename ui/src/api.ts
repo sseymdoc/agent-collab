@@ -17,14 +17,27 @@ function setCsrf(v: string | null) {
 }
 
 // 协调令牌按根工作包保存在当前标签页；持有租约时，变更请求附带 X-Coordinator-Token。
+// 内存为准，sessionStorage 只用于刷新页面后恢复（隐私模式下不可用时仍能用内存中的令牌）。
+// 同时记下取得时的 expires_at：租约的 expires_at 变了，说明已被接管或失效，本页不再算持有者。
+export type CoordHeld = { token: string; expires_at: string }
+const coordMem = new Map<string, CoordHeld | null>()
 const coordKey = (wp: string) => 'ac_coord_' + wp
-export function coordToken(wp?: string | null): string | null {
+export function coordHeld(wp?: string | null): CoordHeld | null {
   if (!wp) return null
-  try { return sessionStorage.getItem(coordKey(wp)) } catch { return null }
+  if (!coordMem.has(wp)) {
+    let v: CoordHeld | null = null
+    try { const s = JSON.parse(sessionStorage.getItem(coordKey(wp)) ?? 'null'); if (typeof s?.token === 'string') v = s } catch { /* 不可用或格式不符 */ }
+    coordMem.set(wp, v)
+  }
+  return coordMem.get(wp) ?? null
 }
-function setCoordToken(wp: string, v: string | null) {
-  try { v ? sessionStorage.setItem(coordKey(wp), v) : sessionStorage.removeItem(coordKey(wp)) } catch { /* 忽略 */ }
+function setCoord(wp: string, v: CoordHeld | null) {
+  coordMem.set(wp, v)
+  try { v ? sessionStorage.setItem(coordKey(wp), JSON.stringify(v)) : sessionStorage.removeItem(coordKey(wp)) } catch { /* 忽略 */ }
 }
+// 取得请求的响应丢失（网络错误）时保留请求体，下次原样重放：controller 按 request_id 返回同一令牌，
+// 而不是因租约已被（自己）占用而拒绝。收到 controller 的明确答复后丢弃。
+const pendingTake = new Map<string, J>()
 
 // 任何请求得到 401 都表示会话已失效（如超过会话有效期），由 App 切回登录页。
 let unauthorized = () => {}
@@ -76,14 +89,22 @@ export const api = {
     call('POST', '/jobs/' + id + '/assess', { request_id: uuid(), expected_version: v, assessment_id: uuid(), ...body }, coordHeader(wp)),
   coordinator: (wp: string) => call('GET', '/packages/' + wp + '/coordinator'),
   takeCoordinator: async (wp: string, takeover: boolean, reason: string) => {
-    const d = await call('POST', '/packages/' + wp + '/coordinator', {
-      request_id: uuid(), holder_kind: 'interactive', holder_ref: 'web-console', ttl_s: 1800, takeover, reason,
-    }, coordHeader(wp))
-    setCoordToken(wp, d?.coordinator_token ?? null)
+    const body = pendingTake.get(wp) ?? { request_id: uuid(), holder_kind: 'interactive', holder_ref: 'web-console', ttl_s: 1800, takeover, reason }
+    pendingTake.set(wp, body)
+    let d: any
+    try { d = await call('POST', '/packages/' + wp + '/coordinator', body, coordHeader(wp)) } catch (e) {
+      if (e instanceof ApiError) pendingTake.delete(wp)
+      throw e
+    }
+    pendingTake.delete(wp)
+    setCoord(wp, typeof d?.coordinator_token === 'string' ? { token: d.coordinator_token, expires_at: d.expires_at } : null)
     return d
   },
+  // 成功后才清除令牌：失败或响应丢失时保留，便于重试释放。
   releaseCoordinator: async (wp: string) => {
-    try { return await call('DELETE', '/packages/' + wp + '/coordinator', undefined, coordHeader(wp)) } finally { setCoordToken(wp, null) }
+    const d = await call('DELETE', '/packages/' + wp + '/coordinator', undefined, coordHeader(wp))
+    setCoord(wp, null)
+    return d
   },
   drain: (node: string, v: number, drain: boolean, migrate = false) =>
     call('POST', '/nodes/' + node + '/drain', { request_id: uuid(), expected_version: v, drain, ...(drain && migrate ? { migrate: true } : {}) }),
@@ -91,8 +112,8 @@ export const api = {
 }
 
 function coordHeader(wp: string): Record<string, string> {
-  const t = coordToken(wp)
-  return t ? { 'X-Coordinator-Token': t } : {}
+  const t = coordHeld(wp)
+  return t ? { 'X-Coordinator-Token': t.token } : {}
 }
 
 export const blobUrl = (sha: string) => P + '/blobs/' + sha
