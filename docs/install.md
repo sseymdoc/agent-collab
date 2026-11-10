@@ -208,7 +208,7 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 ```
 
 `service stop` 不通知 controller：要立刻停止派单，先用 API 或 `install --drain` 排空。它对活动 attempt 的检查只是停止前的一次快照，
-与 worker 之间没有同步：未排空的节点在检查之后、停止之前领到的 attempt 会被打断，由 controller 按节点失效处理（满足恢复条件时从检查点继续）。
+与 worker 之间没有同步：未排空的节点在检查之后、停止之前领到的 attempt 会被打断，由 controller 按节点失效处理（满足恢复条件时从最新的 durable 检查点继续；还没有检查点时从 inputs 基线重新开始）。
 要避免这种情况，先排空并等活动 attempt 归零再停。受管服务安装的升级和回退会重新启用并启动服务，
 被 `service stop` 停用的节点也一样：要让它继续停用，升级或回退之后再执行一次 `service stop`。
 进程异常退出由服务管理器恢复（Windows 每分钟的时间触发器、launchd KeepAlive、systemd `Restart=on-failure`），
@@ -229,15 +229,20 @@ Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1`
 & .\installer\windows-ssh-management.ps1 -Remove     # 停用入口：删规则、停并禁用 sshd、移除受管配置段
 ```
 
-脚本安装 OpenSSH Server 能力（若缺少），先停用能力自带的全放行防火墙规则，再在 `sshd_config` 顶部写入受管段
-（关闭口令与转发，`AllowUsers <账户>@<来源>`），把公钥连同 `from="<来源>",restrict,pty` 写入授权文件，新增只放行这些来源的防火墙规则。
-授权文件的 ACL 会重建：管理员账户用的 `administrators_authorized_keys` 只留 Administrators 与 SYSTEM，
-普通账户自己的 `.ssh\authorized_keys` 只留该账户、Administrators 与 SYSTEM。端口已被其他进程占用时中止，`sshd -t` 不通过时恢复原配置。
+脚本安装 OpenSSH Server 能力（若缺少），在 `sshd_config` 顶部写入受管段（关闭口令与转发，`AllowUsers <账户>@<来源>`），
+把公钥连同 `from="<来源>",restrict,pty` 写入授权文件，新增或就地更新只放行这些来源的防火墙规则，最后停用能力自带的全放行规则
+（全新安装时在 sshd 第一次启动之前就停用）。端口已被其他进程占用时中止。配置写入之后任何一步失败（包括 `sshd -t` 不通过），
+脚本恢复原配置、撤掉本次新增的规则，并把服务恢复到运行前的状态。
+
+授权文件先在 `%ProgramData%\ssh`（只有 Administrators 与 SYSTEM 可写）里准备好并设好权限，再移到位。管理员账户在默认配置下用共享的
+`administrators_authorized_keys`，只留 Administrators 与 SYSTEM；默认的 `Match Group administrators` 段被去掉时的管理员账户，以及普通账户，
+用账户自己的 `.ssh\authorized_keys`，只留该账户、Administrators 与 SYSTEM，属主是该账户。已有授权文件里的密钥会保留，
+所以它若能被其他账户写入，脚本不做任何改动就中止，要求先检查文件内容。
 
 受管段只在 sshd 对同一关键字“取第一个值”时才压得住后面的配置。原有配置在受管段之外含有下列指令时，脚本不做任何改动就中止，
 需要先手工清理或合并：`AllowUsers`、`Port`（多条是累加的）、`Include`（被包含的文件脚本不检查）、`AuthorizedKeysCommand`、
-`TrustedUserCAKeys`（会让别的密钥通过认证），以及 `Match` 块里对受管段所设认证与转发项的改写（对匹配的连接生效）。
-系统自带的默认配置不含这些指令。
+`TrustedUserCAKeys`（会让别的密钥通过认证）、`ForceCommand`（会替换管理命令）、默认值以外的 `AuthorizedKeysFile`，
+以及 `Match` 块里对受管段所设认证与转发项的改写（对匹配的连接生效）。系统自带的默认配置不含这些指令。
 它不修改 DefaultShell，调用时显式写出解释器和安装前缀（下例对应上文 Windows 安装示例的前缀）：
 
 ```sh
