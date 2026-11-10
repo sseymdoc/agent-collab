@@ -20,9 +20,9 @@
 ## 开发隔离
 
 - 稳定执行器不被本项目修改或热替换；候选版本不管理自己的开发任务。
-- 开发在共享目录中进行：Windows 侧可能经 SMB 访问，git 需 `-c safe.directory=*`（不改全局配置）；worker 在独立 clone（分支 `wp/<包名>`）中实施，且该 clone 位于执行端本地盘。不用 `git worktree`，因为其元数据含单一 OS 的绝对路径。
+- 开发在共享目录中进行：Windows 侧可能经 SMB 访问。Git 因所有权检查拒绝该 checkout 时，用 `git -c safe.directory=<该 checkout 的绝对路径>` 只信任这一个目录，不改全局配置，也不用通配 `*`；worker 在独立 clone（分支 `wp/<包名>`）中实施，且该 clone 位于执行端本地盘。不用 `git worktree`，因为其元数据含单一 OS 的绝对路径。
 - 候选服务：开发端口 18669（loopback）；测试任务使用测试 profile。
-- SQLite 只在本机文件系统打开：经 SMB 访问仓库时，controller/测试使用本机临时目录，不经网络盘打开数据库。
+- SQLite 只在本机文件系统打开。测试数据（`.dev/tmp`）和快速试用数据（`./.dev/ctl`）默认都在仓库内；仓库经 SMB 访问时，须先复制到本机磁盘，再运行 controller 和测试，不经网络盘打开数据库。UI 构建不受影响：`node build.mjs` 会自行在本机临时目录构建。
 
 ## 后果
 
