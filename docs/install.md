@@ -78,8 +78,8 @@ sh installer/install.sh --role worker --release /local/agent-collab-0.1.0.tar.gz
 Linux worker（可选，含按需启用的 WSL）使用同一命令，替换 node-id。其服务为 `systemctl --user` unit，需要可用的用户 systemd 会话。
 安装器不启用 lingering。WSL 生命周期受 Windows 宿主、WSL 停机和用户会话限制，没有 Windows 侧保活时发行版会在空闲后停止；
 它不属于默认拓扑，没有它时只要求 Linux 的任务会停在 `waiting_capability`，不会被派到 macOS 或 Windows。
-与 Windows 节点同机时应显式传相同 `--physical-host-id desktop-1 --failure-domain desktop-1`，
-并按 `docs/agent.md` 设置相同 host_slots；安装器沿用 agent 默认 slots/host_slots=1。
+与 Windows 节点同机时应显式传相同的 `--physical-host-id desktop-1`，并按 `docs/agent.md` 设置相同 host_slots；
+`--failure-domain` 按节点实际所在的故障域填写（同一台物理主机上的节点通常相同）。安装器沿用 agent 默认 slots/host_slots=1。
 
 Windows worker（当前用户 PowerShell 5.1+/7）：
 
@@ -189,14 +189,15 @@ Windows 将入口换为 `.\installer\install.ps1`、路径换为本地磁盘，`
 
 ## 服务管理与 SSH 管理入口
 
-`service` 是固定的管理命令，本机直接运行和经 SSH 调用是同一条命令；不需要管理员令牌，也不访问 controller。
-stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实。非默认前缀加 `--prefix`，等待时间用 `--timeout <秒>`（缺省 60）。
+`service` 是固定的管理命令，本机直接运行和经 SSH 调用是同一条命令；不需要管理员令牌，也不调用 controller 的 API。
+stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实。非默认前缀加 `--prefix`，等待时间用 `--timeout <秒>`（缺省 60，最长 600）。
+服务名在整台机器上共用：服务定义属于另一个前缀的安装，或无法确认归属时，三个动作都拒绝执行。
 
 | 命令 | 行为 |
 | --- | --- |
 | `service status` | 只读：当前版本、服务状态、是否自启动（enabled/disabled/unknown）、worker 的 status.json 与心跳年龄。组件都在运行时返回 0 |
-| `service stop` | 有意停用：先关闭自启动（Windows 禁用计划任务，macOS `launchctl disable`，Linux `disable --now`），再停止进程，状态锁释放后才返回 0。本地有 preparing/running attempt 时拒绝，先排空或加 `--allow-active`。停用一直保持，重复触发和重新登录都不会拉起进程 |
-| `service start` | 恢复自启动并启动。worker 以 status.json 中来自当前版本目录、时间不早于本次请求的成功心跳判定就绪，否则返回非零。已在运行时重复执行不会产生第二个实例 |
+| `service stop` | 有意停用：先关闭自启动（Windows 禁用计划任务，macOS `launchctl disable`，Linux `disable --now`），再停止进程，状态锁释放后才返回 0。本地有 preparing/running attempt 时拒绝，先排空或加 `--allow-active`。停用后重复触发和重新登录都不会拉起进程，直到 `service start` 或下一次升级、回退 |
+| `service start` | 恢复自启动并启动。worker 以 status.json 中来自当前版本目录、时间不早于本次请求的成功心跳判定就绪；controller 以本机无认证的 `/healthz` 有应答判定就绪；否则返回非零。已在运行时重复执行不会产生第二个实例 |
 
 ```sh
 "$PREFIX/bin/agent-collab" service status --prefix "$PREFIX"
@@ -206,16 +207,17 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 & "$Prefix\bin\agent-collab.ps1" service stop --prefix $Prefix
 ```
 
-`service stop` 不通知 controller：要立刻停止派单，先用 API 或 `install --drain` 排空。升级和回退总会重新启用并启动服务。
+`service stop` 不通知 controller：要立刻停止派单，先用 API 或 `install --drain` 排空。受管服务安装的升级和回退会重新启用并启动服务，
+被 `service stop` 停用的节点也一样：要让它继续停用，升级或回退之后再执行一次 `service stop`。
 进程异常退出由服务管理器恢复（Windows 每分钟的时间触发器、launchd KeepAlive、systemd `Restart=on-failure`），
 被 `service stop` 停用的节点不受这些机制影响。
 
 ### SSH 管理入口（可选）
 
 SSH 只用于安装、启动、诊断和恢复。任务的领取、续租、事件与工件上传都走 worker 自己的出站 HTTPS 连接：
-经 SSH 发出 `service start` 后可以断开，worker 由计划任务或 LaunchAgent 托管并继续运行，结果从 controller 或
-`service status` 查询。不要用 `Start-Job`、`nohup` 或 `ssh host claude ...` 代替受管服务：直接经 SSH 打开的模型会话
-没有检查点，也不会被接管。
+经 SSH 发出 `service start` 后可以断开，worker 由计划任务或 LaunchAgent 托管并继续运行。任务结果从 controller 查询，
+worker 是否在运行、心跳是否新鲜从 `service status` 查询。不要用 `Start-Job`、`nohup` 或 `ssh host claude ...` 代替受管服务：
+直接经 SSH 打开的模型会话没有检查点，也不会被接管。固定的 `service` 命令是运维约定，SSH 本身不限制命令。
 
 Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1` 在管理员 PowerShell 中运行，
 只接受公钥认证、一个账户和列出的来源地址：
@@ -225,12 +227,15 @@ Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1`
 & .\installer\windows-ssh-management.ps1 -Remove     # 停用入口：删规则、停并禁用 sshd、移除受管配置段
 ```
 
-脚本安装 OpenSSH Server 能力（若缺少），在 `sshd_config` 顶部写入受管段（关闭口令与转发，`AllowUsers <账户>@<来源>`），
-把公钥连同 `from="<来源>",restrict,pty` 写入授权文件，新增只放行这些来源的防火墙规则，并停用能力自带的全放行规则；
-端口已被其他进程占用时中止，`sshd -t` 不通过时恢复原配置。它不修改 DefaultShell，调用时显式写出解释器：
+脚本安装 OpenSSH Server 能力（若缺少），先停用能力自带的全放行防火墙规则，再在 `sshd_config` 顶部写入受管段
+（关闭口令与转发，`AllowUsers <账户>@<来源>`），把公钥连同 `from="<来源>",restrict,pty` 写入授权文件并把它的 ACL 重建为
+只有 Administrators 与 SYSTEM，新增只放行这些来源的防火墙规则。端口已被其他进程占用时中止，`sshd -t` 不通过时恢复原配置。
+原有配置在受管段之外已经有 `AllowUsers` 或 `Include` 时脚本不做任何改动就中止：多条 `AllowUsers` 是累加的，
+被包含的文件脚本也不检查，这两种情况下无法保证只放行一个账户，需要先手工清理或合并。
+它不修改 DefaultShell，调用时显式写出解释器和安装前缀（下例对应上文 Windows 安装示例的前缀）：
 
 ```sh
-ssh win-host "C:\Python312\python.exe -B C:\Users\me\.local\share\agent-collab\launcher.py service status"
+ssh win-host "C:\Python312\python.exe -B C:\Users\me\AppData\Local\agent-collab\code\launcher.py service status --prefix C:\Users\me\AppData\Local\agent-collab\code"
 ```
 
 管理员组账户经 SSH 登录得到的是完整管理员令牌，没有 UAC 降权：持有私钥就能控制这台机器。不要经这个入口直接启动模型进程，

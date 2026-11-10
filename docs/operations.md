@@ -27,7 +27,7 @@
 cd /opt/agent-collab/current && runuser -u agent-collab -- python3 -B -m agent_collab.controller pairing-code --data-dir <DATA> --node-id <节点名>
 ```
 
-在节点上（默认每台物理主机一个原生节点；同机再装可选节点（如 WSL）时使用相同 `--physical-host-id` / `--failure-domain`，`--host-slots` 为该主机总并发）：
+在节点上（默认每台物理主机一个原生节点；同机再装可选节点（如 WSL）时使用相同 `--physical-host-id`，`--host-slots` 为该主机总并发；`--failure-domain` 按节点实际所在的故障域填写）：
 
 ```sh
 "$PREFIX/bin/agent-collab" agent pair --controller <CONTROLLER> --code <配对码> --node-id <节点名> \
@@ -99,6 +99,8 @@ $Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).conf
 1. 排空（`drain:true, migrate:true`），等 `active_attempts` 为 0。未结束的任务按检查点迁移；原生会话不能跨平台续接。
 2. 在该节点执行 `service stop`。节点随后显示为 unreachable 且保持排空，不会再被派单。
 3. 保留它的 node_id、执行证据和数据目录，不要删除节点记录或卸载。要重新启用：`service start`，再解除排空。
+
+对已停用的节点运行安装器升级或回退会重新启用并启动它的服务（节点仍处于排空，不会被派单）；要继续停用，之后再执行一次 `service stop`。
 
 只有被排空节点才具备的能力不会被别的节点替代：仅 Linux 可满足的任务进入 `waiting_capability`，`status_reason` 列出各节点的拒绝原因
 （如 `os_mismatch`、`gpu_missing`、`tool_missing:<名称>`）。macOS 的 POSIX shell 不等于 Linux，controller 主机也不是 worker。

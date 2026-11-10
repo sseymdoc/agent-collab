@@ -9,7 +9,7 @@
 
 *A small, dependency-free scheduler that runs Claude Code and Codex CLI work packages across your own machines, with checkpoint recovery, fenced publishing and evidence-gated acceptance.*
 
-> 状态：候选版本 `0.1.0rc7`。下文“已验证”与“未验证”分开写；不要把它当作生产级高可用系统。
+> 状态：候选版本，最近一次在真实环境中验证的是 `0.1.0rc9`。下文“已验证”与“未验证”分开写；不要把它当作生产级高可用系统。
 
 ## 它解决什么问题
 
@@ -122,7 +122,7 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
 - 只对已受理、输入已复制到控制服务、存在已确认检查点或完整初始基线的任务做自动接管；旧 epoch 的检查点与发布会被拒绝（409 `fenced`）；旧 epoch 的事件仍会去重存档，但标记 `stale=true`，不改变任何状态，事件消费者应据此区分迟到事件。
 - 修复任务继承根工作包的累计预算；取消或预算耗尽后不再派生修复或恢复。
 - Codex 以 `workspace-write` 沙箱、关闭网络、`--ignore-user-config`（不加载你的 MCP 服务与钩子）运行，写权限限于 attempt 工作区。
-- Claude 协调回合以 `--strict-mcp-config --setting-sources local` 运行：不连接 MCP 服务（含账户级连接器），不加载用户级设置、插件、hooks 和用户 CLAUDE.md；认证仍用本机官方登录。
+- Claude 协调回合以 `--strict-mcp-config --setting-sources local --safe-mode` 运行：不连接 MCP 服务（含账户级连接器），不加载用户级设置、插件、hooks 和各级目录的 CLAUDE.md、CLAUDE.local.md；认证仍用本机官方登录。提示词要求协调者只依据提供的证据判断、不声称没看到的检查，证据不足或没有检查点时选择 `escalate`。这些是命令行参数与提示词约束，不是操作系统级隔离（见下）。
 
 **不会做到的：**
 

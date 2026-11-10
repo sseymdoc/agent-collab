@@ -30,7 +30,9 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 版本目录、解释器、用户、平台）和每个 harness 的 `argv`、`version`、`disabled`、`path_prepend`、`managed_argv`
 （Codex 另有 `codex_home` 与被清除的环境变量名）。`managed_argv` 直接调用适配器的 `build_argv` 生成，
 `<work>`、`<attempt>`、`<sandbox>`、`<effort>`、`<profile.model>`、`<profile.effort>`、`<decision-schema>`、`<session-id>`
-是运行期才确定的值；环境变量只列名称，不列取值。
+是运行期才确定的值；环境变量只列名称，不列取值。`argv` 与 `managed_argv` 只原样显示可执行文件路径：
+`codex_command`、`claude_command` 里附带的其余参数可能含凭据，一律显示为 `<configured-argument>`。
+`agent.json` 里的值类型不对、无法生成 `effective` 时，`effective` 只含 `error_type`，`checks.configuration` 记为失败，其余检查照常返回。
 
 `run` 默认派生脱离当前会话的后台 agent，将输出写入 `agent.log`，返回 `spawned` 与 PID；
 `spawned` 仅表示进程已创建，后续错误见日志。`--foreground` 用于服务管理器；
@@ -128,13 +130,20 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 ```text
 [claude_command, -p, --model, <profile.model>, --effort, <profile.effort>,
  --output-format, json, --json-schema, <内联 JSON>, --permission-mode, dontAsk,
- --tools, "", --session-id, <新 UUID>, --strict-mcp-config, --setting-sources, local]
+ --tools, "", --session-id, <新 UUID>, --strict-mcp-config, --setting-sources, local, --safe-mode]
 ```
 
 `--strict-mcp-config` 不加载任何 MCP 服务（含账户级连接器）；`--setting-sources local` 只读工作目录下的本地设置，
-因此用户级 settings、插件、hooks 和用户 CLAUDE.md 都不进入受管回合，认证仍用官方本机登录（不使用 `--bare`，它读不到订阅登录）。
-实测（Claude Code 2.1.302）：不加这两个参数时回合会连接账户的邮件、笔记等连接器，加载用户插件并运行 SessionStart/UserPromptSubmit hooks；
-`--setting-sources project` 仍会带入用户 CLAUDE.md。协调工作区里若出现 `.claude`，适配器不启动 Claude 并以 `code_failure` 结束。
+因此用户级 settings、插件、hooks 和用户 CLAUDE.md 都不进入受管回合；`--safe-mode` 关闭记忆文件（各级目录的 CLAUDE.md、
+CLAUDE.local.md）、skills、插件、hooks 等全部定制。认证仍用官方本机登录（不使用 `--bare`，它读不到订阅登录）。
+实测（Claude Code 2.1.302）：只有 `--tools ""` 时回合会连接账户的邮件、笔记等连接器，加载用户插件并运行 SessionStart/UserPromptSubmit hooks；
+`--setting-sources project` 仍会带入用户 CLAUDE.md；`--setting-sources local` 仍会读取工作目录及其上级目录里的 `CLAUDE.local.md`，
+加上 `--safe-mode` 后不再读取。协调工作区里若出现 `.claude`，适配器不启动 Claude 并以 `code_failure` 结束。
+本机 Claude Code 必须支持这三个参数，不支持的旧版本不能用于协调回合。
+
+这些都是 Claude Code 的命令行参数，不构成操作系统级隔离。提示词要求协调者只依据提供的上下文判断、不声称没看到的检查，
+证据不足或没有检查点时选择 `escalate`；结构化决策本身不是独立验证，目标契约声明了 checks 时，`passed` 是否成立由 controller
+按节点执行的检查证据核对（protocol §11.7）。
 
 prompt 经 stdin 传入，context.json 全文内嵌在 prompt 末尾，要求仅返回结构化决策；`--tools ""` 不授予任何工具（含读文件）。适配器只解析 stdout JSON 的 structured_output，不从 result 自由文本猜测 JSON。固定 schema 由 controller/adapter 共用并在本地复核：follow_up 只是修复请求 `{title, goal, acceptance, instructions, effort}`，不含完整契约；完整的 codex 修复契约由 controller 基于被验收检查点与目标契约派生。结构化输出通过 schema 即由 agent 原子写入 decision.json，再走已有 final checkpoint 上传和 complete outbox；不合 schema 的结果失败且不写该文件。依赖目标状态的校验（租约归属、检查点、预算、副作用）只在 controller 进行：验收结论合法时一定记录，修复请求无法生成合法契约时写 coordinator.follow_up_rejected 而不是丢弃整个决策。
 
