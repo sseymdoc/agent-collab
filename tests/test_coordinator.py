@@ -83,6 +83,15 @@ class CoordinatorTests(ControllerCase):
         self.assertNotIn('coordinator.decision_rejected', self.event_types(job))
         return current
 
+    def test_same_instant_takeover_keeps_expiry_but_changes_version(self):
+        # 测试时钟固定：同一时刻、相同 TTL 接管，expires_at 相同，只有 version 能区分两次租约。
+        job = self.job()
+        first = self.lease(job)
+        second = self.lease(job, holder_ref='other', takeover=True, reason='same instant')
+        self.assertEqual(second['expires_at'], first['expires_at'])
+        self.assertGreater(second['version'], first['version'])
+        self.assertEqual(self.call('GET', self.lease_path(job))['version'], second['version'])
+
     def test_lease_acquire_renew_conflict_takeover_release_and_hash_only(self):
         job = self.job()
         self.assertIsNone(self.call('GET', self.lease_path(job)))
