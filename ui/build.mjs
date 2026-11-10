@@ -2,7 +2,7 @@
 // 本脚本把源码与依赖复制到本机临时目录构建，再把产物复制回 agent_collab/static。
 // 在本地盘上直接运行 `npx vite build` 同样可用。
 import { cpSync, rmSync, mkdtempSync, mkdirSync, existsSync, renameSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,9 +22,20 @@ function acquire() {
   }
 }
 
-// Ctrl+C / 终止信号不立即退出：正在运行的 tsc、vite 子进程随信号结束，构建按失败走完 finally，释放锁并还原产物，
-// 不留下残留锁。
-for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { process.exitCode = 130 })
+// Ctrl+C / 终止信号：记下中断并结束正在运行的子进程，构建按失败走完 finally（释放锁、还原产物），发布前检查中断标记。
+// 子进程用异步 spawn 运行，信号处理函数才能在构建期间执行；只给本进程发 SIGTERM 时，子进程也会被结束。
+let child = null, aborted = false
+for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { aborted = true; process.exitCode = 130; child?.kill() })
+function run(args, cwd) {
+  return new Promise((resolve, reject) => {
+    if (aborted) return reject(new Error('构建已中断，未发布'))
+    child = spawn(process.execPath, args, { stdio: 'inherit', cwd })
+    child.on('error', reject)
+    child.on('exit', (code, signal) => { child = null; code === 0 ? resolve() : reject(new Error('构建步骤失败：' + (signal ?? 'exit ' + code))) })
+  })
+}
+// 同步步骤期间到达的信号要等让出事件循环后才处理：发布前先让出一次，再检查。
+async function checkAborted() { await new Promise(r => setImmediate(r)); if (aborted) throw new Error('构建已中断，未发布') }
 
 acquire()
 let work = null
@@ -35,10 +46,12 @@ try { try {
   if (!existsSync(out) && existsSync(old)) renameSync(old, out)
   for (const d of [stage, old]) rmSync(d, { recursive: true, force: true })
   for (const f of ['src', 'node_modules', 'index.html', 'package.json', 'tsconfig.json', 'vite.config.ts']) cpSync(join(here, f), join(work, f), { recursive: true })
-  execFileSync(process.execPath, [join(work, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit', '-p', work], { stdio: 'inherit', cwd: work })
-  execFileSync(process.execPath, [join(work, 'node_modules', 'vite', 'bin', 'vite.js'), 'build', '--outDir', join(work, 'dist')], { stdio: 'inherit', cwd: work })
+  await checkAborted()
+  await run([join(work, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit', '-p', work], work)
+  await run([join(work, 'node_modules', 'vite', 'bin', 'vite.js'), 'build', '--outDir', join(work, 'dist')], work)
   // 新产物先完整复制到暂存目录，再用改名替换：复制失败（如磁盘不足）时旧产物不受影响，替换失败时还原旧产物。
   cpSync(join(work, 'dist'), stage, { recursive: true })
+  await checkAborted()
   if (existsSync(out)) renameSync(out, old)
   try { renameSync(stage, out) } catch (e) { if (!existsSync(out) && existsSync(old)) renameSync(old, out); throw e }
 } finally {
