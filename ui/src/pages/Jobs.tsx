@@ -7,12 +7,14 @@ export function Jobs({ tick }: { tick: number }) {
   // 分页游标栈：每项是对应页的 before（上一页最后一个 job_id）；空栈为最新一页。
   const [pages, setPages] = useState<string[]>([])
   const before = pages[pages.length - 1] ?? ''
-  const { data, error } = useData(() => api.jobs(status, before), [tick, status, before])
-  const jobs: any[] = data ? (data.jobs ?? data) : []
+  const { data, error } = useData(() => api.jobs(status, before).then(d => ({ ...d, status, before })), [tick, status, before])
+  const jobs: any[] = data?.jobs ?? []
+  // 新页面到达前仍显示旧数据：这期间不允许翻页，避免把同一游标重复压栈。
+  const settled = !!data && data.status === status && data.before === before
   const pager = <p className="actions">
-    {pages.length > 0 && <button onClick={() => setPages(p => p.slice(0, -1))}>上一页（较新）</button>}
-    {pages.length > 1 && <button onClick={() => setPages([])}>回到最新</button>}
-    {jobs.length >= JOBS_PAGE && <button onClick={() => setPages(p => [...p, jobs[jobs.length - 1].job_id])}>下一页（更早）</button>}
+    {pages.length > 0 && <button disabled={!settled && !error} onClick={() => setPages(p => p.slice(0, -1))}>上一页（较新）</button>}
+    {(pages.length > 1 || (error && pages.length > 0)) && <button onClick={() => setPages([])}>回到最新</button>}
+    {settled && jobs.length >= JOBS_PAGE && <button onClick={() => setPages(p => [...p, jobs[jobs.length - 1].job_id])}>下一页（更早）</button>}
     <small className="muted">第 {pages.length + 1} 页，每页最多 {JOBS_PAGE} 个，按创建时间从新到旧</small>
   </p>
   return <Section title="工作包" extra={<select aria-label="按状态筛选工作包" value={status} onChange={e => { setStatus(e.target.value); setPages([]) }}>

@@ -46,8 +46,14 @@ function App() {
     })
   }
   useEffect(() => { onUnauthorized(() => setAuthed(false)); boot() }, []) // eslint-disable-line
-  // 事件流断开时探测会话；页面空闲时会话过期也能由 401 切回登录页。
-  useEffect(() => { if (authed && live.state === 'retrying') api.resume().catch(() => {}) }, [authed, live.state])
+  // 事件流断开期间定时探测会话：页面空闲时会话过期也能由 401 切回登录页（网络未恢复时探测本身也会失败，需要重试）。
+  useEffect(() => {
+    if (!authed || live.state !== 'retrying') return
+    const probe = () => { void api.resume().catch(() => {}) }
+    probe()
+    const timer = window.setInterval(probe, 5000)
+    return () => window.clearInterval(timer)
+  }, [authed, live.state])
   if (bootErr) return <main className="login"><div className="card">
     <p className="err">无法连接 controller：{bootErr}</p>
     <div className="actions"><button onClick={boot}>重试</button><button className="link" onClick={() => { setBootErr(null); setAuthed(false) }}>改用令牌登录</button></div>

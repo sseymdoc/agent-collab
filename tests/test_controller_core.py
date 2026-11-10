@@ -81,6 +81,18 @@ class JobsTest(ControllerCase):
         err = self.call('POST', '/jobs', {'request_id': uid(), 'work_package_id': one['work_package_id'], 'contract': c}, status=409)
         self.assertEqual(err['error']['code'], 'budget_exhausted')
 
+    def test_job_list_cursor_survives_status_change(self):
+        a, b, c = self.job(), self.job(), self.job()
+        status = self.current(c)['status']
+        page = lambda q: [j['job_id'] for j in self.call('GET', '/jobs?limit=1&status=' + status + q)['jobs']]
+        self.assertEqual(page(''), [c['job_id']])
+        self.mutate(c, 'cancel')
+        self.assertNotEqual(self.current(c)['status'], status)
+        # 游标所指的 job 已不在筛选结果中，翻页仍按创建顺序继续。
+        self.assertEqual(page('&before=' + c['job_id']), [b['job_id']])
+        self.assertEqual(page('&before=' + b['job_id']), [a['job_id']])
+        self.call('GET', '/jobs?before=' + uid(), status=400)
+
     def test_queries_diff_doctor_and_shape(self):
         node = self.node()
         job = self.job()

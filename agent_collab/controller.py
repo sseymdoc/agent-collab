@@ -1130,16 +1130,17 @@ class App:
             jobs = self.store.all('job')
             status = query.get('status', [''])[0]
             before = query.get('before', [''])[0]
-            if status:
-                if status not in p.JOB_STATUSES:
-                    raise ValueError('invalid status')
-                jobs = [j for j in jobs if j['status'] == status]
+            if status and status not in p.JOB_STATUSES:
+                raise ValueError('invalid status')
             jobs.reverse()
+            # 先在全部 job 中定位游标再按状态筛选：游标所指的 job 换了状态，分页仍然有效。
             if before:
                 ids = [j['job_id'] for j in jobs]
                 if before not in ids:
-                    raise ValueError('before must be a job_id in this result')
+                    raise ValueError('before must be an existing job_id')
                 jobs = jobs[ids.index(before) + 1:]
+            if status:
+                jobs = [j for j in jobs if j['status'] == status]
             return response({'jobs': jobs[:self.limit(query)]})
         if pieces[0] == 'jobs' and len(pieces) in (2, 3):
             job = self.get('job', pieces[1])
