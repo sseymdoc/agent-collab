@@ -207,7 +207,9 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 & "$Prefix\bin\agent-collab.ps1" service stop --prefix $Prefix
 ```
 
-`service stop` 不通知 controller：要立刻停止派单，先用 API 或 `install --drain` 排空。受管服务安装的升级和回退会重新启用并启动服务，
+`service stop` 不通知 controller：要立刻停止派单，先用 API 或 `install --drain` 排空。它对活动 attempt 的检查只是停止前的一次快照，
+与 worker 之间没有同步：未排空的节点在检查之后、停止之前领到的 attempt 会被打断，由 controller 按节点失效处理（满足恢复条件时从检查点继续）。
+要避免这种情况，先排空并等活动 attempt 归零再停。受管服务安装的升级和回退会重新启用并启动服务，
 被 `service stop` 停用的节点也一样：要让它继续停用，升级或回退之后再执行一次 `service stop`。
 进程异常退出由服务管理器恢复（Windows 每分钟的时间触发器、launchd KeepAlive、systemd `Restart=on-failure`），
 被 `service stop` 停用的节点不受这些机制影响。
@@ -228,10 +230,14 @@ Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1`
 ```
 
 脚本安装 OpenSSH Server 能力（若缺少），先停用能力自带的全放行防火墙规则，再在 `sshd_config` 顶部写入受管段
-（关闭口令与转发，`AllowUsers <账户>@<来源>`），把公钥连同 `from="<来源>",restrict,pty` 写入授权文件并把它的 ACL 重建为
-只有 Administrators 与 SYSTEM，新增只放行这些来源的防火墙规则。端口已被其他进程占用时中止，`sshd -t` 不通过时恢复原配置。
-原有配置在受管段之外已经有 `AllowUsers` 或 `Include` 时脚本不做任何改动就中止：多条 `AllowUsers` 是累加的，
-被包含的文件脚本也不检查，这两种情况下无法保证只放行一个账户，需要先手工清理或合并。
+（关闭口令与转发，`AllowUsers <账户>@<来源>`），把公钥连同 `from="<来源>",restrict,pty` 写入授权文件，新增只放行这些来源的防火墙规则。
+授权文件的 ACL 会重建：管理员账户用的 `administrators_authorized_keys` 只留 Administrators 与 SYSTEM，
+普通账户自己的 `.ssh\authorized_keys` 只留该账户、Administrators 与 SYSTEM。端口已被其他进程占用时中止，`sshd -t` 不通过时恢复原配置。
+
+受管段只在 sshd 对同一关键字“取第一个值”时才压得住后面的配置。原有配置在受管段之外含有下列指令时，脚本不做任何改动就中止，
+需要先手工清理或合并：`AllowUsers`、`Port`（多条是累加的）、`Include`（被包含的文件脚本不检查）、`AuthorizedKeysCommand`、
+`TrustedUserCAKeys`（会让别的密钥通过认证），以及 `Match` 块里对受管段所设认证与转发项的改写（对匹配的连接生效）。
+系统自带的默认配置不含这些指令。
 它不修改 DefaultShell，调用时显式写出解释器和安装前缀（下例对应上文 Windows 安装示例的前缀）：
 
 ```sh

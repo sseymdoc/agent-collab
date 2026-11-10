@@ -100,7 +100,7 @@ $Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).conf
 2. 在该节点执行 `service stop`。节点随后显示为 unreachable 且保持排空，不会再被派单。
 3. 保留它的 node_id、执行证据和数据目录，不要删除节点记录或卸载。要重新启用：`service start`，再解除排空。
 
-对已停用的节点运行安装器升级或回退会重新启用并启动它的服务（节点仍处于排空，不会被派单）；要继续停用，之后再执行一次 `service stop`。
+对已停用的节点运行安装器升级或回退会重新启用并启动它的服务，并恢复升级前的排空设置：只有升级前已排空的节点才不会被派单。要继续停用，之后再执行一次 `service stop`。
 
 只有被排空节点才具备的能力不会被别的节点替代：仅 Linux 可满足的任务进入 `waiting_capability`，`status_reason` 列出各节点的拒绝原因
 （如 `os_mismatch`、`gpu_missing`、`tool_missing:<名称>`）。macOS 的 POSIX shell 不等于 Linux，controller 主机也不是 worker。

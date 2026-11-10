@@ -134,11 +134,14 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 ```
 
 `--strict-mcp-config` 不加载任何 MCP 服务（含账户级连接器）；`--setting-sources local` 只读工作目录下的本地设置，
-因此用户级 settings、插件、hooks 和用户 CLAUDE.md 都不进入受管回合；`--safe-mode` 关闭记忆文件（各级目录的 CLAUDE.md、
-CLAUDE.local.md）、skills、插件、hooks 等全部定制。认证仍用官方本机登录（不使用 `--bare`，它读不到订阅登录）。
+因此用户级 settings、插件、hooks 和用户 CLAUDE.md 都不进入受管回合；`--safe-mode` 关闭用户与项目层的定制：记忆文件
+（各级目录的 CLAUDE.md、CLAUDE.local.md）、skills、插件和 hooks。管理员下发的托管策略不受这些参数影响，其中配置的 hooks 仍会运行。
+认证仍用官方本机登录（不使用 `--bare`，它读不到订阅登录）。
 实测（Claude Code 2.1.302）：只有 `--tools ""` 时回合会连接账户的邮件、笔记等连接器，加载用户插件并运行 SessionStart/UserPromptSubmit hooks；
 `--setting-sources project` 仍会带入用户 CLAUDE.md；`--setting-sources local` 仍会读取工作目录及其上级目录里的 `CLAUDE.local.md`，
-加上 `--safe-mode` 后不再读取。协调工作区里若出现 `.claude`，适配器不启动 Claude 并以 `code_failure` 结束。
+加上 `--safe-mode` 后不再读取。工作目录自己的 `.claude/settings.local.json` 里的 hooks 在只有 `--setting-sources local` 时会运行，
+加上 `--safe-mode` 后不运行；工作目录是某个 Git 仓库的子目录时，仓库根目录的 `.claude/settings.local.json` 没有被读取。
+协调工作区里若出现 `.claude`，适配器仍然不启动 Claude 并以 `code_failure` 结束。
 本机 Claude Code 必须支持这三个参数，不支持的旧版本不能用于协调回合。
 
 这些都是 Claude Code 的命令行参数，不构成操作系统级隔离。提示词要求协调者只依据提供的上下文判断、不声称没看到的检查，
