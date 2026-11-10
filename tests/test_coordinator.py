@@ -100,6 +100,13 @@ class CoordinatorTests(ControllerCase):
         self.assertGreater(renewed['expires_at'], first['expires_at'])
         # 续租后重放最初的取得请求：返回当次的同一租约状态（expires_at 与 version 都是原值）。
         self.assertEqual(self.lease(job, request_id=request), first)
+        # 升级前的旧回执没有 version/代次：续租后重放时返回 null，不用当前租约的值冒充。
+        key = job['work_package_id'] + ':' + request
+        legacy = {k: v for k, v in self.app.store.get('coordinator_request', key).items() if k not in ('version', 'authority_generation')}
+        self.app.store.put('coordinator_request', key, legacy)
+        replayed = self.lease(job, request_id=request)
+        self.assertEqual((replayed['coordinator_token'], replayed['expires_at']), (token, first['expires_at']))
+        self.assertEqual((replayed['version'], replayed['authority_generation']), (None, None))
         self.lease(job, status=409)
         self.lease(job, holder_ref='other', status=409)
         self.lease(job, holder_ref='other', takeover=True, status=400)

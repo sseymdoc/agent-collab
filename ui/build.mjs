@@ -12,20 +12,24 @@ const out = join(here, '..', 'agent_collab', 'static')
 // 暂存、旧产物备份和锁都在 ui/ 下（.gitignore 忽略 /ui/dist*/），残留不会被发行包收进 agent_collab/。
 const stage = join(here, 'dist'), old = join(here, 'dist.prev'), lock = join(here, 'dist.lock')
 
-// 同一 checkout 的构建互斥（mkdir 是原子操作）。锁里记下进程号：持有者已退出（如 Ctrl+C 未走到清理）时接管残留锁。
+// 同一 checkout 的构建互斥（mkdir 是原子操作）。残留锁不自动接管：两个构建可能同时判定它失效，
+// 后删的会删掉先到者刚建的新锁。锁里记下进程号，只用来在报错时说明持有者是否还在运行。
 function acquire() {
-  for (;;) {
-    try { mkdirSync(lock); writeFileSync(join(lock, 'pid'), String(process.pid)); return } catch (e) {
-      if (e.code !== 'EEXIST') throw e
-      let pid = 0
-      try { pid = Number(readFileSync(join(lock, 'pid'), 'utf8')) } catch { /* 刚建锁还没写入，按占用处理 */ }
-      let alive = !pid
-      try { if (pid) { process.kill(pid, 0); alive = true } } catch (k) { alive = k.code === 'EPERM' }
-      if (alive) throw new Error('另一个 UI 构建正在进行（' + lock + '）；等它结束再试。确认没有构建在运行时可删除该目录。')
-      rmSync(lock, { recursive: true, force: true })
-    }
+  try { mkdirSync(lock) } catch (e) {
+    if (e.code !== 'EEXIST') throw e
+    let pid = 0
+    try { pid = Number(readFileSync(join(lock, 'pid'), 'utf8')) } catch { /* 刚建锁还没写入 */ }
+    let alive = true
+    try { if (pid) process.kill(pid, 0) } catch (k) { alive = k.code === 'EPERM' }
+    throw new Error((alive ? '另一个 UI 构建正在进行（' + lock + '），等它结束再试。'
+      : '发现残留的构建锁 ' + lock + '（记录的进程 ' + pid + ' 已退出）。') + '确认没有构建在运行后，删除该目录再试。')
   }
+  writeFileSync(join(lock, 'pid'), String(process.pid))
 }
+
+// Ctrl+C / 终止信号不立即退出：正在运行的 tsc、vite 子进程随信号结束，构建按失败走完 finally，释放锁并还原产物，
+// 不留下残留锁。
+for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { process.exitCode = 130 })
 
 acquire()
 const work = mkdtempSync(join(tmpdir(), 'agent-collab-ui-build-'))
