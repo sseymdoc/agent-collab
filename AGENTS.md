@@ -48,7 +48,7 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 - **数据库只在本机打开。** SQLite 只由 controller 进程在本机文件系统打开（`serve` 持有 `controller.lock`），测试也一样，不经 SMB/NFS 打开。→ [ADR 0001](docs/adr/0001-stack-and-boundaries.md)
 - **不凭旧 PID 结束进程。** 节点重启后无法确认原进程身份时，保留 `restart_unknown` 并暂停领取，不根据记录的 PID 结束进程（PID 可能已被重用）。→ agent.md（执行、恢复与回写）
 - **模型调用参数是安全边界。** Claude 协调者固定 `--tools ""`、`--permission-mode dontAsk`、每轮新会话，context 作为不可信数据放进提示词；Codex 固定 `--ignore-user-config`、`read-only` 或 `workspace-write` 沙箱、`network_access=false`。改 `adapters/claude.py`、`adapters/codex.py` 的 argv 时保持这些，现有测试有断言。→ protocol §10、§11.5
-- **凭据只存哈希，不进输出。** 只有 `admin.token` 是明文文件（POSIX 0600）；节点令牌、租约、UI 会话、CSRF、配对码、协调令牌只存 SHA-256，比较用 `hmac.compare_digest`。节点上报的报告和日志尾部经 agent 的 `clean()` 去除已知令牌。新增凭据沿用同样做法。→ controller.md（启动与身份）
+- **控制端凭据只存哈希，所有凭据不进输出。** controller 数据库中的节点令牌、租约、UI 会话、CSRF、配对码、协调令牌只存 SHA-256，比较用 `hmac.compare_digest`。明文凭据文件只有控制端的 `admin.token`，以及节点发起认证必需的 `node.token` 和 `attempts/<id>/lease.token`，POSIX 上均为 0600。节点上报的报告和日志尾部经 agent 的 `clean()` 去除已知令牌。新增凭据沿用同样做法。→ controller.md（启动与身份）、agent.md（agent.json 与目录）
 - **回写不覆盖人工改动。** `artifacts.integrate()` 只检查本次结果改动的路径，冲突时返回 `conflict` 且不写目标；改写前先备份，再逐文件原子替换；结果未知时上报 `conflict`，不重放。→ agent.md（执行、恢复与回写）
 - **兼容面有外部使用者。** `/api/v1` 端点与记录形状、错误码、`agent.json` 与 `config.json` 的键、CLI 与安装器参数、数据库 records、`release-manifest.json` 都有已部署的使用者，controller 与节点不一定同时升级。改动按破坏性变更处理：保持旧字段语义，写明迁移方式。
 - **测试不碰真实模型和网络。** 测试用 stub harness、`tests/fake_controller.py` 或 `App.handle`；真实 Codex/Claude 回合消耗用户额度、依赖登录状态，只在明确要求时运行。`AGENT_COLLAB_FAULT_PARTITION`、`--fault-exit-after-checkpoint` 只用于测试与演练。→ agent.md（测试与故障注入）
