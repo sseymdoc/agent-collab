@@ -411,7 +411,7 @@ class App:
         self.get('root', root_id)
         lease = self.coordinator(root_id)
         if method == 'GET':
-            return response({k: lease[k] for k in ('holder_kind', 'holder_ref', 'expires_at', 'version')}) if lease else Response(200, [('Content-Type', 'application/json')], b'null')
+            return response({k: lease[k] for k in ('holder_kind', 'holder_ref', 'expires_at', 'version', 'authority_generation')}) if lease else Response(200, [('Content-Type', 'application/json')], b'null')
         token = headers.get('x-coordinator-token', '')
         if method == 'DELETE':
             # Expired/released credentials never release a later holder's lease.
@@ -444,7 +444,8 @@ class App:
             if digest_token(credential) != receipt['token_hash']:
                 raise APIError('conflict', 'coordinator credential required', reason='coordinator_lease')
             return response({'coordinator_token': credential, 'expires_at': receipt['expires_at'],
-                             'version': receipt.get('version', lease['version'])})
+                             'version': receipt.get('version', lease['version']),
+                             'authority_generation': receipt.get('authority_generation', lease['authority_generation'])})
         owns = bool(lease and hmac.compare_digest(lease['token_hash'], digest_token(token)) and
                     lease['holder_kind'] == kind and lease['holder_ref'] == ref)
         if lease and not owns and not takeover:
@@ -460,10 +461,13 @@ class App:
                   'version': previous.get('version', 0) + 1, 'token_hash': digest_token(credential),
                   'authority_generation': self.meta()['authority_generation']}
         self.store.put('coordinator', root_id, record)
-        # 回执记下当次的 expires_at 与 version：重放返回同一租约状态（旧回执没有 version 时退回当前租约版本）。
+        # 回执记下当次的 expires_at、version 与恢复代次：重放返回同一租约状态（旧回执缺字段时退回当前租约的值）。
+        # 版本在数据恢复后可能重新从 1 开始，客户端要用（代次, 版本）一起识别租约。
         self.store.put('coordinator_request', key, {'request_hash': hashed, 'token_hash': record['token_hash'],
-                       'expires_at': record['expires_at'], 'version': record['version'], 'renewal': owns})
-        return response({'coordinator_token': credential, 'expires_at': record['expires_at'], 'version': record['version']})
+                       'expires_at': record['expires_at'], 'version': record['version'],
+                       'authority_generation': record['authority_generation'], 'renewal': owns})
+        return response({'coordinator_token': credential, 'expires_at': record['expires_at'], 'version': record['version'],
+                         'authority_generation': record['authority_generation']})
 
     def _release_coordinator(self, root_id, lease, now):
         self.store.put('coordinator', root_id, dict(lease, token_hash=None, expires_at=d.timestamp(now), version=lease['version'] + 1))

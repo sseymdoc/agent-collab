@@ -18,8 +18,9 @@ function setCsrf(v: string | null) {
 
 // 协调令牌按根工作包保存在当前标签页；持有租约时，变更请求附带 X-Coordinator-Token。
 // 内存为准，sessionStorage 只用于刷新页面后恢复（隐私模式下不可用时仍能用内存中的令牌）。
-// 同时记下取得时的租约版本：版本变了（被接管、续租或重建），本页不再算持有者。版本单调递增，不会像时间戳那样在同一毫秒重复。
-export type CoordHeld = { token: string; version: number }
+// 同时记下取得时的租约身份（恢复代次, 版本）：变了（被接管、续租、重建或数据恢复），本页不再算持有者。
+// 版本单调递增，不会像时间戳那样在同一毫秒重复；数据恢复后版本可能重新从 1 开始，所以要连同代次一起比较。
+export type CoordHeld = { token: string; version: number; generation: number }
 const coordMem = new Map<string, CoordHeld | null>()
 const coordKey = (wp: string) => 'ac_coord_' + wp
 export function coordHeld(wp?: string | null): CoordHeld | null {
@@ -48,7 +49,7 @@ async function sendTake(wp: string, body: J) {
     throw e
   }
   pendingTake.delete(wp)
-  setCoord(wp, typeof d?.coordinator_token === 'string' ? { token: d.coordinator_token, version: d.version } : null)
+  setCoord(wp, typeof d?.coordinator_token === 'string' ? { token: d.coordinator_token, version: d.version, generation: d.authority_generation } : null)
   return d
 }
 

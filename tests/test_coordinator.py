@@ -91,9 +91,9 @@ class CoordinatorTests(ControllerCase):
         self.assertEqual(first, self.lease(job, request_id=request))
         token = first['coordinator_token']
         record = self.call('GET', self.lease_path(job))
-        self.assertEqual(set(record), {'holder_kind', 'holder_ref', 'expires_at', 'version'})
+        self.assertEqual(set(record), {'holder_kind', 'holder_ref', 'expires_at', 'version', 'authority_generation'})
         # 取得响应带租约版本：UI 据此判断归属（expires_at 可能在同一毫秒的接管中重复）。
-        self.assertEqual(first['version'], record['version'])
+        self.assertEqual((first['version'], first['authority_generation']), (record['version'], record['authority_generation']))
         self.clock.advance(5)
         renewed = self.lease(job, token, ttl_s=100)
         self.assertEqual(renewed['coordinator_token'], token)
