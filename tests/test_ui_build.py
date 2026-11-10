@@ -61,6 +61,7 @@ class BuildLockTests(unittest.TestCase):
             static.mkdir(parents=True)
             (static / 'index.html').write_text('old')
             build = subprocess.Popen([NODE, 'build.mjs'], cwd=str(ui), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            child, child_alive = None, None
             try:
                 for _ in range(300):
                     if marker.exists() and marker.read_text():
@@ -71,14 +72,27 @@ class BuildLockTests(unittest.TestCase):
                 child = int(marker.read_text())
                 build.send_signal(signal.SIGTERM)  # 只发给构建进程本身
                 build.communicate(timeout=30)
+                try:
+                    os.kill(child, 0)
+                    child_alive = True
+                except ProcessLookupError:
+                    child_alive = False
             finally:
-                if build.poll() is None:
+                # 测试失败时也不留进程：先结束构建进程和记录下的子进程，再收管道（子进程继承了管道，先收会一直等它）。
+                running = build.poll() is None
+                if running:
                     build.kill()
+                if child:
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if running:
+                    build.communicate()
             self.assertNotEqual(build.returncode, 0)
+            self.assertFalse(child_alive)
             self.assertEqual((static / 'index.html').read_text(), 'old')
             self.assertFalse((ui / 'dist.lock').exists())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child, 0)
 
     def test_lock_is_released_when_temporary_directory_cannot_be_created(self):
         with tempfile.TemporaryDirectory() as temp:
