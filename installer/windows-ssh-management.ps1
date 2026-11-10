@@ -181,8 +181,13 @@ try {
 
     Set-Service sshd -StartupType Automatic
     Restart-Service sshd -Force
-    $listening = @(Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
-        Where-Object { $_.RemotePort -eq 0 -and (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName -eq 'sshd' })
+    # The service reports Running before sshd has bound its socket: wait up to ten seconds for it.
+    $listening = @()
+    for ($attempt = 0; $attempt -lt 20 -and -not $listening; $attempt++) {
+        if ($attempt) { Start-Sleep -Milliseconds 500 }
+        $listening = @(Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
+            Where-Object { $_.RemotePort -eq 0 -and (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName -eq 'sshd' })
+    }
     if (-not $listening) { throw "sshd is not listening on port $Port; see the OpenSSH/Operational event log" }
 } catch {
     # An entry that worked before this run keeps working: its configuration, the rule this run
