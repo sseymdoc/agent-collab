@@ -98,6 +98,8 @@ class CoordinatorTests(ControllerCase):
         renewed = self.lease(job, token, ttl_s=100)
         self.assertEqual(renewed['coordinator_token'], token)
         self.assertGreater(renewed['expires_at'], first['expires_at'])
+        # 续租后重放最初的取得请求：返回当次的同一租约状态（expires_at 与 version 都是原值）。
+        self.assertEqual(self.lease(job, request_id=request), first)
         self.lease(job, status=409)
         self.lease(job, holder_ref='other', status=409)
         self.lease(job, holder_ref='other', takeover=True, status=400)

@@ -443,7 +443,8 @@ class App:
             credential = token if receipt['renewal'] else issued
             if digest_token(credential) != receipt['token_hash']:
                 raise APIError('conflict', 'coordinator credential required', reason='coordinator_lease')
-            return response({'coordinator_token': credential, 'expires_at': receipt['expires_at'], 'version': lease['version']})
+            return response({'coordinator_token': credential, 'expires_at': receipt['expires_at'],
+                             'version': receipt.get('version', lease['version'])})
         owns = bool(lease and hmac.compare_digest(lease['token_hash'], digest_token(token)) and
                     lease['holder_kind'] == kind and lease['holder_ref'] == ref)
         if lease and not owns and not takeover:
@@ -459,8 +460,9 @@ class App:
                   'version': previous.get('version', 0) + 1, 'token_hash': digest_token(credential),
                   'authority_generation': self.meta()['authority_generation']}
         self.store.put('coordinator', root_id, record)
+        # 回执记下当次的 expires_at 与 version：重放返回同一租约状态（旧回执没有 version 时退回当前租约版本）。
         self.store.put('coordinator_request', key, {'request_hash': hashed, 'token_hash': record['token_hash'],
-                       'expires_at': record['expires_at'], 'renewal': owns})
+                       'expires_at': record['expires_at'], 'version': record['version'], 'renewal': owns})
         return response({'coordinator_token': credential, 'expires_at': record['expires_at'], 'version': record['version']})
 
     def _release_coordinator(self, root_id, lease, now):
