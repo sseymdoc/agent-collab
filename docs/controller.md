@@ -108,7 +108,7 @@ API 路径统一前缀 `/api/v1`，另支持无认证 `/healthz`。`GET /healthz
 {"holder_kind":"interactive","holder_ref":"desktop-session","expires_at":"2026-11-09T03:50:00.000Z","version":1}
 ```
 
-POST 同路径提交 `{"request_id":"<UUID v4>","holder_kind":"interactive","holder_ref":"desktop-session","ttl_s":90,"takeover":false,"reason":""}`，返回 `{"coordinator_token":"<不透明凭据>","expires_at":"<UTC时间>"}`。续租使用新 request_id、相同 holder_kind/ref，并带 `X-Coordinator-Token`；DELETE 带该头释放，返回 `{}`。其他持有者占用时为 409 conflict；管理员 Bearer 或经管理员登录建立的 UI 会话可用 takeover=true 和非空 reason 接管，并写 coordinator.takeover 事件。节点身份不能获取/接管。UI 仍须提供 CSRF 和合法 Origin。
+POST 同路径提交 `{"request_id":"<UUID v4>","holder_kind":"interactive","holder_ref":"desktop-session","ttl_s":90,"takeover":false,"reason":""}`，返回 `{"coordinator_token":"<不透明凭据>","expires_at":"<UTC时间>","version":<租约版本>}`。续租使用新 request_id、相同 holder_kind/ref，并带 `X-Coordinator-Token`；DELETE 带该头释放，返回 `{}`。其他持有者占用时为 409 conflict；管理员 Bearer 或经管理员登录建立的 UI 会话可用 takeover=true 和非空 reason 接管，并写 coordinator.takeover 事件。节点身份不能获取/接管。UI 仍须提供 CSRF 和合法 Origin。
 
 协调租约按目标根工作包独占。客户端 assess/publish/retry/integration 及同根新 job 提交缺少匹配 token 时返回 `409 {"error":{"code":"conflict","message":"…","details":{"reason":"coordinator_lease"}}}`。cancel 不受门禁影响；节点 auto publish 豁免协调 token，但仍受 epoch/generation/CAS 约束；节点 integration 不豁免。检查门禁后才读写普通请求幂等回执，旧协调者不能凭旧请求重放绕过租约。
 

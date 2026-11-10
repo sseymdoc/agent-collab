@@ -92,6 +92,8 @@ class CoordinatorTests(ControllerCase):
         token = first['coordinator_token']
         record = self.call('GET', self.lease_path(job))
         self.assertEqual(set(record), {'holder_kind', 'holder_ref', 'expires_at', 'version'})
+        # 取得响应带租约版本：UI 据此判断归属（expires_at 可能在同一毫秒的接管中重复）。
+        self.assertEqual(first['version'], record['version'])
         self.clock.advance(5)
         renewed = self.lease(job, token, ttl_s=100)
         self.assertEqual(renewed['coordinator_token'], token)
@@ -101,6 +103,8 @@ class CoordinatorTests(ControllerCase):
         self.lease(job, holder_ref='other', takeover=True, status=400)
         second = self.lease(job, holder_ref='other', takeover=True, reason='operator takeover')
         self.assertNotEqual(second['coordinator_token'], token)
+        self.assertGreater(second['version'], renewed['version'])
+        self.assertEqual(self.call('GET', self.lease_path(job))['version'], second['version'])
         takeovers = [e for e in self.call('GET', '/events')['events'] if e['type'] == 'coordinator.takeover']
         self.assertEqual(len(takeovers), 1)
         self.assertEqual(takeovers[0]['payload']['reason'], 'operator takeover')

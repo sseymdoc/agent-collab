@@ -137,8 +137,8 @@ function Coordinator({ job, tick }: { job: any; tick: number }) {
   const [reason, setReason] = useState('')
   const l = lease.data
   const held = coordHeld(wp)
-  // 只凭本地令牌不够：别人接管后旧令牌仍在。租约的 expires_at 与取得时一致才算本页持有。
-  const mine = !!(held && l && held.expires_at === l.expires_at)
+  // 只凭本地令牌不够：别人接管后旧令牌仍在。租约版本与取得时一致才算本页持有。
+  const mine = !!(held && l && held.version === l.version)
   const target = job.contract?.coordinates?.job_id
   return <Section title="协调权" extra={<span className="muted">同一根工作包同时只允许一个协调者（交互或受管 Claude）</span>}>
     {target && <p>本任务是受管协调回合，目标任务：<a href={'#/jobs/' + target}>{short(target)}</a></p>}

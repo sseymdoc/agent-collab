@@ -5,7 +5,7 @@ __pycache__/
 *.egg-info/
 /.dev/
 /ui/node_modules/
-/ui/dist/
+/ui/dist*/
 /agent_collab/static/
 *.db
 *.db-wal
