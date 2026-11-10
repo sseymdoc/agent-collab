@@ -171,15 +171,17 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(list(self.temp.iterdir()), [])
 
     @unittest.skipUnless(shutil.which('pwsh') or shutil.which('powershell.exe'), 'PowerShell parser unavailable')
-    def test_powershell_entry_parses(self):
+    def test_powershell_scripts_parse(self):
         executable = shutil.which('pwsh') or shutil.which('powershell.exe')
-        path = str(ROOT / 'installer/install.ps1').replace("'", "''")
-        command = ("$tokens=$null; $errors=$null; "
-                   "[System.Management.Automation.Language.Parser]::ParseFile('" + path +
-                   "', [ref]$tokens, [ref]$errors) > $null; if ($errors.Count) { exit 1 }")
-        result = subprocess.run([executable, '-NoProfile', '-NonInteractive', '-Command', command],
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ('install.ps1', 'windows-ssh-management.ps1'):
+            with self.subTest(script=name):
+                path = str(ROOT / 'installer' / name).replace("'", "''")
+                command = ("$tokens=$null; $errors=$null; "
+                           "[System.Management.Automation.Language.Parser]::ParseFile('" + path +
+                           "', [ref]$tokens, [ref]$errors) > $null; if ($errors.Count) { exit 1 }")
+                result = subprocess.run([executable, '-NoProfile', '-NonInteractive', '-Command', command],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_paired_worker_drain_timeout_keeps_current_and_never_stops_services(self):
         self.invoke('--release', str(self.v1), role='worker')
