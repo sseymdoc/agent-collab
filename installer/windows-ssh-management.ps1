@@ -129,13 +129,11 @@ if ($shared) {
 # Existing keys are kept, so they must come from a file nobody else could have written. sshd
 # ignores a file that others own or can write; tightening it would bring every line in it to life.
 $existing = @()
-$previousKeys = $null
 if (Test-Path -LiteralPath $keys) {
     $others = @(Get-OtherWriters $keys $writers)
     if ($others) {
         throw "$keys can be written by $($others -join ', '); review its contents, then restrict or remove the file and rerun"
     }
-    $previousKeys = [IO.File]::ReadAllBytes($keys)
     $existing = @(Get-Content -LiteralPath $keys)
 }
 
@@ -163,6 +161,7 @@ $block = @($begin, "Port $Port", 'PubkeyAuthentication yes', 'PasswordAuthentica
     "AllowUsers $allowUsers", 'AllowTcpForwarding no', 'AllowAgentForwarding no', 'X11Forwarding no',
     'PermitTunnel no', 'MaxAuthTries 3', 'LoginGraceTime 30', $end) -join "`r`n"
 $stage = $null
+$aside = $null
 $movedKeys = $false
 $createdRule = $false
 $oldRule = $null
@@ -188,6 +187,12 @@ try {
     if ($LASTEXITCODE -eq 0 -and -not $shared) { & icacls.exe $stage /setowner $User | Out-Null }
     if ($LASTEXITCODE -ne 0) { throw "cannot set the permissions of the authorized keys for $User" }
     [void](New-Item -ItemType Directory -Force -Path (Split-Path $keys))
+    # The previous file is renamed out of the way, not overwritten: a failure further down puts
+    # back the very same file, permissions and owner included.
+    if (Test-Path -LiteralPath $keys) {
+        Move-Item -LiteralPath $keys -Destination ($keys + '.agent-collab-previous') -Force
+        $aside = $keys + '.agent-collab-previous'
+    }
     Move-Item -LiteralPath $stage -Destination $keys -Force
     $movedKeys = $true
 
@@ -221,11 +226,10 @@ try {
     # firewall rule and service state are put back as they were.
     Write-Config $previous
     if ($stage) { Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue }
-    if ($movedKeys) {
-        try {
-            if ($null -ne $previousKeys) { [IO.File]::WriteAllBytes($keys, $previousKeys) } else { Remove-Item -LiteralPath $keys -Force }
-        } catch { Write-Warning "could not restore ${keys}: $_" }
-    }
+    try {
+        if ($movedKeys) { Remove-Item -LiteralPath $keys -Force }
+        if ($aside) { Move-Item -LiteralPath $aside -Destination $keys -Force }
+    } catch { Write-Warning "could not restore ${keys}: $_" }
     if ($createdRule) {
         Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     } elseif ($oldRule) {
@@ -235,7 +239,8 @@ try {
     if ($wasRunning) { Restart-Service sshd -Force -ErrorAction SilentlyContinue } else { Stop-Service sshd -Force -ErrorAction SilentlyContinue }
     throw
 }
+if ($aside) { Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue }
 
-$hostKey = & (Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe') -lf (Join-Path $sshDir 'ssh_host_ed25519_key.pub')
+$hostKey =& (Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe') -lf (Join-Path $sshDir 'ssh_host_ed25519_key.pub')
 [ordered]@{ user = $User; port = $Port; allow_from = $AllowFrom; authorized_keys = $keys
     administrator_token = $administrator; host_key = "$hostKey"; default_shell = 'unchanged' } | ConvertTo-Json
