@@ -58,10 +58,20 @@ foreach ($listener in $listeners) {
     if ($owner -ne 'sshd') { throw "port $Port is already in use by '$owner' (pid $($listener.OwningProcess)); pass another -Port" }
 }
 
-# AllowUsers accumulates across directives instead of taking the first value, and included files
-# are not inspected: neither can sit under the single-account promise. Checked before any change.
-if ([regex]::Replace((Read-Config), $blockPattern, '') -match '(?im)^[ \t]*(AllowUsers|Include)\b') {
-    throw "sshd_config already has $($Matches[1]) outside the managed block; remove or merge it by hand, then rerun"
+# The managed block only wins where sshd takes the first value of a keyword. Refuse, before any
+# change, an existing configuration with directives that add to the block or override it:
+# AllowUsers and Port accumulate, Include pulls in files this script does not read, a key command
+# or user CA authorizes further keys, and a Match block replaces the block's settings for the
+# connections it matches. The stock sshd_config has none of these.
+$preserved = [regex]::Replace((Read-Config), $blockPattern, '')
+$conflicts = @([regex]::Matches($preserved, '(?im)^[ \t]*(AllowUsers|Port|Include|AuthorizedKeysCommand|TrustedUserCAKeys)\b') |
+    ForEach-Object { $_.Groups[1].Value })
+$overridable = 'PubkeyAuthentication|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|' +
+    'AuthenticationMethods|PermitEmptyPasswords|AllowTcpForwarding|AllowAgentForwarding|X11Forwarding|PermitTunnel|MaxAuthTries'
+$matchScope = [regex]::Match($preserved, '(?ims)^[ \t]*Match\b.*').Value
+$conflicts += @([regex]::Matches($matchScope, "(?im)^[ \t]*($overridable)\b") | ForEach-Object { 'Match ' + $_.Groups[1].Value })
+if ($conflicts) {
+    throw "sshd_config has directives outside the managed block that add to or override it ($(($conflicts | Select-Object -Unique) -join ', ')); remove or merge them by hand, then rerun"
 }
 
 $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
@@ -84,8 +94,8 @@ $block = @($begin, "Port $Port", 'PubkeyAuthentication yes', 'PasswordAuthentica
     'KbdInteractiveAuthentication no', 'AuthenticationMethods publickey', 'PermitEmptyPasswords no',
     "AllowUsers $allowUsers", 'AllowTcpForwarding no', 'AllowAgentForwarding no', 'X11Forwarding no',
     'PermitTunnel no', 'MaxAuthTries 3', 'LoginGraceTime 30', $end) -join "`r`n"
-# sshd uses the first value of each of these keywords except AllowUsers (rejected above when
-# already present): the managed block goes before the defaults.
+# sshd uses the first value of each of these keywords (the accumulating ones were rejected above
+# when already present): the managed block goes before the defaults.
 Write-Config ($block + "`r`n" + [regex]::Replace($previous, $blockPattern, ''))
 & $sshd -t -f $config
 if ($LASTEXITCODE -ne 0) {
@@ -109,13 +119,14 @@ $line = 'from="' + ($AllowFrom -join ',') + '",restrict,pty ' + $PublicKey
 $existing = @(if (Test-Path -LiteralPath $keys) { Get-Content -LiteralPath $keys })
 $kept = @($existing | Where-Object { $_ -and ($_ -notlike "*$keyBlob*") })
 [IO.File]::WriteAllLines($keys, [string[]]($kept + $line), [Text.Encoding]::ASCII)
-if ($administrator) {
-    # sshd ignores this file unless only Administrators and SYSTEM can access it. /reset drops
-    # explicit entries left on an existing file; /inheritance:r alone would keep them.
-    & icacls.exe $keys /reset | Out-Null
-    if ($LASTEXITCODE -eq 0) { & icacls.exe $keys /inheritance:r /grant '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null }
-    if ($LASTEXITCODE -ne 0) { throw 'cannot restrict administrators_authorized_keys' }
-}
+# sshd ignores an authorized-keys file that other accounts can write: administrators' file may list
+# only Administrators and SYSTEM, a user's own file the user as well. /reset drops explicit entries
+# left on an existing file (/inheritance:r alone would keep them); inheritance could add others.
+$grant = @('*S-1-5-32-544:F', '*S-1-5-18:F')
+if (-not $administrator) { $grant += "${User}:F" }
+& icacls.exe $keys /reset | Out-Null
+if ($LASTEXITCODE -eq 0) { & icacls.exe $keys /inheritance:r /grant $grant | Out-Null }
+if ($LASTEXITCODE -ne 0) { throw "cannot restrict access to $keys" }
 
 Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -Name $ruleName -DisplayName 'agent-collab SSH management (listed sources only)' `
