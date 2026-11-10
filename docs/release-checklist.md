@@ -9,12 +9,12 @@
 ## 隐私与环境信息
 
 - 部署实测证据（真实域名、实例、主机名、用户目录、会话 ID）只保存在私有资料中，不进入公开仓库。
-- 提交前复查暂存区（`git add` 之后），检查将要提交的内容而不是工作区：
+- 提交前在仓库根目录复查暂存区（`git add` 之后），检查将要提交的内容而不是工作区；在子目录（如 `ui/`）中运行会只检查该目录：
   - `git grep --cached -nIiE "<你的域名>|<实例 ID 前缀>|<主机名>|<用户名>"` 应无输出；
   - `git ls-files -- "*.token" "*.db" "*.db-wal" "*.db-shm"` 应无输出（`admin.token`、`node.token`、`lease.token` 等令牌文件都匹配 `*.token`）。`.gitignore` 已忽略这些文件，但忽略规则不影响已被跟踪的文件，所以仍要检查索引。
 
 ## 发布产物
 
-- 先构建 UI：`cd ui && npm ci && node build.mjs`。干净检出里没有 `agent_collab/static/`，这时构建出的发行包 manifest 为 `ui_built=false`，安装后没有控制台。
+- 先构建 UI，完成后回到仓库根目录：`cd ui && npm ci && node build.mjs && cd ..`。干净检出里没有 `agent_collab/static/`，这时构建出的发行包 manifest 为 `ui_built=false`，安装后没有控制台。
 - `python3 -B scripts/build_release.py --version <版本>`：确认 manifest 中 `ui_built=true`，且包内有 `agent_collab/static/third-party-licenses.md`、`agent_collab/LICENSE` 与 `agent_collab/THIRD_PARTY.md`；manifest 记录 git_commit/git_dirty、逐文件 sha256；当前**没有签名**，正式发行前需增加可信签名或来源证明（如 Sigstore / minisign）并在安装器中校验。
 - 发行前在 Windows、Linux（含 WSL）、macOS 系统 Python 3.9 各跑一次 `python -m unittest discover -s tests`（含 `tests/test_e2e_local.py`）；CI 覆盖 Ubuntu（3.9、3.13）、Windows 与 macOS。

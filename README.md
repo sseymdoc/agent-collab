@@ -13,7 +13,7 @@
 - **受理与调度**：任务契约（目标、验收项、排除项、harness、资源与预算）受理后不可变；按操作系统、CPU 架构、工具、GPU、认证状态、主机槽位等硬条件过滤，再做可解释的评分。
 - **检查点恢复**：节点在静止边界提交内容寻址的检查点；节点失联后，从最近一个已确认的检查点在另一台合格机器上新建 attempt（epoch +1），旧 attempt 的迟到发布被 fencing 拒绝。
 - **受管协调**：任务结束或需要对账时，可由幸存节点上的 Claude Code 读取上下文、给出结构化决定（accept / rework / escalate），必要时派生 Codex 修复任务；协调权按工作包独占，迟到或重复的决定不会重复生效。
-- **证据门禁**：契约可声明必需检查（如单元测试命令），由节点在 harness 完成后亲自执行并记录退出码、平台和输出尾部，绑定到检查点 manifest。缺少这些证据时，无论模型还是管理员请求 `passed`，都只会记为 `unverified` 并列出缺口。要让未通过验收的结果不能发布，契约需设 `publish.requires_acceptance=true`；默认值为 `false`：检查结果照样由节点写入 attempt 报告（`attempts[].report.checks.results`），只是发布不受它阻止。
+- **证据门禁**：契约可声明必需检查（如单元测试命令），由节点在 harness 完成后亲自执行并记录退出码、平台和输出尾部，绑定到检查点 manifest。有人请求 `passed` 验收时（无论来自模型还是管理员）才核对这些证据：缺少或失败就只记为 `unverified` 并列出缺口；没有验收请求时不会生成验收记录，结果要看 attempt 报告。要让未通过验收的结果不能发布，契约需设 `publish.requires_acceptance=true`；默认值为 `false`：检查结果照样由节点写入 attempt 报告（`attempts[].report.checks.results`），只是发布不受它阻止。
 - **源目录回写**：交付保存在控制服务；回写到源目录由目标节点按基线检查执行，源机暂时不可达时显示为“待回写”，冲突时不覆盖。
 - **运维**：安装器（systemd、LaunchAgent、Windows 计划任务）、不可变版本目录、升级/回退、定时一致备份与实例外拉取、Web 控制台。
 
@@ -80,7 +80,7 @@ python -m agent_collab.node_agent run --data-dir ./.dev/node --foreground
    "coordination": {"policy": "none"}}}
 ```
 
-`recovery.auto=false` 表示不上传输入基线，可直接派单，但不做自动恢复；`coordination.policy=none` 表示结束后不调用 Claude 协调者。然后提交并查看结果：
+`recovery.auto=false` 表示不做自动恢复，因此不要求提供输入基线（`inputs_manifest`）。本例没有提供基线，任务受理后可以直接派单。`coordination.policy=none` 表示结束后不调用 Claude 协调者。保持前两个终端中的 controller 和节点继续运行，在第三个终端提交并查看结果：
 
 ```sh
 python -m agent_collab.cli submit job.json --token-file ./.dev/ctl/admin.token
