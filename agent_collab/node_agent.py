@@ -24,7 +24,7 @@ from .adapters.codex import CodexAdapter, process_stamp, process_status
 from .adapters.claude import ClaudeAdapter
 from .adapters.stub import StubAdapter
 from .adapters.checks import ContractChecks
-from .adapters.commands import resolve_commands, probe_auth
+from .adapters.commands import CODEX_CLEARED_ENV, resolve_commands, probe_auth
 from .release import VERSION, release_info, version_directory
 
 LOG = logging.getLogger(__name__)
@@ -947,6 +947,45 @@ def pair(args, transport=None):
     return dict(node_id=args.node_id, data_dir=str(directory), paired=True)
 
 
+def effective_configuration(config, directory, commands, capabilities, system=None):
+    """Allowlisted local diagnostics; derive managed arguments from the execution builders."""
+    from .adapters import codex, claude
+    from . import domain as d
+    node = {key: config.get(key) for key in ('node_id', 'controller', 'physical_host_id', 'failure_domain')}
+    node.update(slots=config.get('slots', 1), host_slots=config.get('host_slots', 1),
+                labels=sorted(set(capabilities.get('labels', []) + config.get('labels', []))),
+                workspace_root=str(Path(config['workspace_root']).expanduser().absolute()) if config.get('workspace_root') else None,
+                data_dir=str(directory.absolute()))
+    agent = dict(capabilities['agent'], version_dir=str(version_directory()), python=sys.executable,
+                 user=getpass.getuser(), platform=system or platform.system())
+    harness = {}
+    for name in ('codex', 'claude'):
+        command = commands[name]
+        argv = command['argv']
+        entry = dict(argv=argv, version=capabilities['harness'][name], disabled=command.get('disabled'),
+                     path_prepend=str(Path(argv[0]).parent) if argv else None, managed_argv=None)
+        if name == 'codex':
+            entry.update(codex_home=config.get('codex_home') or command['env'].get('CODEX_HOME', str(Path.home() / '.codex')),
+                         cleared_env=list(CODEX_CLEARED_ENV))
+        if argv:
+            if name == 'codex':
+                managed = codex.build_argv(argv, '<work>', '<attempt>', system=system or platform.system(),
+                                          windows_sandbox=config.get('codex_windows_sandbox', 'elevated'))
+                # Effort and sandbox come from the attempt contract, not the node config.
+                managed[managed.index('--sandbox', len(argv)) + 1] = '<sandbox>'
+                index = next(i for i in range(len(argv), len(managed)) if managed[i].startswith('model_reasoning_effort='))
+                managed[index] = managed[index].split('=', 1)[0] + '="<effort>"'
+            else:
+                session = '00000000-0000-4000-8000-000000000000'
+                managed = claude.build_argv(argv, dict(model='<profile.model>', effort='<profile.effort>'),
+                                            d.DECISION_SCHEMA, session)
+                managed[managed.index('--json-schema', len(argv)) + 1] = '<decision-schema>'
+                managed[managed.index('--session-id', len(argv)) + 1] = '<session-id>'
+            entry['managed_argv'] = managed
+        harness[name] = entry
+    return dict(node=node, agent=agent, harness=harness)
+
+
 def doctor(data_dir, transport=None, commands=None, runner=None, system=None):
     directory = Path(data_dir)
     checks = {}
@@ -1007,7 +1046,8 @@ def doctor(data_dir, transport=None, commands=None, runner=None, system=None):
     checks.update(attempt_credentials=credentials_ok, restart_clear=not blockers)
     result = dict(ok=all(value for key, value in checks.items() if key != 'harness'),
                   checks=checks, restart_blockers=blockers, warnings=warnings, capabilities=capabilities,
-                  auth_health={name: probe_auth(name, command, runner) for name, command in commands.items()})
+                  auth_health={name: probe_auth(name, command, runner) for name, command in commands.items()},
+                  effective=effective_configuration(config, directory, commands, capabilities, system))
     return redact(result, secrets)
 
 

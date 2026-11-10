@@ -6,6 +6,7 @@ import platform
 import subprocess
 
 HARNESSES = ('codex', 'claude')
+CODEX_CLEARED_ENV = ('CODEX_THREAD_ID', 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE')
 
 
 def resolve_commands(config=None, env=None, system=None, home=None, mac_dirs=None):
@@ -58,7 +59,7 @@ def resolve_commands(config=None, env=None, system=None, home=None, mac_dirs=Non
         if path:
             command_env['PATH'] = str(Path(path).parent) + os.pathsep + environment.get('PATH', os.defpath)
         if name == 'codex':
-            for key in ('CODEX_THREAD_ID', 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE'):
+            for key in CODEX_CLEARED_ENV:
                 command_env.pop(key, None)
             if config.get('codex_home'):
                 command_env['CODEX_HOME'] = config['codex_home']

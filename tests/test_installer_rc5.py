@@ -91,10 +91,15 @@ class WorkerInstallTests(unittest.TestCase):
         pythonw.write_bytes(b'fixture')
         xml = task()
         self.assertEqual(xml.find('.//{*}Command').text, str(pythonw))
-        repetition = xml.find('.//{*}LogonTrigger/{*}Repetition')
-        self.assertEqual(repetition.find('{*}Interval').text, 'PT5M')
+        # 重复挂在时间触发器上（注册即生效）；登录触发器只负责登录时立即启动。
+        self.assertIsNone(xml.find('.//{*}LogonTrigger/{*}Repetition'))
+        timer = xml.find('.//{*}TimeTrigger')
+        repetition = timer.find('{*}Repetition')
+        self.assertEqual(repetition.find('{*}Interval').text, 'PT1M')
         self.assertEqual(repetition.find('{*}StopAtDurationEnd').text, 'false')
         self.assertIsNone(repetition.find('{*}Duration'))
+        self.assertLess(timer.find('{*}StartBoundary').text, '2026')  # 起点在过去，不带结束时间
+        self.assertIsNone(timer.find('{*}EndBoundary'))
         self.assertEqual(xml.find('.//{*}MultipleInstancesPolicy').text, 'IgnoreNew')
         self.assertIsNotNone(xml.find('.//{*}RestartOnFailure'))
         self.assertEqual(ins.worker_python(r'C:\Python315\python.exe', exists=lambda path: True), r'C:\Python315\pythonw.exe')
