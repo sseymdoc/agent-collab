@@ -39,7 +39,7 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 - **零运行时依赖，兼容 Python 3.9。** `agent_collab/` 只用标准库，语法和 API 都要在 3.9 上可用（macOS 系统 Python 3.9.6 是真实节点）：不用 `match`、`zip(strict=)`、运行期求值的 `X | None`、`tomllib` 等。Node 只在构建 UI 时需要。→ [ADR 0001](docs/adr/0001-stack-and-boundaries.md)
 - **业务逻辑在 `App.handle`。** `http.server` 包装只做 socket、TLS 和 SSE 推送；新端点必须能不开 socket、经 `App.handle` 测试。时间取注入的 `clock()`，节点网络走注入的 `transport`；测试用 `helpers.Clock.advance()` 推进时间，不真实等待。→ protocol §1
 - **`domain.py` 只放纯函数。** 状态转换、调度过滤与评分、恢复决策、验收证据判定不访问数据库、文件、网络或时钟。→ protocol §6
-- **fencing 优先。** 节点改变权威状态的请求都校验 `(attempt_id, epoch == job.current_epoch, lease_token, authority_generation)`：旧 epoch 的事件按 `event_id` 去重存档为 `stale=true`，不改状态；检查点、完成与发布返回 409 `fenced`；fencing 先于返回历史幂等回执。新增的节点写端点走同一校验。→ protocol §4 规则 2、7
+- **fencing 优先。** attempt 的事件、检查点、完成与发布请求都校验 `(attempt_id, epoch == job.current_epoch, lease_token, authority_generation)`：旧 epoch 的事件按 `event_id` 去重存档为 `stale=true`，不改状态；检查点、完成与发布返回 409 `fenced`；fencing 先于返回历史幂等回执。新增的 attempt 写端点走同一校验。回写结果（`POST /jobs/{id}/integration`）不属于某个 attempt，改为按当前交付指针校验：`checkpoint_id` 必须等于 `delivery_checkpoint_id`。→ protocol §4 规则 2、7，§5
 - **幂等回执与状态同事务。** 客户端变更请求带 `request_id` 与 `expected_version`，相同内容重放原响应，不同内容 409。权威状态、事件与幂等回执在同一个 SQLite 事务里提交；不要拆成多个事务，也不要在事务外补写事件。→ protocol §5、controller.md（数据和配置）
 - **blob 齐全才能 durable。** blob 先写同盘临时文件、fsync、校验 SHA-256，再 `os.replace`；checkpoint 引用的 blob 全部存在且大小一致，才与 job 指针在同一事务里置为 `durable`。→ protocol §4 规则 4
 - **交付只经发布 CAS。** `delivery_version` 只在 `expected_base_version == delivery_version` 时加 1；`requires_acceptance` 只认 `passed`；`version_mismatch` 不自动重试，交给协调者。→ protocol §4 规则 6
@@ -47,11 +47,11 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 - **契约受理后不可变。** 契约字段参与 `request_hash`。新增字段要决定是否参与哈希，且不能改变旧契约的哈希；升级时幂等补齐缺省字段，不改写历史契约、请求哈希、幂等回执或版本号。→ controller.md（rc5 检查、能力证据与回写待办）
 - **数据库只在本机打开。** SQLite 只在 controller 所在主机的本机文件系统上打开，测试也一样，不经 SMB/NFS 打开。`serve` 持有 `controller.lock`，同一数据目录只运行一个服务；`backup`、`pairing-code`、`prune-events` 等本机命令可以与它并行，其中 `backup` 用 SQLite backup API 取一致快照；`restore` 要求服务已停止。直接构造 `App` 时，由调用方保证同一目录只有一个活动实例。→ [ADR 0001](docs/adr/0001-stack-and-boundaries.md)、controller.md（启动与身份）
 - **不凭旧 PID 结束进程。** 节点重启后无法确认原进程身份时，保留 `restart_unknown` 并暂停领取，不根据记录的 PID 结束进程（PID 可能已被重用）。→ agent.md（执行、恢复与回写）
-- **模型调用参数是安全边界。** Claude 协调者固定 `--tools ""`、`--permission-mode dontAsk`、每轮新会话，context 作为不可信数据放进提示词；Codex 固定 `--ignore-user-config`、`read-only` 或 `workspace-write` 沙箱、`network_access=false`。改 `adapters/claude.py`、`adapters/codex.py` 的 argv 时保持这些，现有测试有断言。→ protocol §10、§11.5
+- **模型调用参数是安全边界。** Claude 协调者固定 `--tools ""`、`--permission-mode dontAsk`、每轮新会话，context 作为不可信数据放进提示词；提示词要求它只依据提供的证据判断、不声称没看到的检查，证据不足或没有检查点时选择 `escalate`，改提示词时保留这些要求。Codex 固定 `--ignore-user-config`、`read-only` 或 `workspace-write` 沙箱、`network_access=false`。改 `adapters/claude.py`、`adapters/codex.py` 的 argv 时保持这些，现有测试有断言。→ protocol §10、§11.5
 - **控制端凭据只存哈希，所有凭据不进输出。** controller 数据库中的节点令牌、租约、UI 会话、CSRF、配对码、协调令牌只存 SHA-256，比较用 `hmac.compare_digest`。明文凭据文件只有控制端的 `admin.token`，以及节点发起认证必需的 `node.token` 和 `attempts/<id>/lease.token`，POSIX 上均为 0600。节点上报的报告和日志尾部经 agent 的 `clean()` 去除已知令牌。新增凭据沿用同样做法。→ controller.md（启动与身份）、agent.md（agent.json 与目录）
 - **回写不覆盖人工改动。** `artifacts.integrate()` 只检查本次结果改动的路径，冲突时返回 `conflict` 且不写目标；改写前先备份，再逐文件原子替换；结果未知时上报 `conflict`，不重放。→ agent.md（执行、恢复与回写）
 - **兼容面有外部使用者。** `/api/v1` 端点与记录形状、错误码、`agent.json` 与 `config.json` 的键、CLI 与安装器参数、数据库 records、`release-manifest.json` 都有已部署的使用者，controller 与节点不一定同时升级。改动按破坏性变更处理：保持旧字段语义，写明迁移方式。
-- **测试不碰真实模型和网络。** 测试用 stub harness、`tests/fake_controller.py` 或 `App.handle`；真实 Codex/Claude 回合消耗用户额度、依赖登录状态，只在明确要求时运行。`AGENT_COLLAB_FAULT_PARTITION`、`--fault-exit-after-checkpoint` 只用于测试与演练。→ agent.md（测试与故障注入）
+- **测试不碰真实模型和外部网络。** 测试用 stub harness、`tests/fake_controller.py` 或 `App.handle`；`tests/test_e2e_local.py` 在 loopback 上起本机 controller 是例外，socket 不可用时跳过。真实 Codex/Claude 回合消耗用户额度、依赖登录状态，只在明确要求时运行。`AGENT_COLLAB_FAULT_PARTITION`、`--fault-exit-after-checkpoint` 只用于测试与演练。→ agent.md（测试与故障注入）
 
 ## 缺陷、已知限制与部署加固
 
