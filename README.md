@@ -1,5 +1,10 @@
 # agent-collab
 
+[![CI](https://github.com/sseymdoc/agent-collab/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sseymdoc/agent-collab/actions/workflows/ci.yml)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
+![零运行时依赖](https://img.shields.io/badge/runtime%20deps-0-22c55e)
+[![License: MIT](https://img.shields.io/badge/license-MIT-A855F7)](LICENSE)
+
 **Claude–Codex 协作调度器**：把开发工作包交给多台机器上的 Codex / Claude 执行，按能力调度、靠检查点恢复，在一台主机失效后由另一台接着完成修复与验收。
 
 *A small, dependency-free scheduler that runs Claude Code and Codex CLI work packages across your own machines, with checkpoint recovery, fenced publishing and evidence-gated acceptance.*
@@ -123,6 +128,13 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
 - Claude 协调者不启用任何工具（`--tools ''`），只根据控制服务在提示中提供的上下文给出决定，不能自行读取文件；这是 Claude Code 自身的命令行限制，**不是操作系统级隔离**；stub harness 仅用于测试，没有隔离。
 - macOS 和 Windows 的节点服务依赖用户登录（macOS 钥匙串、Windows 登录触发），开机后无人登录时不会运行。Linux worker 的 systemd 用户单元默认也随用户会话启停；启用 linger 后可在无人登录时运行，但安装器不会自动启用。WSL 还受 Windows 宿主与 WSL 生命周期限制。
 
+## 数据去向
+
+- **控制服务**保存任务契约、输入文件和每个检查点的工作区文件（内容寻址 blob）、attempt 报告（含检查命令的输出尾部，已去除已知令牌）和事件；备份包含同样的内容，须按控制服务的数据目录同等保护。
+- **节点**只连接你配置的控制服务。本项目不向维护者发送遥测或统计数据。
+- **模型服务**：Codex 与 Claude 以你本机的登录运行，提示词和它们读到的工作区内容按 OpenAI、Anthropic 各自的条款处理。受管协调者的提示词中包含目标任务的契约、attempt 报告、检查点差异，以及最新检查点里的文本文件内容（单文件不超过 32 KB，合计不超过 256 KB），见 [docs/protocol.md](docs/protocol.md) §10。
+- **凭据**：只有 `admin.token` 以明文文件保存（POSIX 0600）；节点令牌、租约、会话、配对码与协调令牌在数据库中只存哈希。
+
 ## 验证情况（0.1.0rc6 / rc7）
 
 - **自动化测试**：Windows（Python 3.15）、WSL（3.14）、macOS（系统 3.9.6）全量运行无失败。部分用例按平台条件跳过（如仅适用于 POSIX、或需要 Node 的用例），例如公开候选在 Windows 上 393 项中 382 项通过、11 项跳过。测试含本机多进程 HTTP 端到端场景（崩溃承接、分区下旧 epoch 迟到发布被拒）。CI 覆盖 Ubuntu（3.9、3.13）、Windows、macOS。
@@ -133,15 +145,13 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
   - 证据门禁负例：契约为 `publish.mode=manual`、`requires_acceptance=true`；worker 自称测试通过而检查实际失败时，`passed` 请求被降为 `unverified`，发布被拒绝。默认 `requires_acceptance=false` 时不会阻止发布。
 - **未验证**：真实重启/注销/断网后的自动恢复、开机无人登录、公网控制台的完整浏览器流程、长期运行。
 
-## 开发
+## 参与开发
 
 ```sh
 python -m unittest discover -s tests
 ```
 
-测试只用标准库；临时目录放在仓库内 `.dev/tmp`。Windows 上若仓库位于 SMB 映射盘，请复制到本机磁盘再运行测试（SQLite 不能经网络盘打开）；`node build.mjs` 会自行在本机临时目录构建，可以直接在映射盘上运行。
-
-协议变更先改 [docs/protocol.md](docs/protocol.md)，再改实现与测试。
+欢迎 issue 和 PR。命令、各模块该先读的文档、改动时容易破坏的约束（fencing、幂等、发布 CAS、证据门禁等）以及提交与 PR 约定都在 [AGENTS.md](AGENTS.md)：它写给编码代理，也是贡献者指南。
 
 ## 许可证
 
