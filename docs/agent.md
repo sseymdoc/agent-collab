@@ -26,6 +26,11 @@ python3 -m agent_collab.node_agent run --data-dir /absolute/agent-data
 Windows 工作区位于 USERPROFILE 内且 Codex 可用时，在 warnings 中报告 `workspace_in_profile`。
 `doctor` 还检查 attempt 租约文件及 POSIX 权限，并在 `restart_blockers` 中列出阻塞领取的
 attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查询命令；不输出凭据原值。
+`effective` 给出不含密钥的最终生效配置：`node`（身份、并发、标签、workspace_root、data_dir）、`agent`（版本、提交、
+版本目录、解释器、用户、平台）和每个 harness 的 `argv`、`version`、`disabled`、`path_prepend`、`managed_argv`
+（Codex 另有 `codex_home` 与被清除的环境变量名）。`managed_argv` 直接调用适配器的 `build_argv` 生成，
+`<work>`、`<attempt>`、`<sandbox>`、`<effort>`、`<profile.model>`、`<profile.effort>`、`<decision-schema>`、`<session-id>`
+是运行期才确定的值；环境变量只列名称，不列取值。
 
 `run` 默认派生脱离当前会话的后台 agent，将输出写入 `agent.log`，返回 `spawned` 与 PID；
 `spawned` 仅表示进程已创建，后续错误见日志。`--foreground` 用于服务管理器；
@@ -54,7 +59,8 @@ installer、系统服务、长时间运行与整机重启验收属于后续工�
 | auth_probe_s | 认证状态探测周期，缺省 900 秒；启动探测，后续后台探测，不阻塞心跳 |
 | provider_account_refs | 可选，非凭据账户分组；auth_health 由实际探测产生，旧配置中的静态 auth_health 不再作为探测结果 |
 
-Windows 与同机 WSL 应显式使用相同 `physical_host_id` 和 `host_slots`。
+同一物理主机上的多个节点（例如 Windows 原生节点与按需启用的 WSL 节点）应显式使用相同 `physical_host_id` 和 `host_slots`。
+默认每台物理主机只有一个原生节点，WSL 节点会带 `wsl` 标签。
 Codex 模型固定为 `gpt-6-astra`；effort 仅 `high/xhigh/max`，默认 `xhigh`。Claude 的 model/effort 必须来自 controller 的已配置 standby profile，不使用默认档位。
 
 每个进程启动时只解析一次 harness argv：服务 PATH → `~/.local/bin` → macOS 的 `/opt/homebrew/bin`、
@@ -66,6 +72,10 @@ PATH 前置该可执行文件目录，不加载 shell rc；Codex 线程来源变
 不保存账户标识、凭据或命令输出。超时及无法识别的结果为 unknown，明确未登录为 expired。
 Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.sandbox="elevated"`（可配置）。
 已有 model、effort、approval_policy、sandbox_workspace_write 隔离参数继续显式传递。
+`--ignore-user-config` 跳过整个用户 config.toml，不只是 MCP 与 notify：模型、effort、沙箱模式、审批策略、工作目录、
+可写根与网络开关全部来自上述受管参数；provider 用 Codex 缺省值，认证用 CODEX_HOME 中的官方本机登录。
+用户配置里的 service_tier、插件和其他键在受管执行中不生效。这个开关不等于隔离全部指引：
+工作区内的 AGENTS.md 与 CODEX_HOME 下的全局指引是否加载取决于 Codex 自身，本项目没有验证，也不对此作保证。
 
 `release_info()` 从运行代码根目录的 release-manifest.json 获取 version/git_commit；缺失或无效时回退
 0.1.0.dev0/null。注册 agent_version、capabilities.agent、attempt.runtime.agent_version/agent_commit 均采用它。
@@ -118,8 +128,13 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 ```text
 [claude_command, -p, --model, <profile.model>, --effort, <profile.effort>,
  --output-format, json, --json-schema, <内联 JSON>, --permission-mode, dontAsk,
- --tools, "", --session-id, <新 UUID>]
+ --tools, "", --session-id, <新 UUID>, --strict-mcp-config, --setting-sources, local]
 ```
+
+`--strict-mcp-config` 不加载任何 MCP 服务（含账户级连接器）；`--setting-sources local` 只读工作目录下的本地设置，
+因此用户级 settings、插件、hooks 和用户 CLAUDE.md 都不进入受管回合，认证仍用官方本机登录（不使用 `--bare`，它读不到订阅登录）。
+实测（Claude Code 2.1.302）：不加这两个参数时回合会连接账户的邮件、笔记等连接器，加载用户插件并运行 SessionStart/UserPromptSubmit hooks；
+`--setting-sources project` 仍会带入用户 CLAUDE.md。协调工作区里若出现 `.claude`，适配器不启动 Claude 并以 `code_failure` 结束。
 
 prompt 经 stdin 传入，context.json 全文内嵌在 prompt 末尾，要求仅返回结构化决策；`--tools ""` 不授予任何工具（含读文件）。适配器只解析 stdout JSON 的 structured_output，不从 result 自由文本猜测 JSON。固定 schema 由 controller/adapter 共用并在本地复核：follow_up 只是修复请求 `{title, goal, acceptance, instructions, effort}`，不含完整契约；完整的 codex 修复契约由 controller 基于被验收检查点与目标契约派生。结构化输出通过 schema 即由 agent 原子写入 decision.json，再走已有 final checkpoint 上传和 complete outbox；不合 schema 的结果失败且不写该文件。依赖目标状态的校验（租约归属、检查点、预算、副作用）只在 controller 进行：验收结论合法时一定记录，修复请求无法生成合法契约时写 coordinator.follow_up_rejected 而不是丢弃整个决策。
 
@@ -221,7 +236,7 @@ rc4 已有回执/写入意图会导入同一进度路径，避免升级后再次
 
 `tests/fake_controller.py` 仅为进程内端点 fixture，不含生产调度逻辑。
 本轮测试临时目录均在仓库 `.dev/tmp` 内，结束清理；新增测试不需要 socket，不访问网络，不调用模型。
-Windows 专属测试在其他平台 skip；主控应在 Windows / WSL 复跑。
+Windows 专属测试在其他平台 skip；主控应在 Windows 复跑。
 `test_agent_restart_controller.py` 使用真实 `App.handle` 做进程内重启集成验证；
 主控的 `test_e2e_local.py` 需要 loopback socket，在本 worker 沙箱不可用时跳过。
 

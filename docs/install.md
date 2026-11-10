@@ -48,6 +48,10 @@ prefix 与 state-dir 必须互不包含；数据库必须位于执行机器的�
 或直接运行 `python -B installer/entry.py` 加同一组参数。安装前会打印步骤；先加 `--dry-run` 可预览，
 此模式校验包但不写文件、不配对、不 drain、不注册/停止服务。
 
+默认生产拓扑是一个 Linux controller 加每台物理主机一个原生 worker（Windows 用计划任务，macOS 用 LaunchAgent）。
+“一个 worker”指一个节点监督进程，模型子进程仍按 slots 并发。Linux/WSL worker 是可选环境，只在确有 Linux 专属任务时安装；
+Windows 上的任务不需要 WSL。节点主动出站连接 controller；SSH 只是可选的管理入口，见“服务管理与 SSH 管理入口”。
+
 Linux controller（需要 systemd、useradd、chown、install；非 root 账户需要 sudo，root 使用 runuser）：
 
 ```sh
@@ -71,9 +75,10 @@ sh installer/install.sh --role worker --release /local/agent-collab-0.1.0.tar.gz
   --controller-url https://controller.example:8443 --node-id mac-worker --pairing-code ONE_TIME_CODE
 ```
 
-Linux/WSL worker 使用同一命令，替换 node-id。其服务为 `systemctl --user` unit，需要可用的用户 systemd 会话。
-安装器不启用 lingering。WSL 生命周期受 Windows 宿主、WSL 停机和用户会话限制；Windows 关机时不能保持运行。
-同一台 Windows 和 WSL 节点应显式传相同 `--physical-host-id desktop-1 --failure-domain desktop-1`，
+Linux worker（可选，含按需启用的 WSL）使用同一命令，替换 node-id。其服务为 `systemctl --user` unit，需要可用的用户 systemd 会话。
+安装器不启用 lingering。WSL 生命周期受 Windows 宿主、WSL 停机和用户会话限制，没有 Windows 侧保活时发行版会在空闲后停止；
+它不属于默认拓扑，没有它时只要求 Linux 的任务会停在 `waiting_capability`，不会被派到 macOS 或 Windows。
+与 Windows 节点同机时应显式传相同 `--physical-host-id desktop-1 --failure-domain desktop-1`，
 并按 `docs/agent.md` 设置相同 host_slots；安装器沿用 agent 默认 slots/host_slots=1。
 
 Windows worker（当前用户 PowerShell 5.1+/7）：
@@ -88,8 +93,12 @@ Windows worker（当前用户 PowerShell 5.1+/7）：
 Windows 使用当前交互用户 SID、InteractiveToken、LeastPrivilege、“登录时”计划任务，安装后主动运行一次。
 这是 **Task Scheduler 任务，不是 SCM 服务**。本版不实现需要服务账户密码的 SCM 模式，不使用 LocalSystem，
 不索取账户密码。登出后没有交互令牌，不能保证任务继续运行。worker 优先用 `--python` 同目录的 pythonw.exe，
-不存在时沿用指定解释器（通常为 python.exe）。登录触发器每 5 分钟无限重复（无 Duration，StopAtDurationEnd=false），
-用于拉起已退出进程；MultipleInstancesPolicy=IgnoreNew 防止重叠，并保留失败重试间隔 1 分钟、最多 3 次。
+不存在时沿用指定解释器（通常为 python.exe）。任务有两个触发器：登录触发器在登录时立即启动；
+时间触发器以过去时刻为起点、每 1 分钟无限重复（无 Duration，StopAtDurationEnd=false），拉起已退出的进程。
+MultipleInstancesPolicy=IgnoreNew 防止重叠，已有实例运行时重复触发被忽略。实测依据：进程被强制结束后
+RestartOnFailure（保留，间隔 1 分钟、最多 3 次）不会重启它；挂在登录触发器上的重复要到下一次登录才生效，
+而安装和升级都是在会话中途重新注册任务。安装器停止任务前先禁用它，启动时重新启用，避免触发器在切换版本期间拉起进程。
+安装器在停止与启动之间被强行终止时，任务停留在禁用状态、不会自行恢复：按“Doctor、drain、升级、回退”一节核对安装状态后运行 `service start`。
 agent.lock 在 Windows 使用非阻塞字节锁、POSIX 使用 flock，第二个同数据目录进程立即失败。
 
 Windows worker 缺省工作区为 `%SystemDrive%\agent-collab-work\<用户名>`，可用 `--workspace-root` 指定。
@@ -178,6 +187,57 @@ Windows 将入口换为 `.\installer\install.ps1`、路径换为本地磁盘，`
 从离线演练迁入托管环境需使用单独审查的 prefix，并核对状态目录所有权。
 离线模式要求调用者手工停止所有运行进程；安装器用数据目录锁再次确认，否则拒绝切换。
 
+## 服务管理与 SSH 管理入口
+
+`service` 是固定的管理命令，本机直接运行和经 SSH 调用是同一条命令；不需要管理员令牌，也不访问 controller。
+stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实。非默认前缀加 `--prefix`，等待时间用 `--timeout <秒>`（缺省 60）。
+
+| 命令 | 行为 |
+| --- | --- |
+| `service status` | 只读：当前版本、服务状态、是否自启动（enabled/disabled/unknown）、worker 的 status.json 与心跳年龄。组件都在运行时返回 0 |
+| `service stop` | 有意停用：先关闭自启动（Windows 禁用计划任务，macOS `launchctl disable`，Linux `disable --now`），再停止进程，状态锁释放后才返回 0。本地有 preparing/running attempt 时拒绝，先排空或加 `--allow-active`。停用一直保持，重复触发和重新登录都不会拉起进程 |
+| `service start` | 恢复自启动并启动。worker 以 status.json 中来自当前版本目录、时间不早于本次请求的成功心跳判定就绪，否则返回非零。已在运行时重复执行不会产生第二个实例 |
+
+```sh
+"$PREFIX/bin/agent-collab" service status --prefix "$PREFIX"
+```
+
+```powershell
+& "$Prefix\bin\agent-collab.ps1" service stop --prefix $Prefix
+```
+
+`service stop` 不通知 controller：要立刻停止派单，先用 API 或 `install --drain` 排空。升级和回退总会重新启用并启动服务。
+进程异常退出由服务管理器恢复（Windows 每分钟的时间触发器、launchd KeepAlive、systemd `Restart=on-failure`），
+被 `service stop` 停用的节点不受这些机制影响。
+
+### SSH 管理入口（可选）
+
+SSH 只用于安装、启动、诊断和恢复。任务的领取、续租、事件与工件上传都走 worker 自己的出站 HTTPS 连接：
+经 SSH 发出 `service start` 后可以断开，worker 由计划任务或 LaunchAgent 托管并继续运行，结果从 controller 或
+`service status` 查询。不要用 `Start-Job`、`nohup` 或 `ssh host claude ...` 代替受管服务：直接经 SSH 打开的模型会话
+没有检查点，也不会被接管。
+
+Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1` 在管理员 PowerShell 中运行，
+只接受公钥认证、一个账户和列出的来源地址：
+
+```powershell
+& .\installer\windows-ssh-management.ps1 -AllowFrom 192.0.2.10 -PublicKey 'ssh-ed25519 AAAA... name'
+& .\installer\windows-ssh-management.ps1 -Remove     # 停用入口：删规则、停并禁用 sshd、移除受管配置段
+```
+
+脚本安装 OpenSSH Server 能力（若缺少），在 `sshd_config` 顶部写入受管段（关闭口令与转发，`AllowUsers <账户>@<来源>`），
+把公钥连同 `from="<来源>",restrict,pty` 写入授权文件，新增只放行这些来源的防火墙规则，并停用能力自带的全放行规则；
+端口已被其他进程占用时中止，`sshd -t` 不通过时恢复原配置。它不修改 DefaultShell，调用时显式写出解释器：
+
+```sh
+ssh win-host "C:\Python312\python.exe -B C:\Users\me\.local\share\agent-collab\launcher.py service status"
+```
+
+管理员组账户经 SSH 登录得到的是完整管理员令牌，没有 UAC 降权：持有私钥就能控制这台机器。不要经这个入口直接启动模型进程，
+worker 仍由最低权限的计划任务运行。SSH 登录会话与图形登录会话也不等价：macOS 的 SSH 会话读不到登录钥匙串，
+`service start` 可用是因为它只让 launchd 在已登录用户的 GUI 域里启动 LaunchAgent。
+macOS 与 Linux 使用系统自带 sshd，按同样原则限制来源与账户。
+
 ## Doctor、drain、升级、回退
 
 安装后的 POSIX 命令入口示例（无需修改 PATH）：
@@ -255,6 +315,8 @@ restore 会递增 `authority_generation`、撤销旧租约、暂停派单，并�
 
 doctor 汇总原有 controller `/api/v1/doctor` 与 `node_agent doctor` 输出、服务状态、current 和 manifest 校验。
 controller doctor 需要管理员权限；组件不可达时报告 `unknown` 与错误类型，返回非零。
+worker 部分含 `effective`：不含密钥的最终生效配置，用来在一处核对节点身份与并发、工作区、解释器，
+以及每个 harness 的可执行文件、PATH 前置目录和 `managed_argv`（由适配器实际使用的参数构造函数生成，运行期才确定的值显示为占位符）。
 `--no-service` 的 ok 仅说明离线结构检查通过，不代表服务运行、TLS 连通、模型工具登录或真实任务已验收。
 
 ## 卸载与验证边界
@@ -278,7 +340,7 @@ sh -n installer/install.sh
 ```
 
 Mac 上验证 Python 3.9.6 的本地 tar/zip、POSIX 入口、数据保留、升级与失败回退、schema 拒绝和服务模板。
-Windows current.txt、任务 XML（pythonw、重复触发）、ACL argv、活动 attempt 拒绝、心跳身份确认失败回退均通过
+Windows current.txt、任务 XML（pythonw、重复触发）、ACL argv、活动 attempt 拒绝、心跳身份确认失败回退、`service` 命令序列均通过
 纯逻辑/注入 runner 测试；没有调用真实 icacls 或注册任务。Mac 无 PowerShell，**install.ps1 尚未经过 PowerShell 解析器或实际执行**。
 systemd、launchctl、schtasks 的真实注册、登录/登出、自启/重启、特权账户权限、真实 HTTP/TLS 配对及升级启动
 均需目标平台后续验收，不能据模板测试声称这些已通过。

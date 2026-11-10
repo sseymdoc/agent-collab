@@ -107,9 +107,11 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
 | 角色 | 服务形态 |
 | --- | --- |
 | controller（Linux） | systemd system unit，独立低权限用户，只监听 loopback |
-| worker（Linux/WSL） | systemd 用户单元（建议开启 linger） |
 | worker（macOS） | LaunchAgent（模型登录在钥匙串中，需要图形登录会话） |
-| worker（Windows） | 当前用户登录触发的计划任务（pythonw，5 分钟重复触发以拉起退出的进程） |
+| worker（Windows） | 当前用户的计划任务（pythonw；登录时启动，每分钟的时间触发器拉起已退出的进程） |
+| worker（Linux/WSL，可选） | systemd 用户单元（建议开启 linger） |
+
+默认拓扑是一个 controller 加每台物理主机一个原生 worker（Windows、macOS）；Linux/WSL worker 只在有 Linux 专属任务时安装。已安装的节点用 `agent-collab service start|stop|status` 启停和查看，这组命令也可以经 SSH 调用；SSH 只是可选的管理入口，任务的领取与上报始终走节点自己的出站连接。
 
 在 controller 所在主机上升级时，先对控制服务做一次本地一致备份；只装 worker 的主机升级时不备份远端 controller。升级后核对新进程确实来自新版本目录并已成功心跳，否则自动回到旧版本。回退前会重新检查旧版本能否支持当前数据库 schema，不支持时拒绝回退，并保留指针、记录与备份，由运维核对后处理。完整参数、回退与卸载见 [docs/install.md](docs/install.md)，日常运维见 [docs/operations.md](docs/operations.md)。
 
@@ -120,6 +122,7 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
 - 只对已受理、输入已复制到控制服务、存在已确认检查点或完整初始基线的任务做自动接管；旧 epoch 的检查点与发布会被拒绝（409 `fenced`）；旧 epoch 的事件仍会去重存档，但标记 `stale=true`，不改变任何状态，事件消费者应据此区分迟到事件。
 - 修复任务继承根工作包的累计预算；取消或预算耗尽后不再派生修复或恢复。
 - Codex 以 `workspace-write` 沙箱、关闭网络、`--ignore-user-config`（不加载你的 MCP 服务与钩子）运行，写权限限于 attempt 工作区。
+- Claude 协调回合以 `--strict-mcp-config --setting-sources local` 运行：不连接 MCP 服务（含账户级连接器），不加载用户级设置、插件、hooks 和用户 CLAUDE.md；认证仍用本机官方登录。
 
 **不会做到的：**
 
@@ -135,15 +138,16 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
 - **模型服务**：Codex 与 Claude 以你本机的登录运行，提示词和它们读到的工作区内容按 OpenAI、Anthropic 各自的条款处理。受管协调者的提示词中包含目标任务的契约、attempt 报告、检查点差异，以及最新 final 检查点里的文本文件内容（没有 final 检查点时取最新的已确认检查点；单文件不超过 32 KB，合计不超过 256 KB），见 [docs/protocol.md](docs/protocol.md) §10。
 - **凭据**：控制服务的数据库里，节点令牌、租约、会话、配对码与协调令牌只存哈希，控制端唯一的明文凭据文件是 `admin.token`。节点要用原值发起认证，所以节点数据目录里的 `node.token` 和各 attempt 的 `lease.token` 是明文文件。这些文件在 POSIX 上都是 0600，请按密钥保护控制端和节点的数据目录。
 
-## 验证情况（0.1.0rc6 / rc7）
+## 验证情况（0.1.0rc6 – rc9）
 
-- **自动化测试**：Windows（Python 3.15）、WSL（3.14）、macOS（系统 3.9.6）全量运行无失败。部分用例按平台条件跳过（如仅适用于 POSIX、或需要 Node 的用例），例如公开候选在 Windows 上 393 项中 382 项通过、11 项跳过。测试含本机多进程 HTTP 端到端场景（崩溃承接、分区下旧 epoch 迟到发布被拒）。CI 覆盖 Ubuntu（3.9、3.13）、Windows、macOS。
-- **真实环境演练**（云主机控制服务 + 两台物理主机上的三个常驻节点）：
+- **自动化测试**：Windows（Python 3.15）、WSL（3.14）、macOS（系统 3.9.6）全量运行无失败。部分用例按平台条件跳过（如仅适用于 POSIX、或需要 Node 的用例），例如在 Windows 上 417 项中 406 项通过、11 项跳过。测试含本机多进程 HTTP 端到端场景（崩溃承接、分区下旧 epoch 迟到发布被拒）。CI 覆盖 Ubuntu（3.9、3.13）、Windows、macOS。
+- **真实环境演练**（rc6 / rc7，云主机控制服务 + 两台物理主机上的三个常驻节点）：
   - 两个方向的完整续作：一侧节点失效 → 另一侧从检查点接管 → Claude 判定 rework → Codex 修复 → 节点执行检查 → Claude accept，验收绑定执行证据；
   - 源机不可达时工件照常保存、回写待处理，恢复后按基线回写，人工改动判冲突不覆盖；
   - 三种服务形态的 worker 升级 → 回退 → 再升级；一份实例外备份的隔离恢复中旧令牌不能复活；
   - 证据门禁负例：契约为 `publish.mode=manual`、`requires_acceptance=true`；worker 自称测试通过而检查实际失败时，`passed` 请求被降为 `unverified`，发布被拒绝。默认 `requires_acceptance=false` 时不会阻止发布。
-- **未验证**：真实重启/注销/断网后的自动恢复、开机无人登录、公网控制台的完整浏览器流程、长期运行。
+- **进程监督与服务管理**（rc8 / rc9，云主机控制服务 + 两台物理主机各一个原生节点）：Windows 与 macOS 的节点进程被强制结束后由服务管理器重新拉起（约 12 秒与 1 秒）；`service stop` 之后不再被拉起，`service start` 之后恢复并重新心跳；经 SSH 发出 `service start` 后断开连接，节点继续运行并完成后续任务；两个方向各做了一次节点停止后的检查点接管。
+- **未验证**：真实重启/注销/断网后的自动恢复、开机无人登录、公网控制台的完整浏览器流程、长期运行；Linux 上的 `service` 命令只有单元测试，没有在真实 systemd 上运行。
 
 ## 参与开发
 

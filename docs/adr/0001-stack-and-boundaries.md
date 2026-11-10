@@ -4,7 +4,7 @@
 
 ## 背景
 
-- 执行环境：Windows 原生（Python 3.15）、同机 Ubuntu WSL2（Python 3.14）、macOS（系统 Python 3.9.6，不假定有 uv/node/brew）。
+- 执行环境：Windows 原生（Python 3.15）、macOS（系统 Python 3.9.6，不假定有 uv/node/brew）；同机 Ubuntu WSL2（Python 3.14）是可选的 Linux 环境。
 - 控制节点：一台低配云主机（Debian、x86_64、约 2 vCPU / 2GB 内存、systemd，前置 Caddy 终止 TLS）。
 - 已有一个只用标准库的 Claude–Codex 协作执行器（按任务目录 `state.json` 保存运行事实）；本项目开发期间它继续作为稳定执行器，本项目移植了其中的进程托管代码。
 
@@ -14,7 +14,7 @@
 2. **单控制服务 + 本地 SQLite（WAL）**：数据库只由 controller 进程在本机文件系统打开，经 API 访问；禁止 SMB/NFS 共享打开。备份用 `sqlite3.Connection.backup` 并附 blob 清单。
 3. **内容寻址 blob 目录**：`blobs/ab/cd/<sha256>`，写入先落临时文件、校验哈希后原子改名；manifest 自身也是 blob。
 4. **UI**：React + TypeScript + Vite，构建产物随包分发到 `agent_collab/static/`，最终用户无需 Node。
-5. **拓扑**：生产 controller 监听 `127.0.0.1:<本地端口>`，由反向代理在 `https://<DOMAIN>:<HTTPS_PORT>` 终止 TLS；节点主动出站连接。开发/备用使用 loopback all-in-one；非 loopback 监听必须显式配置 TLS 证书，不自动绑定 0.0.0.0。
+5. **拓扑**：生产 controller 监听 `127.0.0.1:<本地端口>`，由反向代理在 `https://<DOMAIN>:<HTTPS_PORT>` 终止 TLS；节点主动出站连接。默认每台物理主机一个原生 worker（Windows 计划任务、macOS LaunchAgent），Linux/WSL worker 可选、按需启用。任务生命周期只走节点的出站 HTTPS；SSH 是可选的管理入口（安装、启动、诊断、恢复），只调用固定的 `service start|stop|status` 命令，不是第二套节点控制协议。开发/备用使用 loopback all-in-one；非 loopback 监听必须显式配置 TLS 证书，不自动绑定 0.0.0.0。
 6. **不做**：Kubernetes、Redis、消息总线、自建共识/双主选举。Temporal/Restate 仅作为未来 durable backend 评估方向。
 
 ## 开发隔离
