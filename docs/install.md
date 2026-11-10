@@ -237,7 +237,7 @@ Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1`
 授权文件先在 `%ProgramData%\ssh`（只有 Administrators 与 SYSTEM 可写）里准备好并设好权限，再移到位。管理员账户在默认配置下用共享的
 `administrators_authorized_keys`，只留 Administrators 与 SYSTEM；默认的 `Match Group administrators` 段被去掉时的管理员账户，以及普通账户，
 用账户自己的 `.ssh\authorized_keys`，只留该账户、Administrators 与 SYSTEM，属主是该账户。已有授权文件里的密钥会保留，
-所以它若能被其他账户写入，脚本不做任何改动就中止，要求先检查文件内容。
+所以它若属于其他账户或能被其他账户写入，脚本不做任何改动就中止，要求先检查文件内容。
 
 受管段只在 sshd 对同一关键字“取第一个值”时才压得住后面的配置。原有配置在受管段之外含有下列指令时，脚本不做任何改动就中止，
 需要先手工清理或合并：`AllowUsers`、`Port`（多条是累加的）、`Include`（被包含的文件脚本不检查）、`AuthorizedKeysCommand`、

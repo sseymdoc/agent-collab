@@ -101,14 +101,17 @@ if ($shared) {
     $writers += (New-Object Security.Principal.NTAccount $User).Translate([Security.Principal.SecurityIdentifier]).Value
 }
 # Existing keys are kept, so they must come from a file nobody else could have written. sshd
-# ignores a file that others can write; tightening it would bring every line in it to life.
+# ignores a file that others own or can write; tightening it would bring every line in it to life.
 $existing = @()
 if (Test-Path -LiteralPath $keys) {
+    $acl = Get-Acl -LiteralPath $keys
     $writeRights = [Security.AccessControl.FileSystemRights]'Write, Delete, ChangePermissions, TakeOwnership'
-    $others = @((Get-Acl -LiteralPath $keys).Access | Where-Object {
+    $others = @($acl.Access | Where-Object {
             $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $writeRights) -and
             $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin $writers } |
         ForEach-Object { "$($_.IdentityReference)" })
+    # The owner can rewrite the permissions whatever the entries say.
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $writers) { $others += "$($acl.Owner) (owner)" }
     if ($others) {
         throw "$keys can be written by $(($others | Select-Object -Unique) -join ', '); review its contents, then restrict or remove the file and rerun"
     }
