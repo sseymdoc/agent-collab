@@ -45,7 +45,7 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 - **交付只经发布 CAS。** `delivery_version` 只在 `expected_base_version == delivery_version` 时加 1；`requires_acceptance` 只认 `passed`；`version_mismatch` 不自动重试，交给协调者。→ protocol §4 规则 6
 - **验收靠执行证据。** 契约有 `checks` 时，任何来源的 `passed` 都要核对节点执行的检查结果并绑定检查点 manifest，缺证据就降为 `unverified`；模型自述和 stub 步骤结果不能替代。→ protocol §11.7
 - **契约受理后不可变。** 契约字段参与 `request_hash`。新增字段要决定是否参与哈希，且不能改变旧契约的哈希；升级时幂等补齐缺省字段，不改写历史契约、请求哈希、幂等回执或版本号。→ controller.md（rc5 检查、能力证据与回写待办）
-- **数据库只在本机打开。** SQLite 只由 controller 进程在本机文件系统打开（`serve` 持有 `controller.lock`），测试也一样，不经 SMB/NFS 打开。→ [ADR 0001](docs/adr/0001-stack-and-boundaries.md)
+- **数据库只在本机打开。** SQLite 只在 controller 所在主机的本机文件系统上打开，测试也一样，不经 SMB/NFS 打开。`serve` 持有 `controller.lock`，同一数据目录只运行一个服务；`backup`、`pairing-code`、`prune-events` 等本机命令可以与它并行，其中 `backup` 用 SQLite backup API 取一致快照；`restore` 要求服务已停止。直接构造 `App` 时，由调用方保证同一目录只有一个活动实例。→ [ADR 0001](docs/adr/0001-stack-and-boundaries.md)、controller.md（启动与身份）
 - **不凭旧 PID 结束进程。** 节点重启后无法确认原进程身份时，保留 `restart_unknown` 并暂停领取，不根据记录的 PID 结束进程（PID 可能已被重用）。→ agent.md（执行、恢复与回写）
 - **模型调用参数是安全边界。** Claude 协调者固定 `--tools ""`、`--permission-mode dontAsk`、每轮新会话，context 作为不可信数据放进提示词；Codex 固定 `--ignore-user-config`、`read-only` 或 `workspace-write` 沙箱、`network_access=false`。改 `adapters/claude.py`、`adapters/codex.py` 的 argv 时保持这些，现有测试有断言。→ protocol §10、§11.5
 - **控制端凭据只存哈希，所有凭据不进输出。** controller 数据库中的节点令牌、租约、UI 会话、CSRF、配对码、协调令牌只存 SHA-256，比较用 `hmac.compare_digest`。明文凭据文件只有控制端的 `admin.token`，以及节点发起认证必需的 `node.token` 和 `attempts/<id>/lease.token`，POSIX 上均为 0600。节点上报的报告和日志尾部经 agent 的 `clean()` 去除已知令牌。新增凭据沿用同样做法。→ controller.md（启动与身份）、agent.md（agent.json 与目录）
@@ -58,7 +58,7 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 报告问题或“顺手修”之前，先分清三类：
 
 1. **缺陷**：实现违反了文档写明的契约，例如旧 epoch 的发布被接受、节点令牌能调用客户端端点。应当修复。
-2. **已知限制**：文档已经写明的边界，例如契约检查以节点服务身份运行、没有沙箱；stub 没有隔离；协调者的 `--tools ""` 不是操作系统级隔离；单控制服务、没有高可用；节点依赖用户登录；没有 blob GC。不要当作新发现重复提出；要改变它属于设计变更，先在 issue 里讨论。见 README（保障与边界）与 agent.md（协议缺口与已知限制）。
+2. **已知限制**：文档已经写明的边界，例如契约检查以节点服务身份运行、没有沙箱；stub 没有隔离；协调者的 `--tools ""` 不是操作系统级隔离；单控制服务、没有高可用；macOS 与 Windows 节点依赖用户登录，Linux 节点的 systemd 用户单元在未启用 linger 时也一样（安装器不自动启用）；没有 blob GC。不要当作新发现重复提出；要改变它属于设计变更，先在 issue 里讨论。见 README（保障与边界）与 agent.md（协议缺口与已知限制）。
 3. **部署加固**：运维侧可以额外采取的措施，例如独立低权限账户、反向代理、网络访问限制。写进 install.md 或 operations.md，不当作代码缺陷。
 
 ## 约定
