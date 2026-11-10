@@ -411,7 +411,7 @@ class App:
         self.get('root', root_id)
         lease = self.coordinator(root_id)
         if method == 'GET':
-            return response({k: lease[k] for k in ('holder_kind', 'holder_ref', 'expires_at', 'version')}) if lease else Response(200, [('Content-Type', 'application/json')], b'null')
+            return response({k: lease[k] for k in ('holder_kind', 'holder_ref', 'expires_at', 'version', 'authority_generation')}) if lease else Response(200, [('Content-Type', 'application/json')], b'null')
         token = headers.get('x-coordinator-token', '')
         if method == 'DELETE':
             # Expired/released credentials never release a later holder's lease.
@@ -443,7 +443,8 @@ class App:
             credential = token if receipt['renewal'] else issued
             if digest_token(credential) != receipt['token_hash']:
                 raise APIError('conflict', 'coordinator credential required', reason='coordinator_lease')
-            return response({'coordinator_token': credential, 'expires_at': receipt['expires_at']})
+            return response({'coordinator_token': credential, 'expires_at': receipt['expires_at'],
+                             'version': receipt.get('version'), 'authority_generation': receipt.get('authority_generation')})
         owns = bool(lease and hmac.compare_digest(lease['token_hash'], digest_token(token)) and
                     lease['holder_kind'] == kind and lease['holder_ref'] == ref)
         if lease and not owns and not takeover:
@@ -459,9 +460,14 @@ class App:
                   'version': previous.get('version', 0) + 1, 'token_hash': digest_token(credential),
                   'authority_generation': self.meta()['authority_generation']}
         self.store.put('coordinator', root_id, record)
+        # 回执记下当次的 expires_at、version 与恢复代次：重放返回同一租约状态。升级前的旧回执没有后两项，
+        # 重放时返回 null（未知），不拿当前租约的值冒充：期间可能已续租。
+        # 版本在数据恢复后可能重新从 1 开始，客户端要用（代次, 版本）一起识别租约。
         self.store.put('coordinator_request', key, {'request_hash': hashed, 'token_hash': record['token_hash'],
-                       'expires_at': record['expires_at'], 'renewal': owns})
-        return response({'coordinator_token': credential, 'expires_at': record['expires_at']})
+                       'expires_at': record['expires_at'], 'version': record['version'],
+                       'authority_generation': record['authority_generation'], 'renewal': owns})
+        return response({'coordinator_token': credential, 'expires_at': record['expires_at'], 'version': record['version'],
+                         'authority_generation': record['authority_generation']})
 
     def _release_coordinator(self, root_id, lease, now):
         self.store.put('coordinator', root_id, dict(lease, token_hash=None, expires_at=d.timestamp(now), version=lease['version'] + 1))
@@ -1130,16 +1136,17 @@ class App:
             jobs = self.store.all('job')
             status = query.get('status', [''])[0]
             before = query.get('before', [''])[0]
-            if status:
-                if status not in p.JOB_STATUSES:
-                    raise ValueError('invalid status')
-                jobs = [j for j in jobs if j['status'] == status]
+            if status and status not in p.JOB_STATUSES:
+                raise ValueError('invalid status')
             jobs.reverse()
+            # 先在全部 job 中定位游标再按状态筛选：游标所指的 job 换了状态，分页仍然有效。
             if before:
                 ids = [j['job_id'] for j in jobs]
                 if before not in ids:
-                    raise ValueError('before must be a job_id in this result')
+                    raise ValueError('before must be an existing job_id')
                 jobs = jobs[ids.index(before) + 1:]
+            if status:
+                jobs = [j for j in jobs if j['status'] == status]
             return response({'jobs': jobs[:self.limit(query)]})
         if pieces[0] == 'jobs' and len(pieces) in (2, 3):
             job = self.get('job', pieces[1])

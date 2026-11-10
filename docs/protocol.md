@@ -286,8 +286,8 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `GET /packages/{work_package_id}/coordinator` | 当前租约：`{"holder_kind", "holder_ref", "expires_at", "version"}` 或 `null` |
-| `POST /packages/{work_package_id}/coordinator` | `{"request_id", "holder_kind": "interactive\|managed", "holder_ref", "ttl_s", "takeover": false, "reason"}` → `{"coordinator_token", "expires_at"}`；他人持有有效租约时 409 `conflict`，除非管理员 `takeover=true` 且给出 `reason`（写 `coordinator.takeover` 事件）；同一持有者带 `X-Coordinator-Token` 时为续租 |
+| `GET /packages/{work_package_id}/coordinator` | 当前租约：`{"holder_kind", "holder_ref", "expires_at", "version", "authority_generation"}` 或 `null`；`(authority_generation, version)` 唯一标识一次租约状态（数据恢复后 version 可能重新从 1 开始） |
+| `POST /packages/{work_package_id}/coordinator` | `{"request_id", "holder_kind": "interactive\|managed", "holder_ref", "ttl_s", "takeover": false, "reason"}` → `{"coordinator_token", "expires_at", "version", "authority_generation"}`（按 request_id 重放升级前的旧回执时后两项为 `null`，表示未知）；他人持有有效租约时 409 `conflict`，除非管理员 `takeover=true` 且给出 `reason`（写 `coordinator.takeover` 事件）；同一持有者带 `X-Coordinator-Token` 时为续租 |
 | `DELETE /packages/{work_package_id}/coordinator` | 带 `X-Coordinator-Token` 释放 |
 
 存在有效租约时，针对该根工作包的 `assess`、`publish`、`retry`、`integration` 与同根新 job 提交必须带匹配的 `X-Coordinator-Token`，否则 409 `conflict`（`details.reason="coordinator_lease"`）。用户取消不受此限制。旧协调者恢复连接后先读租约与交付版本，不能凭旧令牌继续。

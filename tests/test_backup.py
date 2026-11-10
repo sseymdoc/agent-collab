@@ -346,6 +346,9 @@ class ScheduledBackupTests(ControllerCase):
         renewed = self.call('POST', lease_path, dict(request_id=uid(), holder_kind='interactive',
                             holder_ref='new', ttl_s=90, takeover=False, reason=''))
         self.assertNotEqual(renewed['coordinator_token'], lease['coordinator_token'])
+        # 恢复后 version 可能与恢复前相同，客户端靠恢复代次区分两次租约。
+        self.assertGreater(renewed['authority_generation'], lease['authority_generation'])
+        self.assertEqual(self.call('GET', lease_path)['authority_generation'], renewed['authority_generation'])
         self.call('DELETE', lease_path, headers={'authorization': 'Bearer ' + self.admin,
                   'x-coordinator-token': lease['coordinator_token']}, status=409)
         self.assertEqual(node.complete(assignment, checkpoint=cp, status=409)['error']['details']['reason'], 'stale_generation')

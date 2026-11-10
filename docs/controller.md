@@ -105,14 +105,14 @@ API 路径统一前缀 `/api/v1`，另支持无认证 `/healthz`。`GET /healthz
 `GET /api/v1/packages/{work_package_id}/coordinator` 返回 JSON `null`，或以下对象（没有 token/hash）：
 
 ```json
-{"holder_kind":"interactive","holder_ref":"desktop-session","expires_at":"2026-11-09T03:50:00.000Z","version":1}
+{"holder_kind":"interactive","holder_ref":"desktop-session","expires_at":"2026-11-09T03:50:00.000Z","version":1,"authority_generation":1}
 ```
 
-POST 同路径提交 `{"request_id":"<UUID v4>","holder_kind":"interactive","holder_ref":"desktop-session","ttl_s":90,"takeover":false,"reason":""}`，返回 `{"coordinator_token":"<不透明凭据>","expires_at":"<UTC时间>"}`。续租使用新 request_id、相同 holder_kind/ref，并带 `X-Coordinator-Token`；DELETE 带该头释放，返回 `{}`。其他持有者占用时为 409 conflict；管理员 Bearer 或经管理员登录建立的 UI 会话可用 takeover=true 和非空 reason 接管，并写 coordinator.takeover 事件。节点身份不能获取/接管。UI 仍须提供 CSRF 和合法 Origin。
+POST 同路径提交 `{"request_id":"<UUID v4>","holder_kind":"interactive","holder_ref":"desktop-session","ttl_s":90,"takeover":false,"reason":""}`，返回 `{"coordinator_token":"<不透明凭据>","expires_at":"<UTC时间>","version":<租约版本>,"authority_generation":<恢复代次>}`；客户端用（代次, 版本）识别自己持有的租约。续租使用新 request_id、相同 holder_kind/ref，并带 `X-Coordinator-Token`；DELETE 带该头释放，返回 `{}`。其他持有者占用时为 409 conflict；管理员 Bearer 或经管理员登录建立的 UI 会话可用 takeover=true 和非空 reason 接管，并写 coordinator.takeover 事件。节点身份不能获取/接管。UI 仍须提供 CSRF 和合法 Origin。
 
 协调租约按目标根工作包独占。客户端 assess/publish/retry/integration 及同根新 job 提交缺少匹配 token 时返回 `409 {"error":{"code":"conflict","message":"…","details":{"reason":"coordinator_lease"}}}`。cancel 不受门禁影响；节点 auto publish 豁免协调 token，但仍受 epoch/generation/CAS 约束；节点 integration 不豁免。检查门禁后才读写普通请求幂等回执，旧协调者不能凭旧请求重放绕过租约。
 
-协调 POST 的专用幂等记录只含请求哈希、凭据哈希和到期时间；获取凭据由服务端秘密与 request_id/generation 派生以重放丢失的获取回执，不将 token 明文写入 SQLite。已释放、过期或接管的回执返回 409。续租回执重放仍须原 token。普通重启保留租约；restore 的 generation 变更会使旧协调凭据无效。
+协调 POST 的专用幂等记录包含请求哈希、凭据哈希、到期时间、`version`、`authority_generation` 和 `renewal`；按 request_id 重放时返回当次的到期时间、`version` 与 `authority_generation`。升级前的旧回执没有 `version`、`authority_generation`，重放时这两项为 `null`（未知），不用当前租约的值代替（期间可能已续租）。获取凭据由服务端秘密与 request_id/generation 派生以重放丢失的获取回执，不将 token 明文写入 SQLite。已释放、过期或接管的回执返回 409。续租回执重放仍须原 token。普通重启保留租约；restore 的 generation 变更会使旧协调凭据无效。
 
 缺省策略下 completed/waiting_reconcile/rework 事件与协调 job 创建同事务提交。rc5 以目标 job_id、触发类型、durable_checkpoint_id、acceptance.status 持久去重；同一目标已有未结束协调 job 时不再新建。每个协调 job 有独立根及执行预算，contract.coordinates 指向被协调的目标根；执行不增加目标根 attempts/repairs。model/effort 与 node_ids 在触发时冻结；仅允许名单节点领取，领取时原子取得 managed 租约，holder_ref 为协调 attempt_id。心跳续租，结束/失联释放；被接管后旧 attempt 不能应用结果或释放新租约。协调 job 不自动恢复，也不递归触发协调。正常客户端不能伪造 claude/coordinates job。
 

@@ -96,11 +96,25 @@ class InstallerTests(unittest.TestCase):
             (source / name).write_text('secret')
         (source / 'agent_collab/static').mkdir(exist_ok=True)
         (source / 'agent_collab/static/index.html').write_text('<html>built</html>')
+        (source / 'LICENSE').write_bytes(b'MIT License\n')
+        (source / 'THIRD_PARTY.md').write_bytes(b'# notices\n')
         tar, _ = builder.build_release(source, self.temp / 'out', 'ui-test')
         manifest, files = ins.read_release(tar)
         self.assertTrue(manifest['ui_built'])
         self.assertIn('agent_collab/static/index.html', files)
+        self.assertEqual(files['agent_collab/LICENSE'], b'MIT License\n')
+        self.assertEqual(files['agent_collab/THIRD_PARTY.md'], b'# notices\n')
         self.assertFalse(any('secret' in name or name.endswith('.token') for name in files))
+
+    @unittest.skipIf(os.name == 'nt', 'symlink creation needs privileges on Windows')
+    def test_builder_rejects_symlinked_notice_files(self):
+        source = self.temp / 'source-link'
+        for folder in ('agent_collab', 'installer'):
+            shutil.copytree(str(ROOT / folder), str(source / folder))
+        (self.temp / 'outside.txt').write_text('not a license')
+        (source / 'LICENSE').symlink_to(self.temp / 'outside.txt')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            builder.build_release(source, self.temp / 'out-link', 'link-test')
 
     def test_tamper_rejected_before_any_prefix_or_state_write(self):
         def tamper(manifest, files):

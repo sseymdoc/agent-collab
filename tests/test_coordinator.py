@@ -83,6 +83,15 @@ class CoordinatorTests(ControllerCase):
         self.assertNotIn('coordinator.decision_rejected', self.event_types(job))
         return current
 
+    def test_same_instant_takeover_keeps_expiry_but_changes_version(self):
+        # 测试时钟固定：同一时刻、相同 TTL 接管，expires_at 相同，只有 version 能区分两次租约。
+        job = self.job()
+        first = self.lease(job)
+        second = self.lease(job, holder_ref='other', takeover=True, reason='same instant')
+        self.assertEqual(second['expires_at'], first['expires_at'])
+        self.assertGreater(second['version'], first['version'])
+        self.assertEqual(self.call('GET', self.lease_path(job))['version'], second['version'])
+
     def test_lease_acquire_renew_conflict_takeover_release_and_hash_only(self):
         job = self.job()
         self.assertIsNone(self.call('GET', self.lease_path(job)))
@@ -91,16 +100,29 @@ class CoordinatorTests(ControllerCase):
         self.assertEqual(first, self.lease(job, request_id=request))
         token = first['coordinator_token']
         record = self.call('GET', self.lease_path(job))
-        self.assertEqual(set(record), {'holder_kind', 'holder_ref', 'expires_at', 'version'})
+        self.assertEqual(set(record), {'holder_kind', 'holder_ref', 'expires_at', 'version', 'authority_generation'})
+        # 取得响应带租约版本：UI 据此判断归属（expires_at 可能在同一毫秒的接管中重复）。
+        self.assertEqual((first['version'], first['authority_generation']), (record['version'], record['authority_generation']))
         self.clock.advance(5)
         renewed = self.lease(job, token, ttl_s=100)
         self.assertEqual(renewed['coordinator_token'], token)
         self.assertGreater(renewed['expires_at'], first['expires_at'])
+        # 续租后重放最初的取得请求：返回当次的同一租约状态（expires_at 与 version 都是原值）。
+        self.assertEqual(self.lease(job, request_id=request), first)
+        # 升级前的旧回执没有 version/代次：续租后重放时返回 null，不用当前租约的值冒充。
+        key = job['work_package_id'] + ':' + request
+        legacy = {k: v for k, v in self.app.store.get('coordinator_request', key).items() if k not in ('version', 'authority_generation')}
+        self.app.store.put('coordinator_request', key, legacy)
+        replayed = self.lease(job, request_id=request)
+        self.assertEqual((replayed['coordinator_token'], replayed['expires_at']), (token, first['expires_at']))
+        self.assertEqual((replayed['version'], replayed['authority_generation']), (None, None))
         self.lease(job, status=409)
         self.lease(job, holder_ref='other', status=409)
         self.lease(job, holder_ref='other', takeover=True, status=400)
         second = self.lease(job, holder_ref='other', takeover=True, reason='operator takeover')
         self.assertNotEqual(second['coordinator_token'], token)
+        self.assertGreater(second['version'], renewed['version'])
+        self.assertEqual(self.call('GET', self.lease_path(job))['version'], second['version'])
         takeovers = [e for e in self.call('GET', '/events')['events'] if e['type'] == 'coordinator.takeover']
         self.assertEqual(len(takeovers), 1)
         self.assertEqual(takeovers[0]['payload']['reason'], 'operator takeover')
