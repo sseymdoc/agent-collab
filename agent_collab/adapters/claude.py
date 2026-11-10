@@ -24,7 +24,8 @@ def build_argv(command, params, schema, session_id):
     return command + ['-p', '--model', params['model'], '--effort', params['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(schema).decode(),
             '--permission-mode', 'dontAsk', '--tools', '', '--session-id', p.check_uuid(session_id),
-            '--strict-mcp-config', '--setting-sources', 'local']
+            # --setting-sources local 仍会读取工作目录及各级上级目录的 CLAUDE.local.md；--safe-mode 关闭全部记忆文件与定制。
+            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode']
 
 
 class ClaudeAdapter:

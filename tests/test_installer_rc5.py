@@ -98,7 +98,8 @@ class WorkerInstallTests(unittest.TestCase):
         self.assertEqual(repetition.find('{*}Interval').text, 'PT1M')
         self.assertEqual(repetition.find('{*}StopAtDurationEnd').text, 'false')
         self.assertIsNone(repetition.find('{*}Duration'))
-        self.assertLess(timer.find('{*}StartBoundary').text, '2026')  # 起点在过去，不带结束时间
+        # 起点在过去（注册后立即排定下一次运行），不带结束时间
+        self.assertLess(datetime.datetime.fromisoformat(timer.find('{*}StartBoundary').text), datetime.datetime.now())
         self.assertIsNone(timer.find('{*}EndBoundary'))
         self.assertEqual(xml.find('.//{*}MultipleInstancesPolicy').text, 'IgnoreNew')
         self.assertIsNotNone(xml.find('.//{*}RestartOnFailure'))
@@ -191,15 +192,16 @@ class WorkerInstallTests(unittest.TestCase):
         save(path, good)
         self.assertEqual(ins.wait_worker_status(config, directory, manifest, started, timeout=0), good)
 
-    def test_status_deadline_never_exceeds_sixty_seconds(self):
+    def test_status_deadline_follows_the_caller(self):
+        # service start --timeout 可以等满自己的时限；安装器的 60 秒上限由 transaction 传入（见下一个用例）。
         old, config = self.installed_worker()
         clock = [0.0]
         def sleep(seconds):
             clock[0] += seconds
         with self.assertRaises(RuntimeError):
             ins.wait_worker_status(config, self.prefix / 'new', {'version': '2'}, 0,
-                                   timeout=600, clock=lambda: clock[0], sleep=sleep)
-        self.assertEqual(clock[0], 60)
+                                   timeout=120, clock=lambda: clock[0], sleep=sleep)
+        self.assertEqual(clock[0], 120)
 
     def test_missing_new_heartbeat_rolls_back_pointer_and_restarts_previous_worker(self):
         old, config = self.installed_worker()
@@ -212,8 +214,9 @@ class WorkerInstallTests(unittest.TestCase):
              patch.object(ins, 'wait_doctor', side_effect=AssertionError('must check running code first')), \
              redirect_stderr(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, 'health confirmation failed'):
-                ins.transaction(config, old, manifest, files, ins.parser().parse_args([]))
+                ins.transaction(config, old, manifest, files, ins.parser().parse_args(['--health-timeout', '600']))
         health.assert_called_once()
+        self.assertEqual(health.call_args.kwargs['timeout'], 60)  # 安装与升级的心跳确认最多等 60 秒
         new_manager.start.assert_called_once()
         new_manager.stop.assert_called_once()
         old_manager.start.assert_called_once()

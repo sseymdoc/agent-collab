@@ -793,7 +793,7 @@ def refuse_active_worker(config, allow_active=False):
 
 def wait_worker_status(config, directory, manifest, started_at, timeout=60, clock=time.monotonic, sleep=time.sleep):
     """Require a fresh heartbeat from the actual new code, not doctor reachability."""
-    deadline = clock() + min(60, max(0, timeout))
+    deadline = clock() + max(0, timeout)
     while True:
         try:
             status = read_json(Path(config['state_dir']) / 'worker/status.json')
@@ -805,7 +805,7 @@ def wait_worker_status(config, directory, manifest, started_at, timeout=60, cloc
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             pass
         if clock() >= deadline:
-            raise RuntimeError('new worker did not report a successful heartbeat from its version directory within 60 seconds')
+            raise RuntimeError('new worker did not report a successful heartbeat from its version directory before the timeout')
         sleep(min(1, max(0, deadline - clock())))
 
 
@@ -1194,6 +1194,15 @@ def create_root(path, config):
                                           '-g', str(os.getgid()), str(path)])
 
 
+def controller_listening(config):
+    """Unauthenticated loopback probe: a service manager can report active before the socket answers."""
+    from .client import APIError, Client, ConnectionFailure
+    try:
+        return Client('http://' + config['bind'], timeout=2).json('GET', '/healthz').get('ok') is True
+    except (APIError, ConnectionFailure, OSError, ValueError, KeyError, AttributeError):
+        return False
+
+
 def service_command(argv):
     ap = argparse.ArgumentParser(prog='agent-collab service')
     ap.add_argument('action', choices=('start', 'stop', 'status'))
@@ -1222,7 +1231,11 @@ def service_command(argv):
         directory = prefix / 'versions' / version
         manager = Services(config, directory)
         report['current'] = version
+        # 服务名在整台机器上共用：定义属于另一个前缀的安装时，既不查询也不改动它。
+        reason = 'service definition belongs to another installation or cannot be verified; use that installation\'s prefix'
+        manager.check_ownership()
         if args.action == 'status':
+            reason = 'could not read managed service state'
             report.update(services=manager.status(), autostart=manager.autostart(), worker=None)
             if 'worker' in components(config):
                 try:
@@ -1267,13 +1280,13 @@ def service_command(argv):
                         reason = 'worker has no fresh successful heartbeat matching the current directory, version, commit and pid'
                         report['worker'] = wait_worker_status(config, directory, manifest, started_at,
                                                              timeout=max(0, deadline - time.monotonic()))
-                    reason = 'managed services or local controller doctor did not become ready before the start timeout'
+                    reason = 'managed services or the local controller did not become ready before the start timeout'
                     while True:
                         states = manager.status()
-                        # The service entry point needs no admin token or controller API.
-                        # Reuse doctor's local manifest/schema checks for controllers.
+                        # The service entry point needs no admin token: reuse doctor's local manifest/schema
+                        # checks, then prove the controller answers on its loopback address.
                         healthy = ('controller' not in components(config) or
-                                   doctor(dict(config, role='controller'), offline=True)['ok'])
+                                   (doctor(dict(config, role='controller'), offline=True)['ok'] and controller_listening(config)))
                         if healthy and all(value == 'active' for value in states.values()):
                             break
                         if time.monotonic() >= deadline:
@@ -1285,7 +1298,8 @@ def service_command(argv):
                 lock.rmdir()
         print(json.dumps(report, ensure_ascii=False))
         return 0 if success else 1
-    except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError, sqlite3.Error,
+            subprocess.SubprocessError, ET.ParseError) as exc:
         report.update(error=reason, error_type=type(exc).__name__)
         if args.action == 'start':
             report['ready'] = False

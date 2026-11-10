@@ -38,7 +38,7 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(argv, ['/custom/claude', '-p', '--model', PROFILE['model'], '--effort', PROFILE['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(d.DECISION_SCHEMA).decode(),
             '--permission-mode', 'dontAsk', '--tools', '', '--session-id', session,
-            '--strict-mcp-config', '--setting-sources', 'local'])
+            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode'])
         self.assertNotIn('--bare', argv)
         for value in ({}, {'model': 'x'}, {'model': 'x', 'effort': ''}):
             with self.assertRaises(ValueError):

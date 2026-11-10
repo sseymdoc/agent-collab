@@ -40,10 +40,14 @@ class ServiceTests(unittest.TestCase):
         ins.write_json(self.prefix / 'installation.json', dict(version=manifest['version'], config=config))
         return config, directory, manifest
 
-    def invoke(self, action, config, runner, *extra):
+    def invoke(self, action, config, runner, *extra, real_ownership=False, listening=True):
         out, err = io.StringIO(), io.StringIO()
+        # 所有权检查的 POSIX 分支读当前用户主目录下的服务定义，测试机上可能真有一份安装：默认替换掉。
+        ownership = ins.Services.check_ownership if real_ownership else lambda manager: None
         with patch.object(ins.platform, 'system', return_value=config['system']), \
                 patch.object(ins, 'run', side_effect=runner), \
+                patch.object(ins.Services, 'check_ownership', new=ownership), \
+                patch.object(ins, 'controller_listening', return_value=listening), \
                 patch.object(ins, 'admin_token', side_effect=AssertionError('no admin token')), \
                 patch.object(ins, 'drain_client', side_effect=AssertionError('no controller API')), \
                 patch('agent_collab.client.Client.json', side_effect=AssertionError('no controller API')), \
@@ -307,6 +311,44 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual((code, err), (0, ''))
         self.assertTrue(report['ready'])
         self.assertTrue(doctor.call_args.kwargs['offline'])
+        # 服务管理器已报告 active，但 controller 还没有应答本机 /healthz：不能报告就绪。
+        code, report, err = self.invoke('start', config, runner, listening=False)
+        self.assertEqual(code, 1)
+        self.assertFalse(report['ready'])
+
+    def test_controller_listening_probes_loopback_healthz_without_a_token(self):
+        seen = []
+        def transport(method, url, headers, body):
+            seen.append((method, url, 'authorization' in headers))
+            return 200, {}, b'{"ok": true}'
+        with patch('agent_collab.client.Client._transport', side_effect=transport):
+            self.assertTrue(ins.controller_listening(dict(bind='127.0.0.1:18669')))
+        self.assertEqual(seen, [('GET', 'http://127.0.0.1:18669/api/v1/healthz', False)])
+        with patch('agent_collab.client.Client._transport', side_effect=OSError('refused')):
+            self.assertFalse(ins.controller_listening(dict(bind='127.0.0.1:18669')))
+        self.assertFalse(ins.controller_listening({}))
+
+    def test_service_definition_of_another_prefix_is_neither_queried_further_nor_changed(self):
+        config, directory, manifest = self.installation('Windows')
+        task = '<Task><RegistrationInfo><Description>agent-collab prefix: {}</Description></RegistrationInfo></Task>'
+        query = ['schtasks', '/Query', '/TN', 'agent-collab-worker', '/XML']
+        for answer, error_type in ((task.format('C:\\another prefix'), 'ValueError'), ('not XML', 'ParseError')):
+            calls = []
+            def runner(argv, **kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, answer if '/Query' in argv else 'Running', '')
+            for action in ('status', 'stop', 'start'):
+                with self.subTest(action=action, error_type=error_type):
+                    calls.clear()
+                    code, report, err = self.invoke(action, config, runner, real_ownership=True)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(report['error_type'], error_type)
+                    self.assertIn('another installation', err)
+                    self.assertEqual(calls, [query])
+                    self.assertFalse((self.prefix / '.install-lock').exists())
+        runner = Mock(side_effect=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, task.format(self.prefix) if '/Query' in argv else 'Running', ''))
+        self.assertEqual(self.invoke('status', config, runner, real_ownership=True)[0], 0)
 
     def test_linux_controller_stop_checks_privileged_lock_helper(self):
         config, directory, manifest = self.installation('Linux', 'controller')
@@ -408,10 +450,13 @@ class EffectiveTests(unittest.TestCase):
         self.assertEqual(effective['agent']['python'], sys.executable)
         codex_builder.assert_called_once()
         claude_builder.assert_called_once()
+        # 配置里附带的参数（这里是 codex 的 'wrapper'）只显示占位符，可执行文件原样显示。
+        self.assertEqual(commands['codex']['argv'][1:], ['wrapper'])
+        shown = {'codex': commands['codex']['argv'][:1] + ['<configured-argument>'], 'claude': commands['claude']['argv']}
         expected = codex.build_argv(commands['codex']['argv'], '<work>', '<attempt>', system='Windows', windows_sandbox='unelevated')
         expected[expected.index('--sandbox') + 1] = '<sandbox>'
         expected = [s.replace('model_reasoning_effort="xhigh"', 'model_reasoning_effort="<effort>"') for s in expected]
-        self.assertEqual(effective['harness']['codex']['managed_argv'], expected)
+        self.assertEqual(effective['harness']['codex']['managed_argv'], shown['codex'] + expected[2:])
         session = '00000000-0000-4000-8000-000000000000'
         expected = claude.build_argv(commands['claude']['argv'], dict(model='<profile.model>', effort='<profile.effort>'), d.DECISION_SCHEMA, session)
         expected[expected.index('--json-schema') + 1] = '<decision-schema>'
@@ -419,7 +464,7 @@ class EffectiveTests(unittest.TestCase):
         self.assertEqual(effective['harness']['claude']['managed_argv'], expected)
         for name in ('codex', 'claude'):
             entry = effective['harness'][name]
-            self.assertEqual(entry['argv'], commands[name]['argv'])
+            self.assertEqual(entry['argv'], shown[name])
             self.assertEqual(entry['version'], 'fixture 1')
             self.assertEqual(entry['path_prepend'], str(Path(sys.executable).parent))
             self.assertIsNone(entry['disabled'])
@@ -434,6 +479,29 @@ class EffectiveTests(unittest.TestCase):
         config = dict(self.config, labels=['node-secret-value', 'lease-secret-value'])
         report, commands = self.doctor(config)
         self.assertEqual(report['effective']['node']['labels'], ['[REDACTED]', '[REDACTED]'])
+
+    def test_configured_harness_arguments_are_never_printed(self):
+        # 自定义命令里的参数可能是凭据，脱敏只认得本节点的令牌：除可执行文件外一律显示占位符。
+        config = dict(self.config, codex_command=[sys.executable, '--api-key', 'sk-inline-credential'],
+                      claude_command=[sys.executable, 'token=inline-credential'])
+        report, commands = self.doctor(config)
+        serialized = json.dumps(report)
+        for secret in ('sk-inline-credential', '--api-key', 'inline-credential'):
+            self.assertNotIn(secret, serialized)
+        for name, extra in (('codex', 2), ('claude', 1)):
+            entry = report['effective']['harness'][name]
+            shown = commands[name]['argv'][:1] + ['<configured-argument>'] * extra
+            self.assertEqual(entry['argv'], shown)
+            self.assertEqual(entry['managed_argv'][:len(shown)], shown)
+            self.assertGreater(len(entry['managed_argv']), len(shown))
+
+    def test_malformed_configuration_fails_the_check_but_keeps_the_report(self):
+        report, commands = self.doctor(dict(self.config, labels=['custom', 1]))
+        self.assertFalse(report['ok'])
+        self.assertFalse(report['checks']['configuration'])
+        self.assertEqual(report['effective'], {'error_type': 'TypeError'})
+        self.assertEqual(set(report['auth_health']), {'codex', 'claude'})
+        self.assertTrue(report['checks']['workspace_writable'])
 
     def test_absent_and_disabled_harness_have_null_executable_version_and_managed_argv(self):
         config = dict(self.config, codex_command=str(self.temp / 'absent'), disabled_harnesses={'claude': 'maintenance'})

@@ -962,7 +962,9 @@ def effective_configuration(config, directory, commands, capabilities, system=No
     for name in ('codex', 'claude'):
         command = commands[name]
         argv = command['argv']
-        entry = dict(argv=argv, version=capabilities['harness'][name], disabled=command.get('disabled'),
+        # 只原样显示可执行文件：配置里附带的其余参数可能含凭据，而脱敏只认得本节点的令牌。
+        shown = argv[:1] + ['<configured-argument>'] * (len(argv) - 1) if argv else argv
+        entry = dict(argv=shown, version=capabilities['harness'][name], disabled=command.get('disabled'),
                      path_prepend=str(Path(argv[0]).parent) if argv else None, managed_argv=None)
         if name == 'codex':
             entry.update(codex_home=config.get('codex_home') or command['env'].get('CODEX_HOME', str(Path.home() / '.codex')),
@@ -981,7 +983,7 @@ def effective_configuration(config, directory, commands, capabilities, system=No
                                             d.DECISION_SCHEMA, session)
                 managed[managed.index('--json-schema', len(argv)) + 1] = '<decision-schema>'
                 managed[managed.index('--session-id', len(argv)) + 1] = '<session-id>'
-            entry['managed_argv'] = managed
+            entry['managed_argv'] = shown + managed[len(argv):]
         harness[name] = entry
     return dict(node=node, agent=agent, harness=harness)
 
@@ -1044,10 +1046,16 @@ def doctor(data_dir, transport=None, commands=None, runner=None, system=None):
         except (OSError, ValueError, KeyError):
             credentials_ok = False
     checks.update(attempt_credentials=credentials_ok, restart_clear=not blockers)
+    try:
+        effective = effective_configuration(config, directory, commands, capabilities, system)
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
+        # agent.json 里的值类型不对（如 labels 不是字符串列表）：配置检查记为失败，其余检查照常返回。
+        checks['configuration'] = False
+        effective = dict(error_type=type(exc).__name__)
     result = dict(ok=all(value for key, value in checks.items() if key != 'harness'),
                   checks=checks, restart_blockers=blockers, warnings=warnings, capabilities=capabilities,
                   auth_health={name: probe_auth(name, command, runner) for name, command in commands.items()},
-                  effective=effective_configuration(config, directory, commands, capabilities, system))
+                  effective=effective)
     return redact(result, secrets)
 
 
