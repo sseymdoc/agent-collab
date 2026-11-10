@@ -27,8 +27,10 @@ function acquire() {
 for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { process.exitCode = 130 })
 
 acquire()
-const work = mkdtempSync(join(tmpdir(), 'agent-collab-ui-build-'))
-try {
+let work = null
+// 外层 finally 只负责释放锁：建临时目录失败或下面的清理出错时，锁照样删除。
+try { try {
+  work = mkdtempSync(join(tmpdir(), 'agent-collab-ui-build-'))
   // 上次发布在两次改名之间中断：static 缺失、旧产物只在备份里。先还原，再开始本次构建。
   if (!existsSync(out) && existsSync(old)) renameSync(old, out)
   for (const d of [stage, old]) rmSync(d, { recursive: true, force: true })
@@ -40,10 +42,11 @@ try {
   if (existsSync(out)) renameSync(out, old)
   try { renameSync(stage, out) } catch (e) { if (!existsSync(out) && existsSync(old)) renameSync(old, out); throw e }
 } finally {
-  rmSync(work, { recursive: true, force: true })
+  if (work) rmSync(work, { recursive: true, force: true })
   rmSync(stage, { recursive: true, force: true })
   // 旧产物备份只在 static 已就位时删除；static 不在时它是唯一副本，下次构建会先还原它。
   if (existsSync(out)) rmSync(old, { recursive: true, force: true })
+} } finally {
   rmSync(lock, { recursive: true, force: true })
 }
 console.log('UI 已构建到', out)

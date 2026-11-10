@@ -1,4 +1,5 @@
 """ui/build.mjs 的构建锁：锁已存在时不接管、不清理，直接失败。"""
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,6 +33,18 @@ class BuildLockTests(unittest.TestCase):
             self.assertEqual((lock / 'marker').read_text(), 'stale')
             self.assertEqual((static / 'index.html').read_text(), '<html>old</html>')
             self.assertEqual(sorted(p.name for p in (root / 'ui').iterdir()), ['build.mjs', 'dist.lock'])
+
+    def test_lock_is_released_when_temporary_directory_cannot_be_created(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'ui').mkdir()
+            shutil.copy2(str(ROOT / 'ui' / 'build.mjs'), str(root / 'ui' / 'build.mjs'))
+            missing = str(root / 'no-such-tmp')
+            env = dict(os.environ, TMPDIR=missing, TMP=missing, TEMP=missing)
+            run = subprocess.run([NODE, 'build.mjs'], cwd=str(root / 'ui'), env=env, capture_output=True, timeout=60)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn('mkdtemp', (run.stdout + run.stderr).decode('utf-8', 'replace'))
+            self.assertFalse((root / 'ui' / 'dist.lock').exists())
 
 
 if __name__ == '__main__':
