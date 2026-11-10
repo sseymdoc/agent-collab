@@ -1,0 +1,5 @@
+# Review the hostname, HTTPS port and local port before adding to an existing config.
+https://<DOMAIN>:<HTTPS_PORT> {
+    reverse_proxy 127.0.0.1:<LOCAL_PORT>
+}
+# Validate the complete configuration with caddy validate before an operator reload.

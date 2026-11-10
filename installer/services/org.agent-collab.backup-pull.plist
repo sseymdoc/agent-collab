@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.agent-collab.backup-pull</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string><string>-B</string><string>-m</string><string>agent_collab.backup</string>
+    <string>pull</string><string>--dest</string><string>@STATE_DIR@/offsite-backups</string>
+    <string>--instance-id</string><string>@INSTANCE_ID@</string>
+    <string>--workbench</string><string>/usr/local/bin/workbench</string>
+    <string>--remote-backups-dir</string><string>/var/lib/agent-collab/backups</string>
+    <string>--keep-offsite</string><string>28</string>
+  </array>
+  <key>WorkingDirectory</key><string>@CODE_DIR@</string>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>@STATE_DIR@/logs/backup-pull.log</string>
+  <key>StandardErrorPath</key><string>@STATE_DIR@/logs/backup-pull.err.log</string>
+</dict>
+</plist>

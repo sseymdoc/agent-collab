@@ -1,0 +1,23 @@
+# agent-collab prefix: @PREFIX@
+[Unit]
+Description=agent-collab controller
+After=network.target
+
+[Service]
+Type=simple
+User=agent-collab
+Group=agent-collab
+WorkingDirectory=@VERSION_DIR@
+ExecStart=@COMMAND@
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=@CONTROLLER_STATE@
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

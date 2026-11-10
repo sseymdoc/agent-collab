@@ -1,0 +1,16 @@
+# agent-collab prefix: @PREFIX@
+[Unit]
+Description=agent-collab worker (current user)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@VERSION_DIR@
+ExecStart=@COMMAND@
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

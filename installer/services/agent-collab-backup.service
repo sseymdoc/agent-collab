@@ -1,0 +1,17 @@
+[Unit]
+Description=agent-collab consistent local backup
+
+[Service]
+Type=oneshot
+User=agent-collab
+Group=agent-collab
+WorkingDirectory=/opt/agent-collab/current
+ExecStart=/usr/bin/python3 -B -m agent_collab.backup run-local --data-dir /var/lib/agent-collab/controller --backups-dir /var/lib/agent-collab/backups --keep 8 --max-bytes 500000000
+SuccessExitStatus=75
+TimeoutStartSec=1h
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/agent-collab/controller /var/lib/agent-collab/backups

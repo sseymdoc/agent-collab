@@ -1,0 +1,5 @@
+{
+  "controller_schema_min": 0,
+  "controller_schema_max": 0,
+  "schema_version_source": "PRAGMA user_version"
+}
