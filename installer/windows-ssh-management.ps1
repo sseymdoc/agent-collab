@@ -58,9 +58,18 @@ foreach ($listener in $listeners) {
     if ($owner -ne 'sshd') { throw "port $Port is already in use by '$owner' (pid $($listener.OwningProcess)); pass another -Port" }
 }
 
+# AllowUsers accumulates across directives instead of taking the first value, and included files
+# are not inspected: neither can sit under the single-account promise. Checked before any change.
+if ([regex]::Replace((Read-Config), $blockPattern, '') -match '(?im)^[ \t]*(AllowUsers|Include)\b') {
+    throw "sshd_config already has $($Matches[1]) outside the managed block; remove or merge it by hand, then rerun"
+}
+
 $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
 if (-not $capability) { throw 'OpenSSH.Server capability is not available on this Windows edition' }
 if ($capability.State -ne 'Installed') { Add-WindowsCapability -Online -Name $capability.Name | Out-Null }
+# The capability ships a rule that admits every source address: disable it before sshd can
+# start with its default settings.
+Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
 if (-not (Test-Path -LiteralPath $config)) {
     # First start creates the default configuration and host keys.
     Start-Service sshd
@@ -75,7 +84,8 @@ $block = @($begin, "Port $Port", 'PubkeyAuthentication yes', 'PasswordAuthentica
     'KbdInteractiveAuthentication no', 'AuthenticationMethods publickey', 'PermitEmptyPasswords no',
     "AllowUsers $allowUsers", 'AllowTcpForwarding no', 'AllowAgentForwarding no', 'X11Forwarding no',
     'PermitTunnel no', 'MaxAuthTries 3', 'LoginGraceTime 30', $end) -join "`r`n"
-# sshd uses the first value of each keyword: the managed block goes before the defaults.
+# sshd uses the first value of each of these keywords except AllowUsers (rejected above when
+# already present): the managed block goes before the defaults.
 Write-Config ($block + "`r`n" + [regex]::Replace($previous, $blockPattern, ''))
 & $sshd -t -f $config
 if ($LASTEXITCODE -ne 0) {
@@ -100,8 +110,10 @@ $existing = @(if (Test-Path -LiteralPath $keys) { Get-Content -LiteralPath $keys
 $kept = @($existing | Where-Object { $_ -and ($_ -notlike "*$keyBlob*") })
 [IO.File]::WriteAllLines($keys, [string[]]($kept + $line), [Text.Encoding]::ASCII)
 if ($administrator) {
-    # sshd ignores this file unless only Administrators and SYSTEM can access it.
-    & icacls.exe $keys /inheritance:r /grant '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+    # sshd ignores this file unless only Administrators and SYSTEM can access it. /reset drops
+    # explicit entries left on an existing file; /inheritance:r alone would keep them.
+    & icacls.exe $keys /reset | Out-Null
+    if ($LASTEXITCODE -eq 0) { & icacls.exe $keys /inheritance:r /grant '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null }
     if ($LASTEXITCODE -ne 0) { throw 'cannot restrict administrators_authorized_keys' }
 }
 
@@ -109,8 +121,6 @@ Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFi
 New-NetFirewallRule -Name $ruleName -DisplayName 'agent-collab SSH management (listed sources only)' `
     -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -RemoteAddress $AllowFrom `
     -Profile Private, Domain | Out-Null
-# The capability ships a rule that admits every source address.
-Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
 
 Set-Service sshd -StartupType Automatic
 Restart-Service sshd -Force
