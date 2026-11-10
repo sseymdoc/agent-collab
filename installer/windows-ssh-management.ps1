@@ -42,6 +42,12 @@ function Get-OtherWriters([string]$path, [string[]]$allowed) {
     if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { $others += "$($acl.Owner) (owner)" }
     $others | Select-Object -Unique
 }
+# sshd_config lives in $sshDir and the key file is prepared there. That is only safe while nobody
+# but Administrators and SYSTEM can write to the directory, which is how OpenSSH creates it.
+function Assert-ConfigDirectory {
+    $others = @(Get-OtherWriters $sshDir 'S-1-5-32-544', 'S-1-5-18')
+    if ($others) { throw "$sshDir can be written by $($others -join ', '); restrict it to Administrators and SYSTEM, then rerun" }
+}
 
 if ($Remove) {
     Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
@@ -100,12 +106,8 @@ if ($conflicts) {
     throw "sshd_config has directives outside the managed block that add to or override it ($(($conflicts | Select-Object -Unique) -join ', ')); remove or merge them by hand, then rerun"
 }
 
-# The key file is prepared next to sshd_config. That protects it only while nobody but
-# Administrators and SYSTEM can write to that directory, which is how OpenSSH creates it.
-if (Test-Path -LiteralPath $sshDir) {
-    $others = @(Get-OtherWriters $sshDir 'S-1-5-32-544', 'S-1-5-18')
-    if ($others) { throw "$sshDir can be written by $($others -join ', '); restrict it to Administrators and SYSTEM, then rerun" }
-}
+# A directory that does not exist yet is checked once sshd has created it.
+if (Test-Path -LiteralPath $sshDir) { Assert-ConfigDirectory }
 
 try {
     $administrator = [bool](Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop |
@@ -147,6 +149,7 @@ if (-not (Test-Path -LiteralPath $config)) {
     Start-Service sshd
     Stop-Service sshd -Force
 }
+Assert-ConfigDirectory
 
 $service = Get-Service sshd
 $wasRunning = $service.Status -eq 'Running'
