@@ -235,10 +235,11 @@ Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1`
 脚本把配置、授权文件、受管的防火墙规则和服务状态恢复到写入之前的样子：原授权文件先改名留存，失败时原样放回，本次新增的规则撤掉。
 全新安装时，已安装的 OpenSSH 能力、首次启动生成的默认配置与主机密钥会保留，能力自带的全放行规则保持停用。
 
-授权文件先在 `%ProgramData%\ssh` 里准备好并设好权限，再移到位。这个目录由 OpenSSH 创建，只有 Administrators 与 SYSTEM 可写；
-它若属于其他账户或能被其他账户写入，脚本在改写配置之前中止：目录已存在时不做任何改动，全新安装时在 sshd 首次启动创建它之后再检查一次。
-管理员账户在默认配置下用共享的
-`administrators_authorized_keys`，只留 Administrators 与 SYSTEM；默认的 `Match Group administrators` 段被去掉时的管理员账户，以及普通账户，
+授权文件先在 `%ProgramData%\ssh` 里准备好并设好权限，再移到位。这个目录只有 Administrators 与 SYSTEM 可写；
+它若属于其他账户或能被其他账户写入，脚本中止，目录已存在时不做任何改动。普通账户可以在 `%ProgramData%` 下新建目录，
+所以目录还不存在时，脚本在 sshd 首次启动之前按 OpenSSH 使用的权限一步建好并核对。
+
+管理员账户在默认配置下用共享的 `administrators_authorized_keys`，只留 Administrators 与 SYSTEM；默认的 `Match Group administrators` 段被去掉时的管理员账户，以及普通账户，
 用账户自己的 `.ssh\authorized_keys`，只留该账户、Administrators 与 SYSTEM，属主是该账户。已有授权文件里的密钥会保留，
 所以它若属于其他账户或能被其他账户写入，脚本不做任何改动就中止，要求先检查文件内容。
 

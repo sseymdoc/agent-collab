@@ -106,7 +106,7 @@ if ($conflicts) {
     throw "sshd_config has directives outside the managed block that add to or override it ($(($conflicts | Select-Object -Unique) -join ', ')); remove or merge them by hand, then rerun"
 }
 
-# A directory that does not exist yet is checked once sshd has created it.
+# A directory that does not exist yet is created and checked further down, before sshd starts.
 if (Test-Path -LiteralPath $sshDir) { Assert-ConfigDirectory }
 
 try {
@@ -140,6 +140,16 @@ if (Test-Path -LiteralPath $keys) {
 $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
 if (-not $capability) { throw 'OpenSSH.Server capability is not available on this Windows edition' }
 if ($capability.State -ne 'Installed') { Add-WindowsCapability -Online -Name $capability.Name | Out-Null }
+# sshd reads this directory as soon as it starts, and ordinary users may create folders under
+# %ProgramData%. A missing one is created here in one step with the permissions OpenSSH gives it;
+# either way it is checked before sshd starts or the configuration is touched.
+if (-not (Test-Path -LiteralPath $sshDir)) {
+    $security = New-Object Security.AccessControl.DirectorySecurity
+    $security.SetSecurityDescriptorSddlForm('D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;AU)')
+    $directory = New-Object IO.DirectoryInfo $sshDir
+    if ($PSVersionTable.PSEdition -eq 'Core') { [IO.FileSystemAclExtensions]::Create($directory, $security) } else { $directory.Create($security) }
+}
+Assert-ConfigDirectory
 if (-not (Test-Path -LiteralPath $config)) {
     # The capability ships a rule that admits every source address: disable it before sshd first
     # starts with its default settings. That start creates the default configuration and host keys.
@@ -147,7 +157,6 @@ if (-not (Test-Path -LiteralPath $config)) {
     Start-Service sshd
     Stop-Service sshd -Force
 }
-Assert-ConfigDirectory
 
 $service = Get-Service sshd
 $wasRunning = $service.Status -eq 'Running'
