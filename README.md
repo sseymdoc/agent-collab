@@ -54,7 +54,7 @@
 | `agent_collab/backup.py` | 互斥原子的本地定时备份与实例外拉取 |
 | `agent_collab/installer.py`、`installer/` | 安装、升级、回退、卸载与服务模板 |
 | `agent_collab/cli.py` | 统一入口与客户端子命令（配对、提交、等待、结果、工件、设置） |
-| `agent_collab/preflight.py`、`rehearse.py` | 迁移预检（只读盘点）与隔离副本上的升级预演 |
+| `agent_collab/preflight.py`、`agent_collab/rehearse.py` | 迁移预检（只读盘点）与隔离副本上的升级预演 |
 | `ui/` | React + TypeScript 页面源码，浏览器与桌面端共用，构建到 `agent_collab/static/` |
 | `desktop/` | 桌面端外壳（Tauri v2，Rust）：凭据保管、请求代发、事件流转发、工件另存，见 [docs/desktop.md](docs/desktop.md) |
 | `docs/` | 协议契约、组件说明、安装与运维、架构决定、Agent 集成、功能覆盖矩阵、现有部署迁入 |

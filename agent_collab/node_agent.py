@@ -601,6 +601,7 @@ class Agent:
             raise ValueError('model_catalog_s must be positive and finite')
         self.controller_models = False
         self.models = None
+        self.catalog_revision = 0  # 目录内容每变一次加一；注册据此判断发出去的是不是最新目录
         self.catalog_thread = None
         self.next_catalog = 0
         self.rng = rng or random.Random()
@@ -666,6 +667,7 @@ class Agent:
                 for name in models)
             self.models = models
             if changed:
+                self.catalog_revision += 1
                 self.registered = False  # 下一轮带上新目录重新注册
         self.catalog_thread = threading.Thread(target=run, name='model-catalog', daemon=True)
         self.catalog_thread.start()
@@ -695,7 +697,9 @@ class Agent:
 
     def register(self):
         config = self.config
-        capabilities = dict(self.capabilities, models=self.models) if self.controller_models and self.models else self.capabilities
+        revision = self.catalog_revision  # 先取版本再取目录：两者之间目录被刷新时，结束后会再注册一次
+        models = self.models if self.controller_models else None
+        capabilities = dict(self.capabilities, models=models) if models else self.capabilities
         record = dict(node_id=config['node_id'], physical_host_id=config['physical_host_id'],
             failure_domain=config['failure_domain'], capabilities=capabilities,
             runtime_profile=dict(user=getpass.getuser(), workspace_policy='isolated-attempt'),
@@ -712,7 +716,8 @@ class Agent:
         self.lease_ttl_s = float(result['config']['lease_ttl_s'])
         if self.heartbeat_s <= 0 or self.lease_ttl_s <= 0:
             raise ValueError('invalid controller timing configuration')
-        self.registered = True
+        # 刚得知 controller 支持目录、或注册期间后台探测换了目录：下一轮带上当前目录再注册（§12.5）。
+        self.registered = not (self.controller_models and self.models) or (models is not None and revision == self.catalog_revision)
 
     def heartbeat(self):
         states = []
@@ -931,6 +936,9 @@ class Agent:
             except ConnectionFailure:
                 self.connected = False
                 self.reconciled = False
+                # controller 可能在这期间原地升级（authority_generation 不变，心跳照常通过）：
+                # 重连后重新注册，重新取得它声明的 features。
+                self.registered = False
                 self.next_network = self.clock() + self.backoff.next()
                 self.last_error = p.error_body('invalid', 'Controller unavailable; awaiting reconciliation', reason='network')
             except APIError as exc:

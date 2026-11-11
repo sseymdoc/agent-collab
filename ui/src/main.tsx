@@ -1,9 +1,9 @@
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, ApiError, forgetCoordinators, onUnauthorized } from './api'
+import { api, ApiError, bindCoordinators, onUnauthorized } from './api'
 import { useLive } from './live'
 import { session, setSession } from './session'
-import { invoke, isDesktop, setEpoch } from './transport'
+import { currentEpoch, invoke, isDesktop, setEpoch } from './transport'
 import { applyTheme, errText, short } from './ui'
 import { Connect, bridgeText } from './pages/Connect'
 import { Overview } from './pages/Overview'
@@ -38,23 +38,21 @@ function Login({ onDone }: { onDone: () => void }) {
   </main>
 }
 
-// 上一次连接的 controller：换了 controller 才丢弃协调令牌，重连同一个不必重新接管自己的租约。
-let lastController: string | null = null
-
 function App() {
   // 每次建立连接 generation 加一，主界面按它整体重建：上一条连接留下的弹窗、表单和在途请求的结果随之丢弃。
   const [phase, setPhase] = useState<{ at: 'boot' | 'login' | 'ready'; generation: number; reason: string | null; error: string | null }>(
     { at: 'boot', generation: 0, reason: null, error: null })
   const enter = async () => {
     const who = await api.whoami()
-    if (lastController !== who.controller.controller_id) forgetCoordinators()
-    lastController = who.controller.controller_id
+    // 换了 controller 才丢弃协调令牌，重连同一个不必重新接管自己的租约。
+    bindCoordinators(who.controller.controller_id)
     setSession(who)
     setPhase(p => ({ at: 'ready', generation: p.generation + 1, reason: null, error: null }))
   }
   const leave = (reason: string | null) => {
     setSession(null)
-    if (isDesktop) void invoke('connection_close').catch(() => {})
+    // 只关闭页面当前使用的那条连接（transport 里的代次）；它已不是外壳的当前连接时外壳答 stale_connection，忽略即可。
+    if (isDesktop) void invoke('connection_close', { epoch: currentEpoch() }).catch(() => {})
     setPhase(p => ({ ...p, at: 'login', reason, error: null }))
   }
   const boot = async () => {
@@ -78,9 +76,10 @@ function App() {
       <div className="actions"><button onClick={() => void boot()}>重试</button><button className="link" onClick={() => leave(null)}>改用令牌登录</button></div></div>
     : <p className="muted">连接 controller…</p>}</main>
   if (phase.at === 'login') return isDesktop
-    ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={opened => { setEpoch(opened.epoch); void enter().catch(e => leave(errText(e))) }} />
+    ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={async opened => { setEpoch(opened.epoch); await enter().catch(e => leave(errText(e))) }} />
     : <Login onDone={() => void enter().catch(e => setPhase(p => ({ ...p, at: 'boot', error: errText(e) })))} />
-  return <Shell key={phase.generation} onLeave={() => { if (!isDesktop) void api.logout().catch(() => {}); leave(null) }} />
+  // 浏览器退出要等 DELETE /session 答复后再显示登录页：否则马上重新登录时，迟到的旧答复会清掉新会话的 Cookie 和 CSRF 令牌。
+  return <Shell key={phase.generation} onLeave={() => isDesktop ? leave(null) : void api.logout().catch(() => {}).finally(() => leave(null))} />
 }
 
 // 导航按“总览 → 任务 → 设备 → 设置”排列；项目与活动两页在后续版本加入同一列表。

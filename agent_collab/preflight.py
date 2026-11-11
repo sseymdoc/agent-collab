@@ -20,7 +20,8 @@ from .domain import managed_profile
 
 REDACTED = '[redacted]'
 MAX_SCAN_BYTES = 2 * 1024 * 1024
-SENSITIVE = re.compile(r'token|secret|password|authorization|credential|cookie', re.I)
+_SENSITIVE_WORDS = r'token|secret|password|authorization|credential|cookie|api[_-]?key|access[_-]?key|private[_-]?key'
+SENSITIVE = re.compile(_SENSITIVE_WORDS, re.I)
 TERMINAL = {'completed', 'failed', 'cancelled'}
 ACTIVE = {'assigned', 'leased', 'running'}
 
@@ -43,15 +44,15 @@ class _Redactor:
     def __init__(self):
         self.values = set()
 
-    def remember(self, value):
-        if isinstance(value, str) and value and value != REDACTED:
+    def remember(self, value, minimum=1):
+        if isinstance(value, str) and len(value) >= minimum and value != REDACTED:
             self.values.add(value)
         elif isinstance(value, dict):
             for child in value.values():
-                self.remember(child)
+                self.remember(child, minimum)
         elif isinstance(value, list):
             for child in value:
-                self.remember(child)
+                self.remember(child, minimum)
 
     def json(self, value):
         if isinstance(value, dict):
@@ -61,6 +62,9 @@ class _Redactor:
                     self.remember(child)
                     result[key] = REDACTED
                 elif key.lower() in ('env', 'environment', 'environmentvariables'):
+                    # 记住被遮蔽的值：逐行扫描同一文件时，这些值也不能以原文出现在引用里。
+                    # 环境块里多是 "1"、"true" 这类短值，它们不是凭据，按原文替换会把报告里的版本号等一并改坏。
+                    self.remember(child, minimum=8)
                     result[key] = REDACTED
                 else:
                     result[key] = self.json(child)
@@ -86,10 +90,10 @@ class _Redactor:
         value = re.sub(r'(://)[^/\s:@]+:[^/\s@]+@', r'\1' + REDACTED + '@', value)
         # 不猜测 shell/JSON 的复杂引号边界：含凭据赋值的余行整体遮蔽。
         value = re.sub(
-            r'''(?ix)([\w.-]*(?:token|secret|password|authorization|credential|cookie)[\w.-]*["']?\s*[:=]\s*).*''',
+            r'''(?ix)([\w.-]*(?:%s)[\w.-]*["']?\s*[:=]\s*).*''' % _SENSITIVE_WORDS,
             r'\1' + REDACTED, value)
-        value = re.sub(r'(?i)(--(?:token|password|secret|authorization|credential|cookie)\s+).*',
-                       r'\1' + REDACTED, value)
+        # --token、--api-key 之后的值遮蔽；--token-file 之类给的是路径，不匹配。
+        value = re.sub(r'(?i)(--(?:\w+-)*(?:%s)\s+).*' % _SENSITIVE_WORDS, r'\1' + REDACTED, value)
         if re.search(r'(?i)(?:^|\s)(?:export\s+|Environment(?:Variables)?\s*=)|\b[A-Z_][A-Z0-9_]*=', value):
             return REDACTED
         return value
@@ -167,7 +171,7 @@ class _Reader:
             if not isinstance(value, dict):
                 raise ValueError()
             return self.redactor.json(value)
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, UnicodeError, RecursionError) as exc:
             self.risk('json_unreadable', path, exc)
             return None
 
@@ -325,7 +329,8 @@ def _controller(root, reader, now, snapshot=None):
         # 两种布局：controller backup 直接写出的目录（backup-manifest.json、数据库、blobs/），
         # 以及定时备份打包的集合（COMPLETE.json + backup.tar，清单与数据库在包里）。
         manifest, complete = path / 'backup-manifest.json', path / 'COMPLETE.json'
-        packaged = complete.is_file() and not complete.is_symlink() and (path / 'backup.tar').is_file()
+        archive = path / 'backup.tar'
+        packaged = complete.is_file() and not complete.is_symlink() and archive.is_file() and not archive.is_symlink()
         if not path.is_dir() or not (packaged or (manifest.is_file() and not manifest.is_symlink())):
             reader.risk('backup_set_unrecognized', path)
             continue
@@ -549,6 +554,10 @@ def _references(paths, reader):
                 reader.redactor.json(json.loads(text))
             except ValueError:
                 pass
+            except RecursionError as exc:
+                # 嵌套过深、取不全其中的凭据值：不逐行输出这个文件。
+                reader.risk('json_unreadable', path, exc)
+                continue
             private_block = False
             for number, line in enumerate(text.splitlines(), 1):
                 if '-----BEGIN ' in line:

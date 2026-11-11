@@ -95,6 +95,15 @@ class CodexTests(unittest.TestCase):
         failed = model_catalog([sys.executable, str(broken)], timeout=5)
         self.assertEqual((failed['status'], failed['reason'], failed['models']), ('unknown', 'probe_failed', []))
 
+    def test_model_catalog_gives_up_at_the_deadline_even_while_notifications_keep_arriving(self):
+        chatty = self.temp / 'chatty.py'
+        chatty.write_text('import sys\nwhile True:\n    sys.stdout.write(\'{"method": "note"}\\n\')\n    sys.stdout.flush()\n',
+                          encoding='utf-8')
+        started = time.monotonic()
+        result = model_catalog([sys.executable, str(chatty)], timeout=2)
+        self.assertEqual((result['status'], result['reason']), ('unknown', 'probe_failed'))
+        self.assertLess(time.monotonic() - started, 15)
+
     def test_invalid_model_effort_sandbox_and_session_rejected(self):
         # model 与 effort 必须由契约给出且形状合法；适配器不补默认值。
         for params in ({}, {'model': MODEL}, {'effort': 'xhigh'}, {'model': 'bad model', 'effort': 'xhigh'},

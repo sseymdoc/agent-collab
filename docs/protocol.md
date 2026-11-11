@@ -19,8 +19,9 @@
 | 浏览器 UI | `POST /session {token}` 换取 `ac_session` Cookie（HttpOnly、SameSite=Strict，TLS 下 Secure）与 `csrf_token` | 读取与操作；变更请求必须带 `X-CSRF-Token`，且 `Origin` 为空或等于配置的 `public_origin`（loopback 时为实际监听源） |
 | 节点 | 配对后得到 `node_token`；controller 只存其 SHA-256 | 仅节点端点；令牌绑定 node_id |
 | 配对码 | `controller pairing-code --node-id X` 生成，一次性，10 分钟有效，只存哈希 | 只能调用 `/nodes/pair` |
+| 客户端（桌面、CLI、Agent） | 客户端配对码换取的 `client_token`，见 §12.1 | 按授予的权限访问客户端端点 |
 
-三类凭据互不通用；节点令牌不能调用客户端变更端点，UI 会话不能冒充节点。模型 provider 登录不经过本系统。`GET /healthz` 无需认证，只返回 `{"ok": true}`。
+各类凭据互不通用；节点令牌不能调用客户端变更端点，UI 会话不能冒充节点。模型 provider 登录不经过本系统。`GET /healthz` 无需认证，只返回 `{"ok": true}`。
 
 错误统一为 `protocol.error_body`：`{"error": {"code", "message", "details"}}`。`code` 取值：`invalid`(400)、`unauthorized`(401)、`forbidden`(403)、`not_found`(404)、`conflict`(409)、`fenced`(409，旧 epoch/旧令牌/旧 authority_generation)、`missing_blobs`(409)、`version_mismatch`(409，期望版本过期)、`too_large`(413)、`budget_exhausted`(409)。
 
@@ -62,7 +63,7 @@
 ```
 
 - `requirements` 中空列表表示不限；`tools` 为能力名，必须出现在节点 `capabilities.tools` 中。
-- `harness_params`：`stub` 为 `{"steps": [...]}`（见 §9）；`codex` 为 `{"model": "gpt-6-astra", "effort": "high|xhigh|max", "sandbox": "read-only|workspace-write"}`，模型固定，effort 只允许三档，缺省 `xhigh`，非法值在受理时拒绝。
+- `harness_params`：`stub` 为 `{"steps": [...]}`（见 §9）；`codex` 为 `{"model"?, "effort"?, "sandbox": "read-only|workspace-write"}`：model 与 effort 可省略，受理时按 §12.4 解析成确定值写进契约，解析不出或不在许可范围时拒绝；字段约束见 §12.3。
 - `recovery.auto=true` 要求 `inputs_manifest` 非空，且所有 blob 已存在于 controller，才能把 `protection` 置为 `protected`；否则为 `preparing`，**不得派单**，`status_reason` 列出缺失 blob。`recovery.auto=false` 时 `protection=unprotected`，可直接派单，但不会自动恢复。
 - `side_effects=manual` 时永不自动恢复；`idempotent` 需要 `attempt.side_effect` 事件中的逻辑操作 ID（§7）。
 
@@ -184,7 +185,7 @@ agent 回写时同样忽略匹配路径，避免把快照省略误当成对目�
 任何字段尾部或整体截断均加 `truncated=true`。整体仍超限时缩减最大的内容字段：steps 保留前段、文本保留尾部，
 过大的 usage/cli_error 可变为 null；不把截断后的摘要当作完整证据。report 随 complete outbox 持久化，重放不重新采样日志。
 
-## 5. 客户端端点（admin token 或 UI 会话）
+## 5. 客户端端点（管理令牌、UI 会话或客户端凭据）
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -257,7 +258,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - 每条事件：`id: <seq>`、`event: <type>`、`data: <event JSON>`。
 - 每 `sse_ping_s` 秒发送注释行 `: ping`。
-- 游标早于已保留的最小 `seq` 时，先发送 `event: snapshot_required` 与 `data: {"min_seq"}`，客户端应重新 `GET` 快照后用新游标连接。
+- 游标早于已保留的最小 `seq` 时，先发送 `event: snapshot_required` 与 `data: {"min_seq"}`，客户端应先 `GET /events?after=<min_seq-1>` 补读仍保留的事件，再用补读到的最后序号重新连接（流按 `seq > cursor` 续读，直接用 `min_seq` 会漏掉第一条）。
 - 浏览器的 `Last-Event-ID` 只是游标传递方式，持久性来自数据库事件表。
 - `App.handle` 的 SSE 响应是有限迭代器（测试可设置最大时长或在没有新事件时结束），HTTP 包装负责持续推送。
 
@@ -292,7 +293,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 存在有效租约时，针对该根工作包的 `assess`、`publish`、`retry`、`integration` 与同根新 job 提交必须带匹配的 `X-Coordinator-Token`，否则 409 `conflict`（`details.reason="coordinator_lease"`）。用户取消不受此限制。旧协调者恢复连接后先读租约与交付版本，不能凭旧令牌继续。
 
-节点令牌发起、且 `publish.mode=auto` 的发布不受协调租约限制，仍执行全部 epoch、generation、attempt 和发布 CAS 检查。节点 integration 无此豁免。租约端点只接受管理员 Bearer 或由管理员登录换取的 UI 会话；后者仍要求 CSRF/Origin 校验。`ttl_s` 必须是正有限数；接管必须给出非空 reason。租约 token 只保存哈希，GET 不返回 token；POST 获取回执支持 request_id 重放，续租重放仍须带原 token，已失效的获取回执返回 409，不复活旧租约。DELETE 在无有效租约时幂等返回 `{}`。普通重启保留租约，恢复备份后的 generation 变更使旧协调租约失效。
+节点令牌发起、且 `publish.mode=auto` 的发布不受协调租约限制，仍执行全部 epoch、generation、attempt 和发布 CAS 检查。节点 integration 无此豁免。租约端点接受管理员 Bearer、由管理员登录换取的 UI 会话（仍要求 CSRF/Origin 校验）或带 `tasks` 权限的客户端凭据（§12.1）；节点令牌不能调用。`ttl_s` 必须是正有限数；接管必须给出非空 reason。租约 token 只保存哈希，GET 不返回 token；POST 获取回执支持 request_id 重放，续租重放仍须带原 token，已失效的获取回执返回 409，不复活旧租约。DELETE 在无有效租约时幂等返回 `{}`。普通重启保留租约，恢复备份后的 generation 变更使旧协调租约失效。
 
 **受管协调者**：
 
@@ -306,8 +307,8 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   依次按 workspace 排除、单文件上限、UTF-8 解码、总预算判定，省略原因分别为 excluded、too_large、binary、budget；省略列表也按路径排序。
   无检查点时两列表为空。已有 report 仍为目标 job 最新 attempt 的报告，checkpoint_diff 仍对应 job.durable_checkpoint_id；
   文件集合优先 final，因此在 final 后又有 boundary 的情况下可能与 diff 对应检查点不同。验收仍绑定 context 捕获的 job.durable_checkpoint_id。
-- 协调回合输出 `decision.json`（作为 final 检查点文件）：`{"decision": "accept|rework|escalate", "assessment": {"status", "method", "result", "checkpoint_id"}, "follow_up": {"title", "goal", "acceptance", "instructions", "effort"} | null, "notes"}`。所有列出的键必填；顶层、assessment、follow_up 对象均为 additionalProperties=false。method/result/notes/title/goal/instructions 为字符串，follow_up.acceptance 为非空字符串数组（minItems=1），effort 仅 high/xhigh/max；不接受 contract、budgets、scope、base_checkpoint_id 等额外字段。adapter 使用同一 schema 作为 --json-schema 和本地形状复核依据，不做依赖目标状态的判断。controller 再检查 accept/status=passed、rework/status=rework，以及 checkpoint_id 必须指向 context 捕获的目标 durable checkpoint；escalate 可用 null checkpoint_id。非 rework 的 follow_up 应为 null，否则 controller 单独拒绝该修复请求。
-- 修复契约由 controller 从请求和被验收检查点派生：harness=codex，harness_params 固定 model=gpt-6-astra、sandbox=workspace-write，effort 取 follow_up；goal/acceptance 取 follow_up，prompt 包含 instructions、goal、acceptance 及目标契约 excludes。excludes、requirements、recovery、resources、publish、integration、workspace 继承目标，requirements.tools 补入 codex 且不重复。budgets 继承目标的累计上限并保留取较小值的限制，不把上限改成剩余额度；follow_up 无权覆盖预算。inputs_manifest 必须等于被验收检查点的完整 manifest，包括 base/deleted。domain.validate_contract 验证结构，controller 仅对这种从同根 durable/verified 检查点派生的输入允许非空 base，普通客户端提交的非空输入 base 仍拒绝。修复成功受理后沿同根计 repairs+1。
+- 协调回合输出 `decision.json`（作为 final 检查点文件）：`{"decision": "accept|rework|escalate", "assessment": {"status", "method", "result", "checkpoint_id"}, "follow_up": {"title", "goal", "acceptance", "instructions", "effort"} | null, "notes"}`。所有列出的键必填；顶层、assessment、follow_up 对象均为 additionalProperties=false。method/result/notes/title/goal/instructions 为字符串，follow_up.acceptance 为非空字符串数组（minItems=1），follow_up.effort 为字符串或 null（§12.4；节点也接受此前 effort 必填、限 high/xhigh/max 的 schema）；不接受 contract、budgets、scope、base_checkpoint_id 等额外字段。adapter 使用同一 schema 作为 --json-schema 和本地形状复核依据，不做依赖目标状态的判断。controller 再检查 accept/status=passed、rework/status=rework，以及 checkpoint_id 必须指向 context 捕获的目标 durable checkpoint；escalate 可用 null checkpoint_id。非 rework 的 follow_up 应为 null，否则 controller 单独拒绝该修复请求。
+- 修复契约由 controller 从请求和被验收检查点派生：harness=codex，harness_params 的 model 取根工作包冻结的 model，sandbox=workspace-write，effort 取 follow_up（为 null 时用冻结的 effort，规则见 §12.4）；goal/acceptance 取 follow_up，prompt 包含 instructions、goal、acceptance 及目标契约 excludes。excludes、requirements、recovery、resources、publish、integration、workspace 继承目标，requirements.tools 补入 codex 且不重复。budgets 继承目标的累计上限并保留取较小值的限制，不把上限改成剩余额度；follow_up 无权覆盖预算。inputs_manifest 必须等于被验收检查点的完整 manifest，包括 base/deleted。domain.validate_contract 验证结构，controller 仅对这种从同根 durable/verified 检查点派生的输入允许非空 base，普通客户端提交的非空输入 base 仍拒绝。修复成功受理后沿同根计 repairs+1。
 - controller 在同一事务内确认 managed 租约仍属于该 attempt、目标 epoch/状态/检查点/验收/取消状态未改变且没有后续同根修订，然后应用决策；节点自动发布引起的 delivery/version 更新不使输入失效。合法 accept/rework 的验收先记录并绑定 checkpoint manifest，写 coordinator.decision_applied；follow_up 在独立保存点处理。修复请求形状错误、派生契约无效或派单失败时，仅回滚修复产生的状态/计数，写 `coordinator.follow_up_rejected`（含 reason）；超预算或根副作用未知写 `coordinator.escalated`。这些情况保留验收，协调 attempt 仍为 succeeded、协调 job 为 completed，完成请求重放不重复验收/派单。合法 rework 从 waiting_reconcile 创建修复前，将旧目标标为 failed(managed_rework)；创建失败时该状态变更也回滚，目标保留 waiting_reconcile 和已记录验收。follow_up=null 仅记录验收。显式 escalate 仍只记录事件、保持目标状态等待人工。验收自身非法或持有权/目标版本/检查点失效时，整次应用拒绝，写 `coordinator.decision_rejected`，不改变目标 job 和验收。
 - 节点 claude 适配器使用用户本机已安装的官方 Claude Code 与其官方登录：`claude -p --model <profile.model> --effort <profile.effort> --output-format json --json-schema <内联 JSON> --permission-mode dontAsk --tools "" --session-id <新 uuid> --strict-mcp-config --setting-sources "" --safe-mode`，环境变量 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`（禁用全部内置工具；不加载 MCP 服务，不加载 user、project、local 任何来源的设置、插件、hooks 和各级目录的 CLAUDE.md、CLAUDE.local.md，不加载自动记忆；Claude Code 自身的系统提示、官方登录与管理员下发的托管策略照常）。协调工作区里出现 `.claude` 时适配器不启动 Claude，以 `code_failure` 结束。prompt 经 stdin，内嵌 context.json 全文并要求仅返回结构化决策；follow_up 只需给修复目标、验收项、给 Codex 的修改说明及 effort，系统从被验收检查点自动生成完整契约。仅接受 stdout JSON 的 structured_output，通过 schema 后由 agent 写 decision.json 并建立 final checkpoint，不在 adapter 内生成或校验修复契约。含旧 contract 字段或缺字段的 follow_up 会在 adapter 端失败且不写 decision.json；若错误 follow_up 已通过其他客户端到达 controller，其合法验收仍可部分应用。不把自由文本 result 当作决策。认证失败分类 auth_expired；若此时本进程读不到凭据存储（macOS 钥匙串），改为 capability_missing，不报 auth_expired（§11.2）。Claude 不获写文件或执行命令权限；这是 Claude Code 的命令行限制，不是操作系统级隔离。没有工具时 Claude 只能依据 prompt 内嵌的 context：提示词要求只依据提供的证据判断，不得声称做过或看到未出现在 context 中的检查，证据不足或没有检查点时决策为 `escalate`。路径来自 agent.json 的 claude_command（默认 claude），detect 只在找到可执行文件后探测版本。适配器不读取、复制或代理 Claude.ai OAuth 凭据，不改变计费路径；每轮新建会话，不 resume 原生会话。
 
@@ -362,7 +363,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 | scope | 允许 |
 | --- | --- |
-| `read` | 全部 GET：任务、事件与事件流、检查点与文件清单、blob、节点、总览、调度解释、协调租约、模型设置与目录、模板、输入基线 |
+| `read` | 除 `GET /clients`、`GET /doctor`（需要 `maintain`）外的全部 GET：任务、事件与事件流、检查点与文件清单、blob、节点、总览、调度解释、协调租约、模型设置与目录、模板、输入基线 |
 | `tasks` | 创建任务、契约草拟、取消、重试、验收、发布、回写结果、协调租约取得与释放、上传 blob、登记输入基线 |
 | `settings` | 修改模型设置 |
 | `devices` | 节点排空与迁移 |
@@ -374,12 +375,12 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - `GET /client`（任意客户端凭据、管理令牌或会话）→ `{"identity": {"kind": "client|admin|session", "client_id", "name", "scopes"}, "controller": {"controller_id", "authority_generation", "version", "git_commit", "features"}}`。
 - `DELETE /client`（客户端凭据）→ 撤销调用者自己。
 - `GET /clients`（maintain）→ `{"clients": [client...]}`；client 为 `{"client_id", "name", "kind", "scopes", "created_at", "revoked_at", "version"}`，不含凭据。
-- `POST /clients/codes`（maintain）`{"request_id", "role" | "scopes", "ttl_s"}` → 201 `{"code", "scopes", "expires_at"}`；响应不进入幂等回执，重复的 request_id 返回 409。
+- `POST /clients/codes`（maintain）`{"request_id", "role" | "scopes", "ttl_s"}` → 201 `{"code", "scopes", "expires_at"}`；响应不进入幂等回执，重复的 request_id 返回 409。客户端凭据只能签发不超出自身 scopes 的配对码，否则返回 403 `forbidden`，`details.required_scope` 为第一个缺少的 scope；管理令牌与会话不受此限。
 - `POST /clients/{client_id}/revoke`（maintain）`{"request_id", "expected_version"}` → 更新后的 client。
 
 撤销从下一次请求起生效，不影响节点凭据和其他客户端。已建立的事件流在下一个轮询周期（缺省 0.25 秒）重新认证，收到一帧 `event: unauthorized` 后被服务端关闭。
 
-所有 `/api/v1` 响应带 `X-Controller-Id: <controller_id>`。客户端把连接绑定到配对时得到的 controller_id；响应里的值不同即停止使用该连接。
+所有 `/api/v1` 响应带 `X-Controller-Id: <controller_id>`。客户端把连接绑定到配对时得到的 controller_id；响应里的值不同即停止使用该连接。不带该头的 5xx 视为前置代理代答，按网络错误处理，不算身份不符。
 
 浏览器控制台（`POST /session`、Cookie、CSRF、Origin 检查与静态页面）在配置 `web_console` 为 true（缺省）时保持原行为；设为 false 后 `POST /session` 返回 403，不再提供静态页面，已有会话失效。它是迁移期的兼容入口，退出条件见 `docs/migration.md`。
 
@@ -410,7 +411,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 **12.4 受理时解析与冻结**
 
-- `harness: codex` 的契约可以省略 `harness_params.model` 与 `effort`。受理时逐项解析：请求里显式给出的值 → 工作区默认值；同一根工作包内的后续修订改用根冻结的默认值。解析不出返回 400，`details.reason` 为 `model_default_unset`；解析结果不在许可范围返回 400，`details.reason` 为 `model_not_allowed`。不会换成别的模型或 effort。
+- `harness: codex` 的契约可以省略 `harness_params.model` 与 `effort`。受理时逐项解析：请求里显式给出的值 → 工作区默认值；同一根工作包内的后续修订改用根冻结的默认值。解析不出返回 400，`details.reason` 为 `model_default_unset`；解析结果不在许可范围返回 400，`details.reason` 为 `model_not_allowed`。同一根工作包的后续修订若显式给出 model，必须与根冻结的 model 相同（冻结的 model 为 null 时不限），否则同样返回 400 `model_not_allowed`；effort 可在冻结的许可范围内覆盖。不会换成别的模型或 effort。
 - 解析结果写入 job 的 `contract.harness_params`（与此前由固定常量填充的位置相同），受理后不变；之后修改设置不影响已受理的 job，包括排队中的。
 - job 记录带 `model_policy`：`{"schema": 1, "settings_revision", "requested": {"model", "effort"}, "resolved": {"model", "effort"}, "source": {"model", "effort"}}`。`requested` 是请求显式给出的值（没有则为 null）；`source` 取 `task_override`、`workspace_default`、`root_frozen`、`coordinator_override`、`legacy_compat`（`project_default` 预留）。升级前受理的 job 没有此字段；`request_hash` 与既有契约内容不重算。
 - 根工作包记录带冻结策略 `model_policy`：`{"schema": 1, "settings_revision", "codex": {"model", "effort", "allowed": {...}|null}}`，取根 job 受理时的解析结果与当时的 `codex.allowed`；根 job 不是 codex 时取当时的工作区默认值（未设置则 model、effort 为 null）。
@@ -422,7 +423,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 **12.5 节点模型目录**
 
 - 节点注册可带 `capabilities.models`：`{"codex": {"status": "ok|unknown", "source", "fetched_at", "cli_version", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}, "claude": {...}}`。codex 目录由节点在自己的服务进程上下文里启动 `codex app-server`（stdio，不监听网络端口），发送 `initialize` 与 `model/list` 取得，按 `model_catalog_s`（缺省 21600 秒）刷新；取不到时 `status` 为 `unknown` 并给出 `reason`。claude CLI 没有目录接口，`status` 为 `unknown`、`reason` 为 `no_catalog_interface`。读取目录不调用模型。
-- 节点第一次注册不带 `models`；注册响应的 `features` 含 `node_models` 时再带上它重新注册。
+- 节点第一次注册不带 `models`；注册响应的 `features` 含 `node_models` 时再带上它重新注册。节点与 controller 断线重连后重新注册，以重新取得 `features`（controller 原地升级时恢复代次不变，心跳不会提示能力变化）。
 - 没有上报 `models` 的节点（旧版本）按其适配器实际接受的固定集合处理：`status: legacy`，`gpt-6-astra` 配 `high`、`xhigh`、`max`。
 - 调度过滤（§6）：codex 任务的 model 不在节点目录里记 `model_unsupported:<model>`，effort 不在该模型的列表里记 `effort_unsupported:<model>/<effort>`；只对 status 为 ok 或 legacy 的目录判断。目录 unknown 的节点不因此被排除，调度解释里该节点带 `model_catalog: "unknown"`。
 

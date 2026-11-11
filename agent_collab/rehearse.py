@@ -6,14 +6,16 @@
 并且全程不监听端口：它接不到任何节点，节点也不会把它当成原来的 controller。
 """
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import shutil
 import sqlite3
 import sys
 
-from . import protocol as p
+from . import domain as d, protocol as p
 from .controller import App, database_references, file_hash, restore
+from .preflight import _validate_output
 
 
 def _records(db):
@@ -22,6 +24,15 @@ def _records(db):
 
 def _of(records, kind):
     return {ident: value for (k, ident), value in records.items() if k == kind}
+
+
+def _events(db, upto=None):
+    """事件表（序号不大于 upto 的部分）的条数、最大序号与内容摘要：恢复只追加事件，原有的行必须逐条不变。"""
+    digest, count, last = hashlib.sha256(), 0, None
+    for seq, data in db.execute('SELECT seq, data FROM events WHERE seq <= ? ORDER BY seq', (1 << 62 if upto is None else upto,)):
+        digest.update(b'%d\n' % seq + (data if isinstance(data, bytes) else data.encode('utf-8')) + b'\n')
+        count, last = count + 1, seq
+    return count, last, digest.hexdigest()
 
 
 def rehearse(backup_dir, work_dir, config=None):
@@ -35,7 +46,7 @@ def rehearse(backup_dir, work_dir, config=None):
     source = sqlite3.connect((backup_dir / manifest.get('database', 'controller.db')).as_uri() + '?mode=ro&immutable=1', uri=True)
     try:
         before = _records(source)
-        events_before = source.execute('SELECT COUNT(*) FROM events').fetchone()[0]
+        events_before = _events(source)
     finally:
         source.close()
     data = work / 'controller'
@@ -78,9 +89,20 @@ def rehearse(backup_dir, work_dir, config=None):
               {'attempts': len(attempts), 'reasons': sorted(r for r in reasons if r)})
         settings = app.model_settings()
         had = ('settings', 'models') in before
-        check('model_settings', settings == before[('settings', 'models')] if had else
-              ((settings['updated_by'] or {}).get('kind') == 'migration') == bool(jobs_before or _of(before, 'node')),
-              {'carried_over': had, 'settings': {k: settings[k] for k in ('revision', 'codex', 'claude')}})
+        detail = {'carried_over': had, 'settings': {k: settings[k] for k in ('revision', 'codex', 'claude')}}
+        if had:
+            ok = settings == before[('settings', 'models')]
+        elif jobs_before or _of(before, 'node'):
+            # 升级前的部署：迁移值必须就是 §12.3 规定的组合与当时生效的协调 profile。profile 在 config.json 里，
+            # 而它不在备份集中；没给 --config 时无法确认，不算通过。
+            expected = d.migrated_settings(d.managed_profile(app.config)['profile'])
+            ok = (config is not None and (settings['updated_by'] or {}).get('kind') == 'migration'
+                  and all(settings[k] == expected[k] for k in ('codex', 'claude')))
+            if config is None:
+                detail['unconfirmed'] = 'config_required'
+        else:
+            ok = settings['updated_by'] is None and all(settings[k] == d.EMPTY_SETTINGS[k] for k in ('codex', 'claude'))
+        check('model_settings', ok, detail)
         policies = {'frozen': 0, 'legacy': 0}
         for root_id in _of(after, 'root'):
             policies['legacy' if app.root_policy(root_id).get('legacy') else 'frozen'] += 1
@@ -90,8 +112,9 @@ def rehearse(backup_dir, work_dir, config=None):
             check('durable_artifacts_present', True, {'blobs': len(references)})
         except ValueError as exc:
             check('durable_artifacts_present', False, str(exc))
-        events_after = app.store.db.execute('SELECT COUNT(*) FROM events').fetchone()[0]
-        check('event_history_kept', events_after >= events_before, {'before': events_before, 'after': events_after})
+        kept = _events(app.store.db, events_before[1] if events_before[1] is not None else 0)
+        check('event_history_kept', kept == events_before,
+              {'before': events_before[0], 'after': app.store.db.execute('SELECT COUNT(*) FROM events').fetchone()[0]})
         check('backup_content_unchanged', (backup_dir / 'backup-manifest.json').read_bytes() == manifest_bytes and
               file_hash(backup_dir / manifest.get('database', 'controller.db')) == manifest['db_sha256'], manifest['db_sha256'])
         nodes = _of(after, 'node').values()
@@ -114,13 +137,15 @@ def main(argv=None):
     parser.add_argument('--out', help='报告文件，缺省输出到标准输出')
     args = parser.parse_args(argv)
     try:
+        # 报告不能覆盖备份集（含硬链接别名）或输入的配置文件。
+        output = _validate_output(Path(args.out), [args.backup], [args.config] if args.config else []) if args.out else None
         report = rehearse(args.backup, args.work, args.config)
     except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error) as exc:
         print(json.dumps(p.error_body('invalid', type(exc).__name__ + ': ' + str(exc)), ensure_ascii=False), file=sys.stderr)
         return 2
     text = json.dumps(report, ensure_ascii=False, indent=2) + '\n'
-    if args.out:
-        Path(args.out).write_text(text, encoding='utf-8')
+    if output:
+        output.write_text(text, encoding='utf-8')
     else:
         sys.stdout.write(text)
     return 0 if report['ok'] else 1

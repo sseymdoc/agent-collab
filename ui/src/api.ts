@@ -1,5 +1,5 @@
 // 只对接真实 controller API（docs/protocol.md §5、§8、§12）；没有 mock。传输见 transport.ts。
-import { request, setCsrf } from './transport'
+import { currentEpoch, request, setCsrf, type Rsp } from './transport'
 
 export type J = Record<string, any>
 
@@ -27,13 +27,24 @@ export function coordHeld(wp?: string | null): CoordHeld | null {
 }
 function setCoord(wp: string, v: CoordHeld | null) {
   coordMem.set(wp, v)
-  try { v ? sessionStorage.setItem(coordKey(wp), JSON.stringify(v)) : sessionStorage.removeItem(coordKey(wp)) } catch { /* 忽略 */ }
+  try { v ? sessionStorage.setItem(coordKey(wp), JSON.stringify({ ...v, controller: coordController })) : sessionStorage.removeItem(coordKey(wp)) } catch { /* 忽略 */ }
 }
-// 切换 controller 连接时丢弃全部协调令牌：它们属于上一个 controller。
-export function forgetCoordinators() {
-  for (const wp of coordMem.keys()) setCoord(wp, null)
+// 协调令牌只对签发它的 controller 有效，保存时记下 controller_id。连上（或刷新后重连）一个 controller 时，
+// 内存和 sessionStorage 里不属于它的令牌全部丢弃，包括本页还没读入内存的；重连同一个 controller 时保留。
+let coordController: string | null = null
+export function bindCoordinators(controllerId: string) {
+  if (controllerId === coordController) return
+  coordController = controllerId
   coordMem.clear()
   pendingTake.clear()
+  try {
+    for (const k of Object.keys(sessionStorage)) {
+      if (!k.startsWith('ac_coord_')) continue
+      let owner: unknown
+      try { owner = JSON.parse(sessionStorage.getItem(k) ?? 'null')?.controller } catch { /* 格式不符，按不匹配丢弃 */ }
+      if (owner !== controllerId) sessionStorage.removeItem(k)
+    }
+  } catch { /* 不可用时只有内存 */ }
 }
 // 取得请求的响应丢失（网络错误）时保留请求体，由用户显式“恢复”时原样重放：controller 按 request_id 返回同一令牌，
 // 而不是因租约已被（自己）占用而拒绝。新的取得/接管总是新请求，不会悄悄重放旧请求。收到 controller 的明确答复后丢弃。
@@ -57,23 +68,32 @@ let unauthorized = (_reason: string) => {}
 export function onUnauthorized(f: (reason: string) => void) { unauthorized = f }
 export const lost = (reason: string) => unauthorized(reason)
 
-async function call(method: string, path: string, body?: unknown, extra: Record<string, string> = {}): Promise<any> {
-  let r
-  try { r = await request(method, path, body === undefined ? undefined : JSON.stringify(body), extra) } catch (e: any) {
+// 发请求并把非 2xx 变成 ApiError；JSON 接口和原样取内容（blob）都经过这里，401 与连接失效的处理一致。
+async function send(method: string, path: string, body?: string, extra: Record<string, string> = {}): Promise<Rsp> {
+  // 桌面端：记下发出时的连接代次。旧连接的请求被外壳作废（stale_connection）只说明这次请求被丢弃，
+  // 不代表当前连接有问题；只有当前代次的请求失效时才回到连接页，否则会把刚打开的新连接关掉。
+  const mine = currentEpoch()
+  let r: Rsp
+  try { r = await request(method, path, body, extra) } catch (e: any) {
     // 原生桥的错误是 {code, message}；浏览器 fetch 失败是 TypeError。status 0 表示没有得到 controller 的答复。
     const code = typeof e?.code === 'string' ? e.code : 'network'
-    if (code === 'stale_connection' || code === 'controller_mismatch') unauthorized(code)
+    if ((code === 'stale_connection' || code === 'controller_mismatch') && mine === currentEpoch()) unauthorized(code)
     throw new ApiError(0, code, typeof e?.message === 'string' ? e.message : '无法连接 controller')
   }
-  if (r.status === 204) return null
-  let data: any = null
-  try { data = r.body ? JSON.parse(r.body) : null } catch { data = { raw: r.body } }
   if (r.status < 200 || r.status >= 300) {
     if (r.status === 401) { setCsrf(null); unauthorized('unauthorized') }
+    let data: any = null
+    try { data = JSON.parse(r.body) } catch { /* 不是 JSON 错误体 */ }
     const e = data?.error ?? {}
     throw new ApiError(r.status, e.code ?? 'http_' + r.status, e.message ?? r.body.slice(0, 200), e.details ?? {})
   }
-  return data
+  return r
+}
+
+async function call(method: string, path: string, body?: unknown, extra: Record<string, string> = {}): Promise<any> {
+  const r = await send(method, path, body === undefined ? undefined : JSON.stringify(body), extra)
+  if (r.status === 204 || !r.body) return null
+  try { return JSON.parse(r.body) } catch { return { raw: r.body } }
 }
 
 export const uuid = () => crypto.randomUUID()
@@ -95,7 +115,7 @@ export const api = {
   doctor: () => call('GET', '/doctor'),
   diff: (cp: string, against: string) => call('GET', '/checkpoints/' + cp + '/diff?against=' + encodeURIComponent(against)),
   files: (cp: string) => call('GET', '/checkpoints/' + cp + '/files'),
-  blobText: async (sha: string) => (await request('GET', '/blobs/' + sha)).body,
+  blobText: async (sha: string) => (await send('GET', '/blobs/' + sha)).body,
   // 模型设置：保存时带读到的 revision，别人先改过则得到 version_mismatch 与当前值。
   models: () => call('GET', '/settings/models'),
   // 只带要改的那一组；没给的那组 controller 保持原值。

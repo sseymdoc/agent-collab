@@ -8,7 +8,7 @@ const CATALOG: Record<string, string> = { ok: '已上报', legacy: '旧版本设
 
 export function Nodes({ tick }: { tick: number }) {
   const { data, error } = useData(() => api.nodes(), [tick])
-  const models = useData(() => api.models().catch(() => null), [tick])
+  const models = useData(() => api.models(), [tick])
   if (!data) return error ? <p className="err">{error}</p> : <p className="muted">加载中…</p>
   const nodes: any[] = data.nodes ?? data
   const hosts = new Map<string, any[]>()
@@ -16,6 +16,8 @@ export function Nodes({ tick }: { tick: number }) {
   const devices = can('devices')
   return <>
     {error && <p className="err">刷新失败，以下为上次成功加载的内容：{error}</p>}
+    {/* 模型目录读取失败与设备没上报目录是两回事：失败时单独提示，不把它显示成“未知”。 */}
+    {models.error && <p className="err">读取模型目录失败{models.data ? '，模型目录列为上次成功读取的内容' : ''}：{models.error}</p>}
     {[...hosts].map(([host, list]) => <Section key={host} title={'物理主机 ' + host}
       extra={<span className="muted">同一主机的设备共享 host_slots，不能互为断电备份；“故障域”是各设备自行上报的标签，恢复评分按它区分</span>}>
       <table>
@@ -36,7 +38,7 @@ export function Nodes({ tick }: { tick: number }) {
               {Object.entries(c.harness_paths ?? {}).filter(([, v]) => v).map(([k, v]) => <span key={k}><br />{k} 路径 <code>{String(v)}</code></span>)}
               {Object.entries(c.harness_disabled ?? {}).map(([k, v]) => <span key={k} className="warn-text"><br />{k} 已停用：{String(v)}</span>)}
               {(c.gpu ?? []).length ? <><br />GPU {c.gpu.map((g: any) => typeof g === 'string' ? g : g.name + (g.cuda ? '（CUDA）' : '')).join(', ')}</> : null}</small></td>
-            <td><small>{!catalog ? '未知' : <>{CATALOG[catalog.status] ?? catalog.status}{catalog.reason ? '（' + catalog.reason + '）' : ''}
+            <td><small>{!catalog ? (models.data ? '未知' : models.error ? '读取失败' : '读取中…') : <>{CATALOG[catalog.status] ?? catalog.status}{catalog.reason ? '（' + catalog.reason + '）' : ''}
               {catalog.models?.length ? <details><summary>{catalog.models.length} 个模型{catalog.fetched_at ? ' · 读取于 ' + when(catalog.fetched_at) : ''}</summary>
                 {catalog.models.map((m: any) => <div key={m.id}><code>{m.id}</code>：{m.efforts.join('、')}</div>)}
                 <span className="muted">目录来自该设备上的 CLI，不表示这个账号已成功调用过。</span></details> : null}</>}</small></td>

@@ -7,6 +7,9 @@ import { Action, Badge, Json, ORIGIN, Section, applyTheme, errText, show, short,
 const SCOPE: Record<string, string> = { read: '读取', tasks: '任务', settings: '设置', devices: '设备', maintain: '维护' }
 const ROLE: Record<string, string> = { owner: '拥有者（全部权限）', operator: '操作者（读取 + 任务）', viewer: '只读' }
 const actor = (a: any) => a ? (a.name ?? ORIGIN[a.kind] ?? a.kind) : '未知'
+// 比较设置时不计键与 effort 列表的顺序：勾掉再勾回同一项算没改。
+const canon = (v: any): any => Array.isArray(v) ? v.map(canon).sort() : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canon(v[k])])) : v
+const same = (a: any, b: any) => JSON.stringify(canon(a)) === JSON.stringify(canon(b))
 
 export function Settings({ tick, onLeave }: { tick: number; onLeave: () => void }) {
   const who = session()
@@ -18,7 +21,7 @@ export function Settings({ tick, onLeave }: { tick: number; onLeave: () => void 
         <dt>权限</dt><dd>{(who?.identity.scopes ?? []).map((s: string) => SCOPE[s] ?? s).join('、')}</dd>
         <dt>controller</dt><dd><code>{show(who?.controller.controller_id)}</code> · 版本 {show(who?.controller.version)}{who?.controller.git_commit ? ' · ' + String(who.controller.git_commit).slice(0, 7) : ''} · authority_generation {show(who?.controller.authority_generation)}</dd>
         <dt>controller 支持的能力</dt><dd>{(who?.controller.features ?? []).join('、') || '未声明（旧版本 controller）'}</dd>
-        <dt>传输</dt><dd>{isDesktop ? '桌面端原生桥；凭据在系统凭据存储里，页面拿不到' : '浏览器会话（Cookie + CSRF）· ' + location.origin}</dd>
+        <dt>传输</dt><dd>{isDesktop ? '桌面端原生桥；凭据在系统凭据存储里，页面拿不到' : '浏览器会话（Cookie + CSRF）· ' + location.origin + (location.protocol === 'https:' ? '（TLS，浏览器已校验证书）' : '（非 TLS，连接未加密：登录令牌和会话 Cookie 以明文传输）')}</dd>
       </dl>
       <p className="actions"><button onClick={onLeave}>{isDesktop ? '断开连接' : '退出登录'}</button>
         {isDesktop && <small className="muted">断开只关闭这个窗口的连接，不影响 controller 和设备上的任务；连接仍保留在本机，可在连接页重新进入或忘记。</small>}</p>
@@ -48,19 +51,27 @@ function Models({ tick }: { tick: number }) {
   const set = (f: (v: any) => void) => {
     const next = structuredClone(cur)
     f(next)
-    const changed = (k: 'codex' | 'claude') => form?.[k] || JSON.stringify(next[k]) !== JSON.stringify(cur[k]) ? { [k]: next[k] } : {}
-    setForm({ ...changed('codex'), ...changed('claude') })
+    // 与 controller 当前值比较：改回原值的那组不再算修改，两组都没改时清空表单，不会提交一次相同的设置让 revision 白白递增。
+    const changed = (k: 'codex' | 'claude') => same(next[k], settings[k]) ? {} : { [k]: next[k] }
+    const edited = { ...changed('codex'), ...changed('claude') }
+    setForm(Object.keys(edited).length ? edited : null)
     setMsg(null)
   }
   const selectable: any[] = view.data.selectable?.codex ?? []
   // 目录里的全部模型（不受当前许可范围过滤），用来编辑许可范围。
   const catalog = new Map<string, Set<string>>()
+  const defaults = new Map<string, string>()   // 设备上报的 default_effort，选模型时优先预选它
   for (const node of Object.values<any>(view.data.catalog?.nodes ?? {}))
-    if (node.codex?.status !== 'unknown') for (const m of node.codex?.models ?? []) catalog.set(m.id, new Set([...(catalog.get(m.id) ?? []), ...m.efforts]))
+    if (node.codex?.status !== 'unknown') for (const m of node.codex?.models ?? []) {
+      catalog.set(m.id, new Set([...(catalog.get(m.id) ?? []), ...m.efforts]))
+      if (m.default_effort && !defaults.has(m.id)) defaults.set(m.id, m.default_effort)
+    }
   for (const [m, efforts] of Object.entries<string[]>(cur.codex.allowed ?? {})) catalog.set(m, new Set([...(catalog.get(m) ?? []), ...efforts]))
   const allowed = cur.codex.allowed
   const ok = (m: string, e: string) => !allowed || (allowed[m] ?? []).includes(e)
-  const models = [...catalog.keys()].filter(m => !allowed || allowed[m]?.length)
+  // 只列至少有一个可用 effort 的模型：没有 effort 的模型选了也保存不了。
+  const models = [...catalog].filter(([m, es]) => [...es].some(e => ok(m, e))).map(([m]) => m)
+  const firstEffort = (m: string) => { const es = [...(catalog.get(m) ?? [])].filter(e => ok(m, e)), d = defaults.get(m); return d && es.includes(d) ? d : es[0] ?? null }
   const efforts = [...(catalog.get(cur.codex.default.model) ?? [])].filter(e => ok(cur.codex.default.model, e))
   const stale = form && base !== settings.revision
   const save = async () => {
@@ -83,7 +94,7 @@ function Models({ tick }: { tick: number }) {
     </div>}
     <h3>执行（Codex）</h3>
     <div className="form-grid">
-      <label>默认模型<select disabled={!editable} value={cur.codex.default.model ?? ''} onChange={e => set(v => { v.codex.default = e.target.value ? { model: e.target.value, effort: [...(catalog.get(e.target.value) ?? [])].find(x => ok(e.target.value, x)) ?? null } : { model: null, effort: null } })}>
+      <label>默认模型<select disabled={!editable} value={cur.codex.default.model ?? ''} onChange={e => set(v => { v.codex.default = e.target.value ? { model: e.target.value, effort: firstEffort(e.target.value) } : { model: null, effort: null } })}>
         <option value="">未设置（提交任务时必须指定）</option>{models.map(m => <option key={m} value={m}>{m}</option>)}</select></label>
       <label>默认推理强度（effort）<select disabled={!editable || !cur.codex.default.model} value={cur.codex.default.effort ?? ''} onChange={e => set(v => { v.codex.default.effort = e.target.value || null })}>
         {!cur.codex.default.model && <option value="">—</option>}{efforts.map(x => <option key={x} value={x}>{x}</option>)}</select></label>

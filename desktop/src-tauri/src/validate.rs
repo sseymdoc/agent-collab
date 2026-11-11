@@ -94,12 +94,12 @@ pub fn file_name(name: &str) -> String {
 }
 
 /// 主窗口只允许停留在随包分发的页面上：macOS/Linux 为 `tauri://localhost`，
-/// Windows 为 `http(s)://tauri.localhost`。
+/// Windows 为 `http://tauri.localhost`（`tauri.conf.json` 没有开 `useHttpsScheme`，也没有 `devUrl`，
+/// 开发运行同样从 frontendDist 加载）。协议与端口都要精确匹配：
+/// 带端口的同名主机是本机上任意进程都能监听的普通网页，不是随包页面。
 pub fn is_app_url(url: &Url) -> bool {
-    matches!(
-        (url.scheme(), url.host_str()),
-        ("tauri", Some("localhost")) | ("http" | "https", Some("tauri.localhost"))
-    )
+    url.port().is_none()
+        && matches!((url.scheme(), url.host_str()), ("tauri", Some("localhost")) | ("http", Some("tauri.localhost")))
 }
 
 #[cfg(test)]
@@ -225,7 +225,11 @@ mod tests {
         assert!(ok("tauri://localhost/"));
         assert!(ok("tauri://localhost/assets/index.js"));
         assert!(ok("http://tauri.localhost/"));
-        assert!(ok("https://tauri.localhost/index.html"));
+        assert!(ok("http://tauri.localhost/index.html"));
+        assert!(ok("http://tauri.localhost:80/")); // 缺省端口会被规范化掉
+        assert!(!ok("https://tauri.localhost/index.html"));
+        assert!(!ok("http://tauri.localhost:8080/"));
+        assert!(!ok("tauri://localhost:8080/"));
         assert!(!ok("https://example.com/"));
         assert!(!ok("http://localhost:8080/"));
         assert!(!ok("http://tauri.localhost.evil.com/"));

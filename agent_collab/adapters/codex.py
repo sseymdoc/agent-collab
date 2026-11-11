@@ -72,7 +72,11 @@ def model_catalog(argv, env=None, timeout=20, popen=subprocess.Popen):
 
     def reply(ident):
         while True:
-            line = lines.get(timeout=max(.1, deadline - time.monotonic()))
+            # 每行都核对截止时间：持续输出通知时队列从不为空，只靠 get 的超时永远等不到期。
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty()
+            line = lines.get(timeout=remaining)
             if line is None:
                 raise OSError('app-server closed its output')
             try:
@@ -82,7 +86,8 @@ def model_catalog(argv, env=None, timeout=20, popen=subprocess.Popen):
             if isinstance(message, dict) and message.get('id') == ident:
                 return message
 
-    threading.Thread(target=read, name='codex-model-list', daemon=True).start()
+    reader = threading.Thread(target=read, name='codex-model-list', daemon=True)
+    reader.start()
     try:
         send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'agent-collab', 'version': '1'}}})
         reply(1)
@@ -113,6 +118,13 @@ def model_catalog(argv, env=None, timeout=20, popen=subprocess.Popen):
             process.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             pass
+        reader.join(timeout=5)  # 进程结束后输出到达 EOF，读线程随之退出，再关闭管道
+        # 读线程仍卡在 read（子进程的后代还握着管道）时不关 stdout：关闭要等它释放缓冲区锁。
+        for stream in (process.stdin,) + (() if reader.is_alive() else (process.stdout,)):
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def classify_failure(text, returncode=None, abnormal=False):

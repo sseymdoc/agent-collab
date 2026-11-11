@@ -7,6 +7,7 @@
 ## 连接与凭据
 
 - 一条连接 = controller 地址 + 配对时得到的 `controller_id` + 本客户端的 `client_id`。连接的非机密信息保存在应用配置目录的 `connections.json`；`client_token` 只保存在系统凭据存储（macOS 钥匙串、Windows 凭据管理器），服务名 `agent-collab`，账户名 `<controller_id>/<client_id>`。
+- 同一应用配置目录只运行一个实例（目录里的 `instance.lock` 加跨进程排他锁）：连接记录与凭据的修改不会被另一个实例覆盖；第二个实例启动时提示已在运行并退出。
 - 凭据存储读写失败时命令返回 `secure_storage_unavailable`，不写入任何明文替代位置。
 - 页面拿不到 `client_token`：它不出现在命令返回值、事件、日志和 `connections.json` 里。
 - 地址必须是 `https://`；`http://` 只接受 loopback 主机。不跟随重定向。
@@ -23,10 +24,10 @@
 | `connections_list` | 无 | `{"connections": [connection...], "active": {"id", "epoch"} \| null}` | connection 为 `{"id", "name", "url", "controller_id", "client_id", "kind", "scopes", "paired_at"}` |
 | `connection_pair` | `{"url", "code", "name"}` | connection | `POST /clients/pair`（`kind: "desktop"`），凭据写入系统凭据存储后才保存连接 |
 | `connection_open` | `{"id"}` | `{"epoch", "identity", "controller"}` | 读取凭据，调用 `GET /client` 并核对 `controller_id`，成功后成为当前连接 |
-| `connection_close` | 无 | `{}` | 关闭当前连接与事件流，不删除连接 |
-| `connection_forget` | `{"id", "revoke"}` | `{"revoked"}` | `revoke` 为 true 时先调用 `DELETE /client`（失败不阻止本地删除，返回值如实给出）；删除凭据与连接记录 |
+| `connection_close` | `{"epoch"}` | `{}` | 关闭这一代次的连接与事件流（包括尚在核对中的打开），不删除连接；代次不是当前值时返回 `stale_connection`，不影响当前连接 |
+| `connection_forget` | `{"id", "revoke"}` | `{"revoked"}` | `revoke` 为 true 时先调用 `DELETE /client`（失败不阻止本地删除，返回值如实给出）；先删除连接记录再删除凭据，凭据删除失败时恢复连接记录并返回 `secure_storage_unavailable` |
 | `api_request` | `{"epoch", "method", "path", "body"?, "headers"?}` | `{"status", "body"}` | 请求 `<url>/api/v1<path>`；`path` 以 `/` 开头且不含 `..`；`headers` 只转发 `X-Coordinator-Token`；`body` 为 JSON 文本；响应体上限 16 MiB |
-| `stream_open` | `{"epoch", "cursor"}` | `{}` | 打开 `/events/stream?cursor=<cursor>`，经事件 `ac-sse` 转发 |
+| `stream_open` | `{"epoch", "cursor"}` | `{}` | 打开 `/events/stream?cursor=<cursor>`，经事件 `ac-sse` 转发；单帧（含未完成的缓冲）上限 16 MiB，超出时以 `closed`（`frame_too_large`）结束 |
 | `stream_close` | `{"epoch"}` | `{}` | 关闭事件流 |
 | `blob_save` | `{"epoch", "sha256", "name"}` | `{"path", "bytes"}` 或 `{"cancelled": true}` | 弹出系统“另存为”对话框；下载到同目录临时文件，SHA-256 相符后改名到所选路径，不符则删除并报错 |
 
@@ -34,7 +35,7 @@
 
 ## 权限隔离
 
-- 主窗口只加载随包分发的页面，不导航到外部地址；内容安全策略只允许自身资源与原生桥。
+- 主窗口只加载随包分发的页面（macOS 为 `tauri://localhost`，Windows 为 `http://tauri.localhost`，协议与端口精确匹配），不导航到其他地址；内容安全策略只允许自身资源与原生桥。
 - 原生桥命令只对主窗口开放。页面里展示的模型输出、日志、Markdown 与工件一律按文本渲染，不执行其中的脚本或 HTML，因此拿不到原生桥。
 - 外壳不提供任意文件读写、命令执行或 Shell 能力；唯一的文件写入是 `blob_save`，路径由系统对话框返回。
 - 关闭窗口只结束界面进程。controller 与节点的任务不受影响；重新打开后页面从 controller 读取当前状态。

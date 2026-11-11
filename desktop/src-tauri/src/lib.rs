@@ -158,6 +158,16 @@ impl Inner {
         Ok(())
     }
 
+    /// 页面关闭它持有的那一代连接（包括还在核对、尚未成为当前连接的那次打开）。
+    /// 旧页面状态晚到的关闭不会关掉已经切换过去的新连接。
+    fn close(&mut self, epoch: u64) -> Result<()> {
+        if self.epoch != epoch {
+            return Err(stale());
+        }
+        self.bump();
+        Ok(())
+    }
+
     fn close_if_active(&mut self, id: &str) {
         if self.active.as_ref().is_some_and(|a| a.id == id) {
             self.bump();
@@ -197,10 +207,8 @@ impl Shell {
         inner.current(epoch)?;
         let response = sent.map_err(net)?;
         let header = controller_header(&response);
-        if header.is_none() && response.status().is_server_error() {
-            // 没带身份头的 5xx 来自 controller 前面的反向代理（controller 重启期间的 502/503/504）：
-            // 按暂时不可达处理，不关闭连接。带了头但不一致，或其他状态码缺头，仍判为不是同一个 controller。
-            return Err(err("network", format!("controller 暂时不可达（HTTP {}）", response.status().as_u16())));
+        if from_proxy(header.as_deref(), response.status()) {
+            return Err(proxy_error(response.status()));
         }
         inner.verify(epoch, header.as_deref())?;
         Ok(response)
@@ -244,6 +252,17 @@ impl Shell {
 
 fn controller_header(response: &reqwest::Response) -> Option<String> {
     response.headers().get("x-controller-id")?.to_str().ok().map(str::to_owned)
+}
+
+/// 没带身份头的 5xx 来自 controller 前面的反向代理（controller 重启期间的 502/503/504）：
+/// 按暂时不可达处理，不关闭连接。带了头但不一致，或其他状态码缺头，仍判为不是同一个 controller。
+/// 所有核对 `X-Controller-Id` 的地方都先过这一关，行为才一致。
+fn from_proxy(header: Option<&str>, status: StatusCode) -> bool {
+    header.is_none() && status.is_server_error()
+}
+
+fn proxy_error(status: StatusCode) -> BridgeError {
+    err("network", format!("controller 暂时不可达（HTTP {}）", status.as_u16()))
 }
 
 /// 读完整个响应体，上限 16 MiB。
@@ -302,6 +321,19 @@ fn save(app: &AppHandle, _held: &Inner, connections: &[Connection]) -> Result<()
     let bytes = serde_json::to_vec_pretty(&json!({ "connections": connections })).map_err(io)?;
     std::fs::write(&tmp, bytes).map_err(io)?;
     std::fs::rename(&tmp, &path).map_err(io)
+}
+
+/// 同一配置目录只允许一个实例：`connections.json` 的读-改-写、它的临时文件和凭据增删只在进程内串行，
+/// 两个实例同时配对或忘记会互相覆盖记录。锁在进程退出时由系统释放，崩溃也不会留下死锁。
+/// 已被别的实例持有时返回 None。
+fn instance_lock(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("instance.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 fn find(app: &AppHandle, held: &Inner, id: &str) -> Result<Connection> {
@@ -429,10 +461,14 @@ async fn connection_open(app: AppHandle, shell: State<'_, Shell>, id: String) ->
     let base = validate::base_url(&conn.url).map_err(invalid)?;
     let token = Token(credential(&conn, |entry| entry.get_password()).await?);
     let response = shell.http.get(format!("{base}{API}/client")).bearer_auth(&token.0).send().await.map_err(net)?;
-    if controller_header(&response).as_deref() != Some(conn.controller_id.as_str()) {
+    let status = response.status();
+    let header = controller_header(&response);
+    if from_proxy(header.as_deref(), status) {
+        return Err(proxy_error(status));
+    }
+    if header.as_deref() != Some(conn.controller_id.as_str()) {
         return Err(mismatch());
     }
-    let status = response.status();
     let body = read_body(response).await?;
     if status != StatusCode::OK {
         return Err(http_error("打开连接失败", status, &body));
@@ -451,9 +487,9 @@ async fn connection_open(app: AppHandle, shell: State<'_, Shell>, id: String) ->
 }
 
 #[tauri::command]
-fn connection_close(shell: State<'_, Shell>) -> Value {
-    shell.lock().bump();
-    json!({})
+fn connection_close(shell: State<'_, Shell>, epoch: u64) -> Result<Value> {
+    shell.lock().close(epoch)?;
+    Ok(json!({}))
 }
 
 #[tauri::command]
@@ -471,15 +507,29 @@ async fn connection_forget(app: AppHandle, shell: State<'_, Shell>, id: String, 
             revoked = shell.revoke(&base, Some(&conn.controller_id), &Token(secret)).await;
         }
     }
-    credential(&conn, |entry| match entry.delete_credential() {
+    // 先删连接记录、再删凭据，凭据删不掉时把记录放回：任何一步失败，列表里留下的连接都还有凭据可用，
+    // 可以再次“忘记”。反过来的顺序会在保存失败时留下一条看得见、却打不开的连接。
+    {
+        let mut inner = shell.lock();
+        let remaining: Vec<Connection> = load(&app, &inner)?.into_iter().filter(|c| c.id != id).collect();
+        save(&app, &inner, &remaining)?;
+        inner.close_if_active(&id); // 删除期间它可能刚被打开
+    }
+    let deleted = credential(&conn, |entry| match entry.delete_credential() {
         Err(keyring::Error::NoEntry) => Ok(()), // 凭据本来就不在
         other => other,
     })
-    .await?;
-    let mut inner = shell.lock();
-    let remaining: Vec<Connection> = load(&app, &inner)?.into_iter().filter(|c| c.id != id).collect();
-    save(&app, &inner, &remaining)?;
-    inner.close_if_active(&id); // 删除期间它可能刚被打开
+    .await;
+    if deleted.is_err() {
+        let inner = shell.lock();
+        let _ = load(&app, &inner).and_then(|mut list| {
+            if !list.iter().any(|c| c.id == conn.id) {
+                list.push(conn.clone());
+            }
+            save(&app, &inner, &list)
+        });
+    }
+    deleted?;
     Ok(json!({ "revoked": revoked }))
 }
 
@@ -569,8 +619,8 @@ impl Stream {
             Err(e) => return self.closed(net(e).message),
         };
         let header = controller_header(&response);
-        if header.is_none() && response.status().is_server_error() {
-            return self.closed(format!("http_{}", response.status().as_u16())); // 反向代理的 5xx，同 send()
+        if from_proxy(header.as_deref(), response.status()) {
+            return self.closed(format!("http_{}", response.status().as_u16()));
         }
         if header.as_deref() != Some(active.controller_id.as_str()) {
             self.closed("controller_mismatch");
@@ -597,6 +647,10 @@ impl Stream {
                 Err(e) => return self.closed(net(e).message),
             };
             for frame in parser.push(&chunk) {
+                // 一帧可能在同一块里完成并被取走，pending() 看不到它；交付前单独限制。
+                if frame.size() > MAX_BODY {
+                    return self.closed("frame_too_large");
+                }
                 let (kind, id, ty, data) = classify(frame);
                 if !self.emit(kind, id, Some(ty), Some(data)) || kind == "unauthorized" {
                     return;
@@ -807,9 +861,21 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(shell)
         .plugin(navigation_guard())
-        .setup(|_app| {
+        .setup(|app| {
+            match instance_lock(&app.path().app_config_dir()?)? {
+                Some(lock) => {
+                    app.manage(lock); // 持有到进程结束
+                }
+                None => {
+                    rfd::MessageDialog::new()
+                        .set_title("Agent Collab")
+                        .set_description("Agent Collab 已经在运行，请切换到已打开的窗口。")
+                        .show();
+                    std::process::exit(0);
+                }
+            }
             #[cfg(feature = "automation")]
-            automation::grant(_app)?;
+            automation::grant(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -903,6 +969,44 @@ mod tests {
     }
 
     #[test]
+    fn close_only_affects_its_own_epoch() {
+        let (mut inner, old) = connected();
+        let new = inner.bump();
+        inner.active = Some(active());
+        // 旧页面状态晚到的关闭被拒绝，新连接不受影响。
+        assert_eq!(code(inner.close(old)), "stale_connection");
+        assert_eq!(inner.epoch, new);
+        assert!(inner.active.is_some());
+
+        assert_eq!(code(inner.close(new)), "ok");
+        assert_eq!(inner.epoch, new + 1);
+        assert!(inner.active.is_none());
+    }
+
+    #[test]
+    fn second_instance_cannot_take_the_lock() {
+        let dir = scratch_dir("instance");
+        let first = instance_lock(&dir).unwrap();
+        assert!(first.is_some());
+        assert!(instance_lock(&dir).unwrap().is_none());
+        drop(first); // 进程退出时同样释放
+        assert!(instance_lock(&dir).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_headerless_5xx_counts_as_proxy_outage() {
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::SERVICE_UNAVAILABLE, StatusCode::GATEWAY_TIMEOUT] {
+            assert!(from_proxy(None, status));
+            // 带了身份头的 5xx 来自 controller 本身，照常核对身份。
+            assert!(!from_proxy(Some("ctl-b"), status));
+        }
+        for status in [StatusCode::OK, StatusCode::UNAUTHORIZED, StatusCode::NOT_FOUND] {
+            assert!(!from_proxy(None, status));
+        }
+    }
+
+    #[test]
     fn late_response_from_old_epoch_is_dropped_without_touching_the_new_connection() {
         let (mut inner, old) = connected();
         let new = inner.bump();
@@ -971,6 +1075,7 @@ mod tests {
             serde_json::to_value(stale()).unwrap(),
             json!({ "code": "stale_connection", "message": "连接已切换或关闭，这次请求被丢弃" })
         );
+        assert_eq!(proxy_error(StatusCode::BAD_GATEWAY).code, "network");
         let e = http_error("配对失败", StatusCode::BAD_REQUEST, br#"{"error":{"code":"invalid","message":"bad code"}}"#);
         assert_eq!((e.code, e.message.as_str()), ("invalid", "配对失败（HTTP 400）：bad code"));
         assert_eq!(http_error("x", StatusCode::BAD_GATEWAY, b"<html>").code, "network");

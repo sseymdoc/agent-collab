@@ -22,7 +22,7 @@
 
 凭据：--profile（缺省 default；client pair 写入的客户端凭据），或 --token-file（controller 本机的管理令牌）。
 变更请求缺 request_id 时自动生成。证书始终校验，http:// 仅限 loopback。
-退出码：0 成功；2 请求被拒绝；3 连接、凭据或 controller 身份问题；4 等待超时；5 任务以失败、取消或需人工处理结束。
+退出码：0 成功；1 本地错误；2 请求被拒绝或参数格式错误；3 连接、凭据（HTTP 401）或 controller 身份问题；4 等待超时；5 任务以失败、取消或需人工处理结束。
 """
 import argparse
 import http.client
@@ -62,6 +62,14 @@ def fail(code, message, exit_code=3):
     raise SystemExit(exit_code)
 
 
+class Unreachable(Exception):
+    """controller 暂时不可达（连接失败，或前置代理代答的 5xx）。等待类命令据此重试，其余命令在 main 里以退出码 3 结束。"""
+
+
+def rejected(status):
+    return 3 if status == 401 else 2
+
+
 def _open(url, token, method, path, body=None, ca_file=None, controller_id=None, content_type='application/json', timeout=30, extra=None):
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ('http', 'https') or (u.scheme == 'http' and u.hostname not in LOOPBACK):
@@ -80,10 +88,17 @@ def _open(url, token, method, path, body=None, ca_file=None, controller_id=None,
         response = e
     except http.client.InvalidURL:
         fail('invalid', '请求路径含有空格或控制字符：' + path, 2)
-    except (urllib.error.URLError, OSError):
-        fail('network', 'controller 不可达，或 TLS 校验失败')
+    except (urllib.error.URLError, OSError) as exc:
+        if any(isinstance(e, ssl.SSLCertVerificationError) for e in (exc, getattr(exc, 'reason', None))):
+            fail('network', 'TLS 校验失败')  # 证书不对是身份问题，重试不会变好
+        raise Unreachable() from exc
+    seen = response.headers.get('X-Controller-Id')
+    if seen is None and response.getcode() >= 500:
+        # 不带 controller 身份的 5xx 来自前置代理（例如 controller 重启期间）：按网络问题处理，不当作身份不符。
+        response.close()
+        raise Unreachable()
     # 配对得到的凭据绑定了 controller 身份：应答必须来自同一个 controller（protocol §12.1）。
-    if controller_id and response.headers.get('X-Controller-Id') != controller_id:
+    if controller_id and seen != controller_id:
         response.close()
         fail('controller_mismatch', '应答不是来自配对时的 controller；凭据没有再发送，检查地址或重新配对')
     return response
@@ -115,18 +130,21 @@ def profile_path(name):
 
 class Conn:
     """一条已认证的 controller 连接：客户端凭据（绑定 controller 身份）或本机管理令牌。"""
-    def __init__(self, a):
-        token_file = a.token_file or os.environ.get('AGENT_COLLAB_TOKEN_FILE')
+    def __init__(self, a, profile_only=False):
+        token_file = None if profile_only else a.token_file or os.environ.get('AGENT_COLLAB_TOKEN_FILE')
         if token_file:
             self.url, self.ca_file, self.controller_id = a.url or DEFAULT_URL, a.ca_file, None
-            self.token = open(token_file, encoding='utf-8').read().strip()
+            self.token = Path(token_file).read_text(encoding='utf-8').strip()
             return
         path = profile_path(a.profile)
         if not path.is_file():
             raise SystemExit('没有客户端凭据（%s）。先运行 agent-collab client pair --url <地址> --code <配对码>，'
                              '或在 controller 本机用 --token-file 指定管理令牌' % path)
         saved = json.loads(path.read_text(encoding='utf-8'))
-        self.url, self.token, self.controller_id = a.url or saved['url'], saved['token'], saved['controller_id']
+        # 凭据只发往配对时的地址：X-Controller-Id 要等应答回来才能核对，那时凭据已经送出。地址变了就重新配对。
+        if a.url and a.url.rstrip('/') != saved['url']:
+            raise SystemExit('profile %s 配对的地址是 %s；凭据不会发往 --url 指定的其他地址，地址变了请重新配对' % (a.profile, saved['url']))
+        self.url, self.token, self.controller_id = saved['url'], saved['token'], saved['controller_id']
         self.ca_file = a.ca_file or saved.get('ca_file')
 
     def send(self, method, path, data=None):
@@ -139,7 +157,7 @@ class Conn:
         status, body = self.send(method, path, data)
         if not 200 <= status < 300:
             out({'http_status': status, 'body': body})
-            raise SystemExit(3 if status == 401 else 2)
+            raise SystemExit(rejected(status))
         return body
 
     def raw(self, method, path, body=None, timeout=120):
@@ -175,18 +193,18 @@ def _client(argv, submit):
     a = ap.parse_args(argv)
     conn = Conn(a)
     if submit:
-        method, path, data = 'POST', '/jobs', json.load(open(a.job_file, encoding='utf-8-sig'))
+        method, path, data = 'POST', '/jobs', json.loads(Path(a.job_file).read_text(encoding='utf-8-sig'))
     else:
         method, path = a.method, a.path
         data = None
         if a.data:
-            data = json.load(open(a.data[1:], encoding='utf-8-sig')) if a.data.startswith('@') else json.loads(a.data)
+            data = json.loads(Path(a.data[1:]).read_text(encoding='utf-8-sig')) if a.data.startswith('@') else json.loads(a.data)
     if method != 'GET' and isinstance(data, dict):
         data.setdefault('request_id', str(uuid.uuid4()))
     extra = {'headers': {'X-Coordinator-Token': a.coordinator_token}} if not submit and a.coordinator_token else {}
     status, body = request(conn.url, conn.token, method, path, data, conn.ca_file, conn.controller_id, **extra)
     out({'http_status': status, 'body': body})
-    return 0 if 200 <= status < 300 else 2  # 3xx 不算送达
+    return 0 if 200 <= status < 300 else rejected(status)  # 3xx 不算送达
 
 
 def _client_command(argv):
@@ -225,7 +243,11 @@ def _client_command(argv):
         return 0
     revoked = None
     if a.revoke:
-        revoked = Conn(a).send('DELETE', '/client')[0] == 200
+        # 撤销的是这份客户端凭据自己：只用 profile 里的凭据，不用 --token-file 或环境里的管理令牌。
+        revoked = Conn(a, profile_only=True).send('DELETE', '/client')[0] == 200
+        if not revoked:
+            out({'profile': a.profile, 'forgotten': False, 'revoked': False})
+            return 2  # 撤销没成功就保留凭据文件，以便重试
     if path.exists():
         path.unlink()
     out({'profile': a.profile, 'forgotten': True, 'revoked': revoked})
@@ -267,10 +289,13 @@ def summarize(conn, job):
             rounds.append({'job_id': c['job_id'], 'status': c['status'], 'decision': report.get('decision'), 'notes': report.get('notes'),
                            'node_id': next((x['node_id'] for x in reversed(c.get('attempts', []))), None)})
     acceptance = job['acceptance']['status']
-    if job['status'] != 'completed':
-        outcome = 'running' if job['status'] not in RESTING else 'needs_attention'
+    if job['status'] not in RESTING:
+        outcome = 'running'
     elif any(r['status'] not in ENDED for r in rounds):
+        # 失败或待对账也可能触发协调回合；回合结束前它可能新建修复修订，不能先判为需人工处理。
         outcome = 'awaiting_coordination'
+    elif job['status'] != 'completed':
+        outcome = 'needs_attention'
     elif acceptance in ('rework', 'blocked'):
         outcome = 'needs_attention'
     elif job['contract']['publish']['requires_acceptance'] and acceptance != 'passed':
@@ -312,11 +337,17 @@ def finish(summary, line=False):
 
 
 def wait(conn, job_id, timeout, interval=2.0):
-    deadline = time.monotonic() + timeout
+    deadline, summary = time.monotonic() + timeout, None
     while True:
-        summary = settled_state(conn, job_id)
-        if summary['settled']:
-            return finish(summary)
+        try:
+            summary = settled_state(conn, job_id)
+        except Unreachable:
+            # controller 重启或代理暂时 5xx：到期前继续等；到期时还从未取到摘要则按不可达结束。
+            if summary is None and time.monotonic() >= deadline:
+                raise
+        else:
+            if summary['settled']:
+                return finish(summary)
         if time.monotonic() >= deadline:
             out(dict(summary, timed_out=True))
             return 4
@@ -326,7 +357,12 @@ def wait(conn, job_id, timeout, interval=2.0):
 def stream(conn, cursor):
     """事件流：产出事件（或 None 表示心跳/重连）。断线从上次序号续读；游标过期时从 controller 给出的最小序号继续。"""
     while True:
-        response = _open(conn.url, conn.token, 'GET', '/events/stream?cursor=%d' % cursor, None, conn.ca_file, conn.controller_id, timeout=60)
+        try:
+            response = _open(conn.url, conn.token, 'GET', '/events/stream?cursor=%d' % cursor, None, conn.ca_file, conn.controller_id, timeout=60)
+        except Unreachable:  # controller 重启或代理暂时 5xx：稍后从同一游标重连
+            time.sleep(2)
+            yield None
+            continue
         if response.getcode() != 200:
             response.close()
             if response.getcode() in (401, 403):
@@ -348,7 +384,12 @@ def stream(conn, cursor):
                     if kind == 'unauthorized':
                         fail('unauthorized', '凭据已被撤销')
                     if kind == 'snapshot_required':
-                        cursor = json.loads(data)['min_seq']
+                        # min_seq 是仍保留的第一条，而流按 seq > cursor 续读：先补读从它开始的一页，再从补读到的位置续接。
+                        minimum = json.loads(data)['min_seq']
+                        backlog = conn.call('GET', '/events?after=%d&limit=1000' % (minimum - 1))['events']
+                        for event in backlog:
+                            yield event
+                        cursor = backlog[-1]['seq'] if backlog else minimum
                         break
                     yield json.loads(data) if kind and data else None
                     kind = data = None
@@ -380,8 +421,11 @@ def follow(conn, job_id, timeout):
         # 相关事件到达时立即核对；此外每 10 秒核对一次，事件丢失或游标跳过时也能结束。
         if relevant or time.monotonic() - checked > 10:
             checked = time.monotonic()
-            summary = settled_state(conn, job_id)
-            if summary['settled']:
+            try:
+                summary = settled_state(conn, job_id)
+            except Unreachable:
+                summary = None  # 暂时不可达：事件流在重连，到期前继续等
+            if summary and summary['settled']:
                 return finish(summary, line=True)
         if time.monotonic() >= deadline:
             print(json.dumps({'summary': dict(settled_state(conn, job_id), timed_out=True)}, ensure_ascii=False), flush=True)
@@ -405,6 +449,7 @@ def _submit(argv):
     ap.add_argument('--effort')
     ap.add_argument('--os', action='append', default=[], choices=('windows', 'linux', 'macos'))
     ap.add_argument('--dry-run', action='store_true', help='只输出将提交的契约与解析后的模型，不创建任务')
+    ap.add_argument('--request-id', help='幂等键（UUID）；网络失败后用同一个值重试不会重复创建任务')
     ap.add_argument('--wait', action='store_true')
     ap.add_argument('--timeout', type=float, default=3600)
     connection_args(ap)
@@ -426,11 +471,13 @@ def _submit(argv):
         out(drafted)
         return 0
     # 带上草拟时的设置版本：期间默认模型被改动则被拒绝，不会按没看过的解析结果受理。
-    status, body = conn.send('POST', '/jobs', {'title': drafted['title'], 'contract': drafted['contract'],
-                                               'expected_settings_revision': drafted['settings_revision']})
+    request = {'title': drafted['title'], 'contract': drafted['contract'], 'expected_settings_revision': drafted['settings_revision']}
+    if a.request_id:
+        request['request_id'] = a.request_id
+    status, body = conn.send('POST', '/jobs', request)
     if not 200 <= status < 300 or not a.wait:
         out({'http_status': status, 'body': body, 'warnings': drafted['warnings']})
-        return 0 if 200 <= status < 300 else 2
+        return 0 if 200 <= status < 300 else rejected(status)
     return wait(conn, body['job_id'], a.timeout)
 
 
@@ -569,7 +616,10 @@ def main(argv=None):
     if cmd in MODULES:
         return importlib.import_module(MODULES[cmd]).main(rest) or 0
     if cmd in COMMANDS:
-        return COMMANDS[cmd](rest) or 0
+        try:
+            return COMMANDS[cmd](rest) or 0
+        except Unreachable:
+            fail('network', 'controller 不可达')
     if cmd in ('install', 'doctor', 'service'):
         from . import installer
         return installer.main(([cmd] if cmd != 'install' else []) + rest)

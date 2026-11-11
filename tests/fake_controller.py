@@ -53,6 +53,7 @@ class FakeController:
         self.lease_ttl_s = 5
         self.features = None  # 列表：模拟声明了 §12 能力的 controller；None：升级前的 controller
         self.registrations = []
+        self.on_register = None  # 注册请求到达时调用：模拟注册进行中发生的并发变化
 
     def add(self, steps=None, manifest=None, summary=None, side_effects='none', publish='auto', integration=None):
         sha = p.manifest_sha256(manifest) if manifest else None
@@ -116,6 +117,8 @@ class FakeController:
         value = json.loads(body or b'{}')
         if path == '/nodes/register':
             self.registrations.append(value)
+            if self.on_register:
+                self.on_register()
             return self.response(200, dict(node=value, authority_generation=self.generation,
                 config=dict(heartbeat_s=self.heartbeat_s, lease_ttl_s=self.lease_ttl_s),
                 **({} if self.features is None else {'features': self.features})))

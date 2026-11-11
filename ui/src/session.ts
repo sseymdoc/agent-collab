@@ -6,4 +6,3 @@ let current: { identity: J; controller: J } | null = null
 export function setSession(v: { identity: J; controller: J } | null) { current = v }
 export const session = () => current
 export const can = (scope: string) => !!current?.identity?.scopes?.includes(scope)
-export const has = (feature: string) => !!current?.controller?.features?.includes(feature)

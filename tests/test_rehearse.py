@@ -2,6 +2,9 @@
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
+import uuid
+from unittest.mock import patch
 
 from agent_collab import rehearse
 from agent_collab.controller import backup
@@ -92,3 +95,43 @@ class RehearseTests(ControllerCase):
         with self.assertRaises(ValueError):
             rehearse.rehearse(self.temp / 'backup', self.temp / 'backup' / 'inside')
         self.assertEqual(rehearse.main(['--backup', str(self.temp / 'missing'), '--work', str(self.temp / 'w2')]), 2)
+
+    def test_legacy_settings_cannot_be_confirmed_without_the_production_config(self):
+        self.old_deployment()
+        backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        report = rehearse.rehearse(self.temp / 'backup', self.temp / 'work')
+        detail = next(c for c in report['checks'] if c['id'] == 'model_settings')
+        self.assertEqual((detail['ok'], detail['detail']['unconfirmed'], report['ok']), (False, 'config_required', False))
+
+    def test_lost_event_rows_are_detected_even_when_the_count_grows(self):
+        self.old_deployment()
+        backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        config = self.temp / 'config.json'
+        config.write_text(json.dumps(tc.CONFIG), encoding='utf-8')
+        real = rehearse.restore
+
+        def lossy(data, source):
+            generation = real(data, source)
+            with sqlite3.connect(str(data / 'controller.db')) as db:
+                first = db.execute('SELECT MIN(seq) FROM events').fetchone()[0]
+                db.execute('DELETE FROM events WHERE seq=?', (first,))
+                for _ in range(3):  # 补上更多新事件：只比较条数时会被掩盖
+                    db.execute("INSERT INTO events(event_id, job_id, data) VALUES(?, NULL, '{}')", (str(uuid.uuid4()),))
+            db.close()
+            return generation
+        with patch.object(rehearse, 'restore', lossy):
+            report = rehearse.rehearse(self.temp / 'backup', self.temp / 'work', config)
+        self.assertFalse(next(c for c in report['checks'] if c['id'] == 'event_history_kept')['ok'])
+
+    def test_report_may_not_overwrite_the_backup_set_or_the_config(self):
+        self.job()
+        backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        config = self.temp / 'config.json'
+        config.write_text(json.dumps(tc.CONFIG), encoding='utf-8')
+        sources = digest(self.temp / 'backup'), config.read_bytes()
+        for n, out in enumerate((self.temp / 'backup' / 'backup-manifest.json', config)):
+            with patch('sys.stderr'):
+                code = rehearse.main(['--backup', str(self.temp / 'backup'), '--work', str(self.temp / ('w%d' % n)),
+                                      '--config', str(config), '--out', str(out)])
+            self.assertEqual(code, 2)
+        self.assertEqual((digest(self.temp / 'backup'), config.read_bytes()), sources)

@@ -256,10 +256,41 @@ class PreflightTests(unittest.TestCase):
         self.seed()
         canary = 'fake-command-credential-321'
         self.write(self.scans / 'command.json', {'command': ['launcher.py', '--token', canary]})
-        config = json.loads((self.node / 'agent.json').read_text())
+        config = json.loads((self.node / 'agent.json').read_text(encoding='utf-8'))
         config['codex_command'] = ['codex', '--password', canary]
         self.write(self.node / 'agent.json', config)
         self.assertNotIn(canary, json.dumps(self.report()))
+
+    def test_env_blocks_api_keys_and_deep_json_do_not_leak_into_references(self):
+        self.seed()
+        env_value, key_value, flag_value = 'fake-env-value-4242', 'fake-api-key-4343', 'fake-flag-key-4444'
+        (self.scans / 'env.json').write_text(json.dumps({'env': {'LAUNCH_HINT': 'launcher.py ' + env_value}, 'api_key': key_value,
+                                                         'command': ['launcher.py', '--api-key', flag_value]}, indent=2), encoding='utf-8')
+        (self.scans / 'notes.txt').write_text('launcher.py --api-key %s\nlauncher.py api_key=%s\n' % (flag_value, key_value), encoding='utf-8')
+        (self.scans / 'deep.json').write_text('[' * 100000 + ']' * 100000, encoding='utf-8')
+        report = self.report()
+        text = json.dumps(report)
+        for canary in (env_value, key_value, flag_value):
+            self.assertNotIn(canary, text)
+        self.assertIn('notes.txt', {Path(r['file']).name for r in report['legacy']['references']})
+        self.assertTrue(any(r['code'] == 'json_unreadable' and 'deep.json' in r['detail'] for r in report['risks']))
+        self.assertNotIn('deep.json', {Path(r['file']).name for r in report['legacy']['references']})
+
+    def test_symlinked_backup_archive_does_not_count_as_a_backup_set(self):
+        self.seed(idle=True)
+        backups = self.controller.parent / 'backups'
+        packed = backups / '20260101T000000000000Z-abcdef012345'
+        packed.mkdir(parents=True)
+        target = self.root / 'elsewhere.tar'
+        target.write_bytes(b'tar bytes')
+        try:
+            (packed / 'backup.tar').symlink_to(target)
+        except OSError:
+            self.skipTest('symlink unavailable')
+        self.write(packed / 'COMPLETE.json', dict(id=packed.name, created_at='2026-01-01T00:00:00.000Z', db_sha256='ab' * 32))
+        report = self.report()
+        self.assertNotIn(packed.name, {s['name'] for s in report['controller']['backups']['sets']})
+        self.assertIn('backup_set_unrecognized', {r['code'] for r in report['risks']})
 
     def test_plan_follows_observed_objects(self):
         self.seed()
@@ -342,7 +373,7 @@ class PreflightTests(unittest.TestCase):
         output = self.root / 'report.json'
         code, out, _ = self.call_main(['--node-data-dir', str(self.node), '--node-data-dir', str(other), '--out', str(output)])
         self.assertEqual((code, out), (0, ''))
-        self.assertEqual(json.loads(output.read_text())['conflicts'][0]['code'], 'duplicate_node_id')
+        self.assertEqual(json.loads(output.read_text(encoding='utf-8'))['conflicts'][0]['code'], 'duplicate_node_id')
         self.assertEqual(self.call_main(['--not-an-option'])[0], 2)
         self.assertEqual(self.call_main(['--out'])[0], 2)
 

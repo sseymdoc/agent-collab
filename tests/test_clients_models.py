@@ -99,6 +99,12 @@ class ClientAuthTests(ClientCase):
         self.assertEqual(paired['scopes'], ['read', 'tasks'])
         for bad in ({'role': 'root'}, {'scopes': []}, {'scopes': ['read', 'everything']}, {'role': 'owner', 'scopes': ['read']}, {}):
             self.call('POST', '/clients/codes', dict(bad, request_id=uid()), token=owner, status=400)
+        # maintain 只能签发不超过自己权限的配对码，不能借配对码换取 owner。
+        maintainer = self.pair(role=None, scopes=['maintain'])['client_token']
+        self.assertEqual(self.call('POST', '/clients/codes', {'request_id': uid(), 'role': 'owner'}, token=maintainer, status=403)['error']['details'],
+                         {'required_scope': 'read'})
+        self.assertEqual(self.call('POST', '/clients/codes', {'request_id': uid(), 'scopes': ['maintain']}, token=maintainer, status=201)['scopes'],
+                         ['maintain'])
 
     def test_every_route_checks_the_granted_scope(self):
         worker = self.node('worker')
@@ -418,6 +424,9 @@ class RepairInheritanceTests(ClientCase):
         outside = dict(revision, request_id=uid(), contract=contract(harness='codex', harness_params={'model': B, 'effort': 'high'}))
         self.call('POST', '/jobs/' + job['job_id'] + '/cancel', {'request_id': uid(), 'expected_version': job['version']})
         self.assertEqual(self.call('POST', '/jobs', outside, status=400)['error']['details'], {'reason': 'model_not_allowed'})
+        # 另一模型即使也在冻结的许可范围内（B/low），修订也不能借此换模型。
+        switch = dict(revision, request_id=uid(), contract=contract(harness='codex', harness_params={'model': B, 'effort': 'low'}))
+        self.assertEqual(self.call('POST', '/jobs', switch, status=400)['error']['details'], {'reason': 'model_not_allowed'})
 
     def test_repair_is_refused_when_the_root_froze_no_model(self):
         job, mac, attempt, checkpoint = self.round()  # 根是不调用模型的任务，受理时没有默认模型
@@ -645,3 +654,29 @@ class AgentCatalogTests(unittest.TestCase):
         self.cycle()
         self.cycle()
         self.assertEqual((len(self.calls), len(self.fake.registrations)), (1, count))  # 周期内不重复探测，目录没变不重新注册
+
+    def test_controller_upgraded_during_an_outage_is_renegotiated_on_reconnect(self):
+        self.cycle()
+        self.cycle()
+        self.assertNotIn('models', self.fake.registrations[-1]['capabilities'])
+        self.fake.offline = True  # 旧 controller 停机，原地升级；恢复代次不变
+        self.cycle()
+        self.fake.offline, self.fake.features = False, list(p.FEATURES)
+        self.cycle(lambda: 'models' in self.fake.registrations[-1]['capabilities'])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_catalog_refreshed_while_registering_is_sent_on_the_next_registration(self):
+        self.fake.features = list(p.FEATURES)
+        self.cycle(lambda: 'models' in self.fake.registrations[-1]['capabilities'])
+        newer = {'status': 'ok', 'source': 'test', 'fetched_at': None, 'cli_version': None, 'reason': None,
+                 'models': [{'id': 'm-two', 'efforts': ['high'], 'default_effort': None}]}
+
+        def refreshed_meanwhile():
+            # 后台探测恰在注册请求途中完成：它置的 registered = False 会被注册结束时覆盖。
+            self.fake.on_register = None
+            self.agent.models = dict(self.agent.models, codex=newer)
+            self.agent.catalog_revision = getattr(self.agent, 'catalog_revision', 0) + 1  # 后台线程在目录变化时做的事
+            self.agent.registered = False
+        self.fake.on_register = refreshed_meanwhile
+        self.agent.registered = False
+        self.cycle(lambda: self.fake.registrations[-1]['capabilities']['models']['codex']['models'] == newer['models'])

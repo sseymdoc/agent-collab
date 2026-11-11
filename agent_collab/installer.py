@@ -183,7 +183,7 @@ def write_json(path, value):
 def current_version(prefix, system=None):
     if (system or platform.system()) == 'Windows':
         pointer = prefix / 'current.txt'
-        return validate_version(pointer.read_text().strip()) if pointer.exists() else None
+        return validate_version(pointer.read_text(encoding='utf-8').strip()) if pointer.exists() else None
     pointer = prefix / 'current'
     if not pointer.is_symlink():
         if pointer.exists():
@@ -405,7 +405,7 @@ def render_services(config, directory, user_sid=None):
         name = 'agent-collab-' + kind
         argv = [config['python'], '-B', '-m'] + component_argv(config, kind)
         if config['system'] == 'Linux':
-            template = (directory / 'installer/services' / (name + '.service')).read_text()
+            template = (directory / 'installer/services' / (name + '.service')).read_text(encoding='utf-8')
             # systemd 的 WorkingDirectory= 不做引号解析（带引号会被判为非绝对路径而拒绝加载），
             # 取整行余下部分为路径；只需转义 % 说明符。ECS 实装时发现。
             if '\n' in str(directory):
@@ -513,7 +513,7 @@ class Services:
                     data = plistlib.loads(path.read_bytes())
                     owned = Path(data.get('WorkingDirectory', '/')).parent == self.prefix / 'versions'
                 else:
-                    owned = path.read_text().splitlines()[0] == '# agent-collab prefix: ' + str(self.prefix)
+                    owned = path.read_text(encoding='utf-8').splitlines()[0] == '# agent-collab prefix: ' + str(self.prefix)
                 if not owned:
                     raise ValueError('service name belongs to another installation: ' + str(path))
 
@@ -687,7 +687,7 @@ import json, os, sys
 sys.dont_write_bytecode = True
 prefix = Path(__file__).resolve().parent
 if os.name == 'nt':
-    version = (prefix / 'current.txt').read_text().strip()
+    version = (prefix / 'current.txt').read_text(encoding='utf-8').strip()
     if not version or Path(version).name != version or version in ('.', '..'):
         raise SystemExit('Invalid current.txt')
     current = prefix / 'versions' / version

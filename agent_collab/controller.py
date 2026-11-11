@@ -484,6 +484,10 @@ class App:
             if root_id and self.store.get('root', root_id):
                 frozen = self.root_policy(root_id)
                 base, source, revision = frozen['codex'], 'legacy_compat' if frozen.get('legacy') else 'root_frozen', frozen['settings_revision']
+                # 同一根的后续修订模型不变（ADR 0002）；即使另一模型也在冻结的许可范围内，也不能借修订换模型。
+                asked = value.get('harness_params', {}).get('model')
+                if asked is not None and base['model'] is not None and asked != base['model']:
+                    raise d.PolicyError('model_not_allowed', 'revisions of a work package keep the model frozen at its root')
             else:
                 settings = self.model_settings()
                 base = dict(settings['codex']['default'], allowed=settings['codex']['allowed'])
@@ -1382,6 +1386,8 @@ class App:
             if self.store.get('client_code_request', ident):
                 raise APIError('conflict', 'request_id was already used to issue a pairing code')
             scopes = client_scopes(data.get('role'), data.get('scopes'))
+            for scope in scopes:
+                self.allow(identity, scope)  # 客户端只能签发不超过自己权限的配对码，否则 maintain 即可换取 owner
             ttl = data.get('ttl_s', 600)
             code = issue_client_code(self.store, scopes, ttl, now)
             self.store.put('client_code_request', ident, {'at': d.timestamp(now)})

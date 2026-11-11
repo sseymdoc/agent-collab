@@ -1,6 +1,6 @@
 # 给 Claude 与其他 Agent 的集成说明
 
-自动化客户端用与桌面端相同的 API 和授权提交工作、观察进展、读取检查与成果。入口是随同一版本分发的 `agent-collab` 命令；每条命令的输出都是 JSON。协议细节见 `docs/protocol.md` §12。
+自动化客户端用与桌面端相同的 API 和授权提交工作、观察进展、读取检查与成果。入口是随同一版本分发的 `agent-collab` 命令：命令结果（包括被 controller 拒绝时的应答）以 JSON 写到标准输出，连接与凭据错误以 `{"error": {...}}` 写到标准错误；本地参数错误（缺少凭据文件、参数格式不对等）是标准错误上的一行文本，按退出码判断即可。协议细节见 `docs/protocol.md` §12。
 
 ## 一次性准备
 
@@ -16,7 +16,7 @@ agent-collab controller client-code --data-dir <controller 数据目录> --role 
 agent-collab client pair --url https://<controller 地址> --code <配对码> --name "<这个客户端的名字>" --kind agent
 ```
 
-凭据写入当前用户配置目录下仅本人可读写的文件，之后的命令自动使用它；多个 controller 用 `--profile <名字>` 区分。凭据绑定这个 controller 的身份，应答来自别的 controller 时命令以退出码 3 结束。拥有者可以随时在桌面端“设置 → 客户端”里撤销它。
+凭据写入当前用户配置目录下仅本人可读写的文件，之后的命令自动使用它；多个 controller 用 `--profile <名字>` 区分。凭据绑定这个 controller 的身份和配对时的地址：命令不会把它发往 `--url` 指定的其他地址（地址变了就重新配对），应答来自别的 controller 时命令以退出码 3 结束。拥有者可以随时在桌面端“设置 → 客户端”里撤销它。
 
 ## 提交
 
@@ -36,6 +36,7 @@ agent-collab submit --template codex-change-accept \
 - `--model`、`--effort` 覆盖工作区默认值；不给则用默认值。不被部署许可的组合会被拒绝，不会换成别的模型。
 - `--os windows|macos|linux` 限定执行平台。`--baseline <ID>` 使用已登记的输入基线代替 `--input-dir`。
 - `--dry-run` 只输出将提交的契约和解析后的模型，不创建任务。
+- `--request-id <UUID>` 指定幂等键：提交因网络问题没有拿到应答时，用同一个值重试不会重复创建任务。
 
 成功时输出 `{"http_status": 201, "body": {...}}`，任务标识是 `body.job_id`。提交现成的契约文件用 `agent-collab submit 任务.json`。
 
@@ -56,7 +57,7 @@ agent-collab job results <job_id>                 # 只读取当前摘要
 | `done` | 成果已发布 | 取成果 | 0 |
 | `ready_to_publish` | 执行与验收已满足发布条件，等调用方发布 | `job publish` | 0 |
 | `awaiting_acceptance` | 契约要求验收，尚无“通过”的验收 | 自行验收（见下），或交给拥有者 | 0 |
-| `needs_attention` | 失败、已取消、待对账，或验收为返工/受阻且没有自动修复 | 读 `status_reason`、`assessments`，决定重试或上报 | 5 |
+| `needs_attention` | 失败、已取消、待对账，或验收为返工/受阻，且没有进行中的协调回合 | 读 `status_reason`、`assessments`，决定重试或上报 | 5 |
 | `running`、`awaiting_coordination`、`awaiting_publication` | 仍在执行、协调或等待执行设备发布 | 继续等待 | 超时为 4 |
 
 运行状态、检查、验收、发布是分开的事实：`status: completed` 只表示执行结束，不表示检查通过或已验收。
@@ -94,6 +95,8 @@ agent-collab job cancel <job_id>
 
 ## 约定
 
-- 变更请求自带幂等键，命令因网络问题失败后可以原样重试；`version_mismatch`（409）表示记录已被别人改动，重新读取后再决定。
-- 退出码：0 成功；2 请求被拒绝；3 连接、凭据或 controller 身份问题；4 等待超时；5 任务以失败、取消或需人工处理结束。
+- 每次运行命令都会生成新的幂等键。`job cancel`、`job retry`、`job publish`、`settings set` 和带 `expected_version` 的 `api` 请求重试是安全的：已经生效时重试只会得到 `version_mismatch`（409），表示记录已被改动，重新读取后再决定。`submit` 重试前要么带上同一个 `--request-id`（任务文件里写 `request_id`、`api` 的 `--data` 里带 `request_id` 同理），要么先用 `job list` 确认上一次是否已受理；`baseline add` 重试可能多登记一份同内容的基线。
+- `job wait` 与 `job follow` 在 controller 暂时不可达（重启、前置代理返回 5xx）时继续等待到超时；其余命令遇到这种情况以退出码 3 结束。
+- `client forget --revoke` 用这份客户端凭据自己撤销自己；撤销没有成功时保留凭据文件并以退出码 2 结束。
+- 退出码：0 成功；1 本地错误（缺少凭据文件、地址与配对时不符等，标准错误上是一行文本）；2 请求被拒绝或命令参数格式错误；3 连接、凭据（HTTP 401）或 controller 身份问题；4 等待超时；5 任务以失败、取消或需人工处理结束。`api` 与提交任务文件也按此区分 401 与其他拒绝。
 - 只经这些命令和 API 与系统交互：不读写 controller 的数据库，不在执行设备上自行启动模型进程，不用管理令牌做日常提交。

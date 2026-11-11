@@ -36,7 +36,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 `effective` 给出不含密钥的最终生效配置：`node`（身份、并发、标签、workspace_root、data_dir）、`agent`（版本、提交、
 版本目录、解释器、用户、平台）和每个 harness 的 `argv`、`version`、`disabled`、`path_prepend`、`managed_argv`
 （Codex 另有 `codex_home` 与被清除的环境变量名，Claude 另有适配器固定设置的 `managed_env`）。`managed_argv` 直接调用适配器的 `build_argv` 生成，
-`<work>`、`<attempt>`、`<sandbox>`、`<effort>`、`<profile.model>`、`<profile.effort>`、`<decision-schema>`、`<session-id>`
+`<work>`、`<attempt>`、`<sandbox>`、`<model>`、`<effort>`、`<profile.model>`、`<profile.effort>`、`<decision-schema>`、`<session-id>`
 是运行期才确定的值；环境变量只列名称，不列取值。`argv` 与 `managed_argv` 只原样显示可执行文件路径：
 `codex_command`、`claude_command` 里附带的其余参数可能含凭据，一律显示为 `<configured-argument>`。
 `agent.json` 里的值类型不对、无法生成 `effective` 时，`effective` 只含 `error_type`，`checks.configuration` 记为失败，其余检查照常返回。
@@ -71,7 +71,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 
 同一物理主机上的多个节点（例如 Windows 原生节点与按需启用的 WSL 节点）应显式使用相同 `physical_host_id` 和 `host_slots`。
 默认每台物理主机只有一个原生节点，WSL 节点会带 `wsl` 标签。
-Codex 模型固定为 `gpt-6-astra`；effort 仅 `high/xhigh/max`，契约不写 effort 时取 `xhigh`，其他取值在提交时被拒绝。Claude 的 model/effort 必须来自 controller 的已配置 standby profile，不使用默认档位。
+Codex 的 model 与 effort 由 controller 在受理时按设置解析并写进契约（`docs/protocol.md` §12.4），适配器不带默认值，见下文“模型目录”；固定集合 `gpt-6-astra` 配 `high/xhigh/max` 只用于调度没有上报模型目录的旧节点。Claude 的 model/effort 取设置里的 `claude.default`，未设置时取 controller 已配置的 standby profile，不使用默认档位。
 
 每个进程启动时只解析一次 harness argv：服务 PATH → `~/.local/bin` → macOS 的 `/opt/homebrew/bin`、
 `/usr/local/bin`。Windows 使用 PATHEXT，排除 WindowsApps 应用执行别名。探测与执行共用绝对 argv 和环境，

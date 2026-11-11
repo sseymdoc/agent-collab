@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { api, ApiError } from '../api'
 import { Json, MODEL_SOURCE, Section, errText, show, useData } from '../ui'
 
@@ -35,7 +35,9 @@ export function NewJob({ onCreated }: { onCreated: (jobId: string) => void }) {
   const selectable: any[] = models.data?.selectable?.codex ?? []
   const def = models.data?.settings?.codex?.default ?? {}
   // 改动任何输入都会让已生成的契约失效：必须重新生成后才能提交。
-  const edit = <T,>(set: (v: T) => void) => (v: T) => { set(v); setDraft(null) }
+  // 草拟请求在途时改了输入，迟到的结果对应旧输入，按 inputs 计数丢弃。
+  const inputs = useRef(0)
+  const edit = <T,>(set: (v: T) => void) => (v: T) => { set(v); setDraft(null); inputs.current++ }
   const lines = (s: string) => s.split('\n').map(x => x.trim()).filter(Boolean)
   const argv = (s: string) => s.trim().startsWith('[') ? JSON.parse(s) : s.trim().split(/\s+/)
   const body = () => ({
@@ -92,7 +94,7 @@ export function NewJob({ onCreated }: { onCreated: (jobId: string) => void }) {
     {usesModel && !!models.data?.selectable?.unknown_nodes?.length && <p className="muted">设备 {models.data.selectable.unknown_nodes.join('、')} 的模型目录未知，可选项里不包含它们可能支持的组合。</p>}
     {err && <p className="err" role="alert">{err}</p>}
     <div className="actions">
-      <button disabled={busy || !goal.trim()} onClick={() => void run(async () => setDraft(await api.draft(body())))}>{draft ? '重新生成契约' : '生成契约'}</button>
+      <button disabled={busy || !goal.trim()} onClick={() => void run(async () => { const n = inputs.current; const d = await api.draft(body()); if (n === inputs.current) setDraft(d) })}>{draft ? '重新生成契约' : '生成契约'}</button>
     </div>
     {p && <div className="draft">
       <h3>将提交的契约</h3>

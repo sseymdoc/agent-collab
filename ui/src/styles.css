@@ -71,7 +71,7 @@ legend { color: var(--muted); padding: 0 4px; }
 label.row { flex-direction: row; align-items: center; gap: 6px; margin: 4px 0; }
 label.row.inline { display: inline-flex; margin-right: 14px; }
 label.narrow { max-width: 240px; }
-input.wide { flex: 1; min-width: 280px; }
+input.wide { flex: 1 1 280px; min-width: 0; }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 16px; }
 .draft { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 4px; }
 .notice { background: var(--warn-bg); color: var(--text); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }

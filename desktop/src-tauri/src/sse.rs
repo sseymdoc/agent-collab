@@ -11,6 +11,13 @@ pub struct Frame {
     pub data: String,
 }
 
+impl Frame {
+    /// 帧内三个字段的总字节数，调用方用它限制单帧大小。
+    pub fn size(&self) -> usize {
+        self.id.as_ref().map_or(0, String::len) + self.event.as_ref().map_or(0, String::len) + self.data.len()
+    }
+}
+
 #[derive(Default)]
 pub struct Parser {
     buf: Vec<u8>,
@@ -37,9 +44,9 @@ impl Parser {
         frames
     }
 
-    /// 尚未构成完整帧的缓冲字节数，供调用方限制内存。
+    /// 尚未构成完整帧的缓冲字节数（未成行的字节加上已累积的 id、event、data），供调用方限制内存。
     pub fn pending(&self) -> usize {
-        self.buf.len() + self.frame.data.len()
+        self.buf.len() + self.frame.size()
     }
 
     fn line(&mut self, line: &str) -> Option<Frame> {
@@ -157,5 +164,14 @@ mod tests {
         assert!(p.push(b"id: 1\nevent: x\ndata: {\"a\"").is_empty());
         assert!(p.pending() > 0);
         assert_eq!(p.push(b":1}\n\n"), vec![frame(Some("1"), Some("x"), "{\"a\":1}")]);
+    }
+
+    #[test]
+    fn pending_counts_buffered_id_and_event() {
+        let mut p = Parser::default();
+        let long = "e".repeat(1000);
+        assert!(p.push(format!("id: 12345\nevent: {long}\n").as_bytes()).is_empty());
+        assert_eq!(p.pending(), 5 + 1000);
+        assert_eq!(frame(Some("12"), Some("abc"), "data").size(), 9);
     }
 }

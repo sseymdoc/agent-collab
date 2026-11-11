@@ -426,7 +426,8 @@ def selectable_codex(settings, nodes):
             if efforts:
                 entry = combos.setdefault(model['id'], {'model': model['id'], 'efforts': [], 'nodes': []})
                 entry['efforts'] += [e for e in efforts if e not in entry['efforts']]
-                entry['nodes'].append(node['node_id'])
+                if node['node_id'] not in entry['nodes']:
+                    entry['nodes'].append(node['node_id'])
     return {'codex': list(combos.values()), 'unknown_nodes': unknown}
 
 
@@ -646,10 +647,11 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
         if catalog and catalog['status'] in ('ok', 'legacy'):
             # §12.5：目录明确不含该组合才排除；目录未知不等于不支持，也不等于支持。
             model, effort = (job['contract']['harness_params'].get(k) for k in ('model', 'effort'))
-            entry = next((m for m in catalog['models'] if m['id'] == model), None)
-            if entry is None:
+            # 目录可能把同一模型列成多条：合并它们的 effort，与 selectable_codex 的口径一致。
+            entries = [m for m in catalog['models'] if m['id'] == model]
+            if not entries:
                 reasons.append('model_unsupported:%s' % model)
-            elif effort not in entry['efforts']:
+            elif not any(effort in m['efforts'] for m in entries):
                 reasons.append('effort_unsupported:%s/%s' % (model, effort))
         # 只排除已确认过期的认证；unknown 不等于失败，本地登录状态也不等于服务端接受。
         if harness != 'stub' and node['auth_health'].get(harness) == 'expired':

@@ -102,6 +102,7 @@ export async function saveBlob(sha: string, name: string): Promise<string | null
   a.href = url
   a.download = name
   a.click()
-  URL.revokeObjectURL(url)
+  // 有的浏览器在 click 之后才异步开始下载，立即释放会让下载失败。
+  window.setTimeout(() => URL.revokeObjectURL(url), 10000)
   return name
 }

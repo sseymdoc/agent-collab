@@ -12,7 +12,7 @@ const ERR: Record<string, string> = {
 // 原生桥的错误带 controller 给出的具体原因（如配对码过期）时优先显示它。
 export const bridgeText = (e: any) => e?.message ? (ERR[e.code] && e.code !== 'unauthorized' ? ERR[e.code] : e.message) : ERR[e?.code] ?? String(e)
 
-export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (opened: any, connection: any) => void }) {
+export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (opened: any, connection: any) => Promise<void> }) {
   const [list, setList] = useState<any[] | null>(null)
   const [info, setInfo] = useState<any>(null)
   const [err, setErr] = useState<string | null>(reason ? ERR[reason] ?? reason : null)
@@ -26,7 +26,8 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
     setBusy(true); setErr(null)
     try { await f() } catch (e) { setErr(bridgeText(e)) } finally { setBusy(false) }
   }
-  const open = (c: any) => run(async () => onOpen(await invoke('connection_open', { id: c.id }), c))
+  // 等身份确认（GET /client）完成再解除 busy：期间再点一次会换掉连接代次，先发的确认随后失败会把新连接关掉。
+  const open = (c: any) => run(async () => { await onOpen(await invoke('connection_open', { id: c.id }), c) })
   return <main className="connect">
     <h1>Agent Collab</h1>
     {err && <p className="err" role="alert">{err}</p>}
@@ -42,7 +43,7 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
               if (!window.confirm('忘记这条连接会删除本机保存的凭据，并在 controller 上撤销它。确定？')) return
               void run(async () => {
                 const r = await invoke('connection_forget', { id: c.id, revoke: true })
-                if (!r.revoked) setErr('本机的连接与凭据已删除；controller 当时不可达，没有完成撤销。可在另一客户端的“设置 → 客户端”里撤销它。')
+                if (!r.revoked) setErr('本机的连接与凭据已删除，但没能确认 controller 已撤销这个客户端（controller 不可达、拒绝了请求、应答身份不符或本机读不到凭据）。请在另一客户端的“设置 → 客户端”里确认并撤销它。')
                 await reload()
               })
             }}>忘记</button>
@@ -54,7 +55,9 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
       void run(async () => {
         const c = await invoke('connection_pair', { url: url.trim(), code: code.trim(), name: name.trim() })
         setCode('')
-        onOpen(await invoke('connection_open', { id: c.id }), c)
+        // 配对码已用掉：先刷新列表，接下来打开失败时这条连接仍在列表里可以重试。
+        await reload()
+        await onOpen(await invoke('connection_open', { id: c.id }), c)
       })
     }}>
       <header><h2>配对新的 controller</h2></header>

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { api, coordHeld, pendingTakeOf } from '../api'
 import { can, session } from '../session'
 import { saveBlob } from '../transport'
@@ -9,22 +9,28 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
   const explain = useData(() => api.explain(id).catch(() => null), [id, tick])
   const [older, setOlder] = useState<any[]>([])
   const [olderErr, setOlderErr] = useState<string | null>(null)
+  const [olderDone, setOlderDone] = useState(false)
+  // 打开页面后见过的事件都留在这里（按序号去重）：快照只带最近 200 条，窗口随新事件前移时，
+  // 滑出窗口的事件不在快照里，也取不到（向前翻页从已载入的最早一条往前取），不留下就丢了。
+  const seen = useRef(new Map<number, any>())
   // 刷新失败时保留已加载的页面（含表单输入），只在顶部提示。
   if (!d) return error ? <p className="err">{error}</p> : <p className="muted">加载中…</p>
   const job = d.job ?? d
   const attempts: any[] = d.attempts ?? []
   const checkpoints: any[] = d.checkpoints ?? []
-  // 事件：快照带最近 200 条；更早的按需向前翻页，按序号去重后合并。
-  const recent: any[] = d.events ?? []
-  const events = [...older.filter(o => !recent.length || o.seq < recent[0].seq), ...recent]
+  // 事件：快照带最近 200 条；更早的按需向前翻页。
+  for (const e of [...older, ...(d.events ?? [])]) seen.current.set(e.seq, e)
+  const events = [...seen.current.values()].sort((a, b) => a.seq - b.seq)
   const c = job.contract ?? {}
   const mp = job.model_policy
   const current = attempts.find(a => a.attempt_id === job.current_attempt_id)
   const progress = [...events].reverse().find(e => e.type === 'attempt.progress' && !e.stale && e.attempt_id === job.current_attempt_id)
   const finals = checkpoints.filter(k => k.kind === 'final' && k.state !== 'uploading' && k.attempt_id === job.current_attempt_id)
   const results: any[] | null = current?.report?.checks?.results ?? null
+  // 与 controller 认定执行证据的规则一致：每个契约检查恰好一条同名结果，退出码 0 且明确未超时。
   const checks = !(c.checks ?? []).length ? ['muted', '契约未要求'] : !results ? ['muted', '尚未运行']
-    : results.every(r => r.exit_code === 0 && !r.timed_out) && results.length >= c.checks.length ? ['good', '全部通过'] : ['bad', '未通过']
+    : c.checks.every((k: any) => { const m = results.filter(r => r?.name === k.name); return m.length === 1 && m[0].exit_code === 0 && m[0].timed_out === false })
+      ? ['good', '全部通过'] : ['bad', '未通过']
   const rounds = events.filter(e => e.type === 'coordinator.triggered').map(e => e.payload?.coordinator_job_id).filter(Boolean)
   const tasks = can('tasks')
   return <>
@@ -159,9 +165,9 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
         {e.payload && Object.keys(e.payload).length ? <details><summary>payload</summary><Json v={e.payload} /></details> : null}
       </li>)}</ol>
       {/* 长日志不一次性载入：每次向前取 200 条。 */}
-      {events.length >= 200 && <p className="actions"><button onClick={() => api.jobEvents(id, events[0].seq).then(
-        r => { setOlderErr(r.events.length ? null : '没有更早的事件了'); setOlder(o => [...r.events, ...o.filter(x => x.seq < (recent[0]?.seq ?? Infinity))]) },
-        e => setOlderErr(errText(e)))}>加载更早的事件</button>{olderErr && <small className="muted">{olderErr}</small>}</p>}
+      {events.length >= 200 && <p className="actions">{olderDone ? <small className="muted">没有更早的事件了</small> : <><button onClick={() => api.jobEvents(id, events[0].seq).then(
+        r => { setOlderErr(null); if (r.events.length) setOlder(o => [...r.events, ...o]); else setOlderDone(true) },
+        e => setOlderErr(errText(e)))}>加载更早的事件</button>{olderErr && <small className="muted">{olderErr}</small>}</>}</p>}
     </Section>
   </>
 }

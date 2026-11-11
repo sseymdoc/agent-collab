@@ -7,6 +7,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
+from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -50,7 +51,7 @@ class CliE2E(unittest.TestCase):
     def test_cli_and_another_client_share_tasks_state_settings_and_revocation(self):
         self.agent('n1', 'h1', 'd1')
         paired = self.cli('client', 'pair', '--url', self.url, '--code', self.code('owner'), '--name', 'automation')
-        saved = json.loads(open(paired['credential_file'], encoding='utf-8').read())
+        saved = json.loads(Path(paired['credential_file']).read_text(encoding='utf-8'))
         self.assertNotIn(saved['token'], json.dumps(paired))  # 凭据值不出现在输出里
         if os.name == 'posix':
             self.assertEqual(os.stat(paired['credential_file']).st_mode & 0o077, 0)
@@ -69,8 +70,8 @@ class CliE2E(unittest.TestCase):
         project = self.tmp / 'project'
         project.mkdir()
         (project / 'value.txt').write_text('41\n', encoding='utf-8')
-        checks = ['has-input=' + json.dumps([PY, '-c', "import sys; sys.exit(0 if open('value.txt').read().strip() == '41' else 1)"]),
-                  'wrote-result=' + json.dumps([PY, '-c', "open('agent-collab-diagnostic.txt').read()"])]
+        checks = ['has-input=' + json.dumps([PY, '-c', "import sys; sys.exit(0 if open('value.txt', encoding='utf-8').read().strip() == '41' else 1)"]),
+                  'wrote-result=' + json.dumps([PY, '-c', "open('agent-collab-diagnostic.txt', encoding='utf-8').read()"])]
         draft = self.cli('submit', '--template', 'diagnostic', '--goal', '链路自检', '--input-dir', str(project), '--dry-run')
         self.assertEqual((draft['preview']['harness'], [f['path'] for f in draft['preview']['inputs_manifest']['files']]), ('stub', ['value.txt']))
         self.assertEqual(self.cli('job', 'list')['jobs'], [])
