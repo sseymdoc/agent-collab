@@ -45,6 +45,95 @@ def workspace_excluded(path, patterns):
     return False
 
 
+def _system_tool(name):
+    # 用系统目录里的绝对路径：按 PATH 或当前目录查找时，可写目录里的同名程序可能冒充它们并假装收紧成功。
+    return os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', 'System32', name)
+
+
+@lru_cache(maxsize=1)
+def _current_user():
+    """(账户名, SID)，取自 whoami /user。"""
+    import csv
+    import re
+    import subprocess
+    whoami = subprocess.run([_system_tool('whoami.exe'), '/user', '/fo', 'csv', '/nh'], capture_output=True, text=True, errors='replace', check=True)
+    row = next(csv.reader(whoami.stdout.splitlines()), [])
+    if len(row) < 2 or not row[0] or not re.fullmatch(r'S-1-(?:[0-9]+-)+[0-9]+', row[1]):
+        raise OSError('cannot determine the current user')
+    return row[0], row[1]
+
+
+def _principals(path):
+    """icacls 列出的 DACL 中每条 ACE 的主体名（第一行带文件路径前缀，末尾的处理汇总行不含 ACE）。"""
+    import subprocess
+    listing = subprocess.run([_system_tool('icacls.exe'), str(path)], capture_output=True, text=True, errors='replace', check=True).stdout
+    names = []
+    for line in listing.splitlines():
+        if ':(' not in line:
+            continue
+        head = line[:line.index(':(')]
+        names.append((head[len(str(path)):] if head.startswith(str(path)) else head).strip())
+    return names
+
+
+def owner_only(path):
+    """Windows 不认 POSIX 权限位：DACL 只留当前用户的完全控制。其他系统不做任何事。失败时抛 OSError。
+
+    凭据文件（客户端凭据、node.token、admin.token）在写入内容之前调用它，失败就不留下凭据。
+    /inheritance:r 只去掉继承来的 ACE，父目录没有可继承 ACE 时新文件还会带着令牌默认 DACL 的显式 ACE
+    （例如 SYSTEM、Administrators）；所以设完后读回 DACL，移除其他主体，再核对一次。
+    """
+    if os.name != 'nt':
+        return
+    import subprocess
+    name, sid = _current_user()
+    icacls = _system_tool('icacls.exe')
+    try:
+        subprocess.run([icacls, str(path), '/inheritance:r', '/grant:r', '*%s:F' % sid], capture_output=True, check=True)
+        others = [n for n in _principals(path) if n.casefold() != name.casefold()]
+        for other in dict.fromkeys(others):
+            # 解析不出账户名的主体，icacls 显示为原始 SID，按 SID 删除要加 *；/remove 同时删除授权与拒绝 ACE。
+            subprocess.run([icacls, str(path), '/remove', '*' + other if other.startswith('S-1-') else other], capture_output=True, check=True)
+        remaining = _principals(path)
+    except subprocess.CalledProcessError as exc:
+        raise OSError('icacls failed to restrict %s' % path) from exc
+    if not remaining or any(n.casefold() != name.casefold() for n in remaining):
+        raise OSError('%s still grants access to: %s' % (path, ', '.join(n for n in remaining if n.casefold() != name.casefold()) or 'nobody'))
+
+
+class SecretFile:
+    """凭据文件的预留位：先建好仅当前用户可访问的临时文件，再去换取凭据，拿到后 save() 原子替换成 path。
+
+    配对码只能用一次，配对还会撤销同一身份的旧凭据：所以权限收紧必须在发出请求之前完成，失败时（构造时抛 OSError）
+    请求还没发出。离开 with 块时没有 save() 的临时文件会被删除。
+    """
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.temp = self.path.with_name('.' + self.path.name + '.' + uuid.uuid4().hex + '.tmp')
+        os.close(os.open(str(self.temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        try:
+            owner_only(self.temp)
+        except BaseException:
+            self.temp.unlink()
+            raise
+
+    def save(self, data):
+        with self.temp.open('r+b') as stream:  # 写进已收紧的同一个文件，保留它的 DACL
+            stream.write(data)
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(str(self.temp), str(self.path))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.temp.exists():
+            self.temp.unlink()
+
+
 def atomic_write(path, data, mode=0o600):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

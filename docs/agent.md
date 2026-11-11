@@ -36,7 +36,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 `effective` 给出不含密钥的最终生效配置：`node`（身份、并发、标签、workspace_root、data_dir）、`agent`（版本、提交、
 版本目录、解释器、用户、平台）和每个 harness 的 `argv`、`version`、`disabled`、`path_prepend`、`managed_argv`
 （Codex 另有 `codex_home` 与被清除的环境变量名，Claude 另有适配器固定设置的 `managed_env`）。`managed_argv` 直接调用适配器的 `build_argv` 生成，
-`<work>`、`<attempt>`、`<sandbox>`、`<effort>`、`<profile.model>`、`<profile.effort>`、`<decision-schema>`、`<session-id>`
+`<work>`、`<attempt>`、`<sandbox>`、`<model>`、`<effort>`、`<profile.model>`、`<profile.effort>`、`<decision-schema>`、`<session-id>`
 是运行期才确定的值；环境变量只列名称，不列取值。`argv` 与 `managed_argv` 只原样显示可执行文件路径：
 `codex_command`、`claude_command` 里附带的其余参数可能含凭据，一律显示为 `<configured-argument>`。
 `agent.json` 里的值类型不对、无法生成 `effective` 时，`effective` 只含 `error_type`，`checks.configuration` 记为失败，其余检查照常返回。
@@ -50,7 +50,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 
 ## agent.json 与目录
 
-配对写入 `agent.json` 与 `node.token`，POSIX 均为 0600，已配对目录拒绝覆盖。
+配对写入 `agent.json` 与 `node.token`，POSIX 均为 0600；Windows 上 `node.token` 的 DACL 只留当前用户；这一步在发出配对请求之前完成，做不到时配对请求不会发出（配对码仍可使用，同一 node_id 的旧凭据也不受影响），不留下凭据。已配对目录拒绝覆盖。
 配置字段：
 
 | 字段 | 用途 |
@@ -66,11 +66,12 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 | workspace_root | 可选，工作区改为 `<workspace_root>/<attempt_id>`；元数据和输出仍在 data 下 |
 | codex_windows_sandbox | Windows Codex 的 windows.sandbox，缺省 elevated |
 | auth_probe_s | 认证状态探测周期，缺省 900 秒；启动探测，后续后台探测，不阻塞心跳 |
+| model_catalog_s | 模型目录刷新周期，缺省 21600 秒；后台读取，不阻塞心跳 |
 | provider_account_refs | 可选，非凭据账户分组；auth_health 由实际探测产生，旧配置中的静态 auth_health 不再作为探测结果 |
 
 同一物理主机上的多个节点（例如 Windows 原生节点与按需启用的 WSL 节点）应显式使用相同 `physical_host_id` 和 `host_slots`。
 默认每台物理主机只有一个原生节点，WSL 节点会带 `wsl` 标签。
-Codex 模型固定为 `gpt-6-astra`；effort 仅 `high/xhigh/max`，契约不写 effort 时取 `xhigh`，其他取值在提交时被拒绝。Claude 的 model/effort 必须来自 controller 的已配置 standby profile，不使用默认档位。
+Codex 的 model 与 effort 由 controller 在受理时按设置解析并写进契约（`docs/protocol.md` §12.4），适配器不带默认值，见下文“模型目录”；固定集合 `gpt-6-astra` 配 `high/xhigh/max` 只用于调度没有上报模型目录的旧节点。Claude 的 model/effort 取设置里的 `claude.default`，未设置时取 controller 已配置的 standby profile，不使用默认档位。
 
 每个进程启动时只解析一次 harness argv：服务 PATH → `~/.local/bin` → macOS 的 `/opt/homebrew/bin`、
 `/usr/local/bin`。Windows 使用 PATHEXT，排除 WindowsApps 应用执行别名。探测与执行共用绝对 argv 和环境，
@@ -136,6 +137,15 @@ lease.token）。检查若导入模型刚写出的工作区代码（如 `{python
 超时、耗时和脱敏输出尾部（各 ≤4 KiB）。harness 失败时不运行检查，checks=null。
 成功但未配置检查时 results=[]。64 KiB 总限制优先压缩检查尾部；极端超大 argv 仍可能使检查证据被清空，
 此时 controller 应按缺证据处理，不能当作通过。检查原始本地输出与 harness 日志一样只保存在节点。
+
+## 模型目录
+
+controller 在注册响应的 `features` 里声明 `node_models` 之后，节点在后台读取 Codex 的模型目录并随注册上报（`capabilities.models`，`docs/protocol.md` §12.5）；连接旧版本 controller 时不读取也不上报。
+
+- 读取方式：以节点解析出的 codex 命令启动 `codex app-server`，经 stdin/stdout 发送 `initialize` 与 `model/list`，取到应答后结束该进程。不监听端口，不调用模型；进程继承节点服务的用户、`CODEX_HOME` 与登录状态，所以目录是这个节点上这个账户能看到的模型及各自支持的 effort。
+- 取不到（命令缺失、启动失败、20 秒内没有应答、应答格式不符）时上报 `status: unknown` 与原因，controller 不因此排除该节点。名称不符合字段约束的条目不进目录。
+- 目录内容变化时重新注册；没有变化则在下一个周期前不重复读取。Claude CLI 没有目录接口，固定上报 `unknown` / `no_catalog_interface`。
+- Codex 的 `--model` 与 `model_reasoning_effort` 取自契约的 `harness_params`，适配器不带默认值；契约缺少其中任何一项时该 attempt 以代码失败结束。
 
 ## Claude 受管协调适配器
 

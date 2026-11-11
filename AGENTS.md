@@ -23,6 +23,9 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 | 端点、记录形状、错误码、fencing、幂等、调度原因码、契约字段 | [docs/protocol.md](docs/protocol.md) 与 `agent_collab/protocol.py` |
 | controller 的认证、配置、协调租约、受管协调者、备份恢复、事件保留 | [docs/controller.md](docs/controller.md) |
 | 节点 agent：领取、进程托管、重启对账、检查点、契约检查、回写、harness 适配器 | [docs/agent.md](docs/agent.md) |
+| 桌面端外壳、页面在浏览器与桌面端的传输层 | [docs/desktop.md](docs/desktop.md) |
+| CLI 客户端子命令、给 Claude 与其他 Agent 的集成方式 | [docs/integration.md](docs/integration.md) |
+| 迁移预检与升级预演 | [docs/migration.md](docs/migration.md) |
 | 安装器、服务模板、升级与回退、发行包 | [docs/install.md](docs/install.md) |
 | 运维流程：配对、排空迁移、备份与实例外拉取、隔离恢复 | [docs/operations.md](docs/operations.md) |
 | 技术栈、依赖、拓扑、开发隔离 | [docs/adr/](docs/adr/) |

@@ -16,6 +16,8 @@ def node(**cap):
 def job(harness='stub', tools=(), gpu=None):
     return {'job_id': 'j', 'protection': 'unprotected', 'contract': {
         'harness': harness, 'resources': {'slots': 1},
+        # model/effort 只属于 codex 契约；stub 契约带上它们会被 validate_contract 拒绝。
+        'harness_params': {'model': 'gpt-6-astra', 'effort': 'xhigh'} if harness == 'codex' else {},
         'requirements': {'os': [], 'arch': [], 'tools': list(tools), 'gpu': gpu, 'labels': []}}}
 
 
@@ -42,6 +44,20 @@ class ContractTest(unittest.TestCase):
         n['auth_health'] = merge_health({'codex': 'expired'}, {'codex': 'unknown'})
         self.assertIn('auth_unhealthy:codex', reasons(job('codex'), n))
         self.assertEqual(merge_health({'codex': 'expired'}, {'codex': 'ok'}), {'codex': 'ok'})
+
+    def test_stub_fixture_is_an_admissible_contract(self):
+        contract = dict(job()['contract'], goal='g', inputs_manifest={'version': 1, 'base': None, 'files': [], 'deleted': []})
+        domain.validate_contract(contract)
+
+    def test_duplicate_catalog_entries_for_one_model_are_merged(self):
+        catalog = {'codex': {'status': 'ok', 'source': 't', 'fetched_at': None, 'cli_version': None, 'reason': None, 'models': [
+            {'id': 'gpt-6-astra', 'efforts': ['high'], 'default_effort': None},
+            {'id': 'gpt-6-astra', 'efforts': ['xhigh'], 'default_effort': None}]}}
+        n = node(harness={'stub': '0.1', 'codex': '0.167.0'}, models=catalog)
+        self.assertEqual([r for r in reasons(job('codex'), n) if 'unsupported' in r], [])
+        settings = {'codex': {'allowed': None}}
+        self.assertEqual(domain.selectable_codex(settings, [n])['codex'],
+                         [{'model': 'gpt-6-astra', 'efforts': ['high', 'xhigh'], 'nodes': ['n1']}])
 
 
 if __name__ == '__main__':

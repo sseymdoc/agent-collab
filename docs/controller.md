@@ -8,9 +8,12 @@
 python -m agent_collab.controller serve --data-dir /local/controller-data --bind 127.0.0.1:18669
 python -m agent_collab.controller admin-token --data-dir /local/controller-data
 python -m agent_collab.controller pairing-code --data-dir /local/controller-data --node-id mac-worker --ttl 600
+python -m agent_collab.controller client-code --data-dir /local/controller-data --role owner --ttl 600
 ```
 
-`admin-token` 只打印文件路径。管理员令牌首次生成于 `admin.token`；POSIX 权限为 0600。此文件是协议要求的唯一明文凭据文件；数据库中的节点令牌、租约、UI 会话、CSRF 和配对码均只保存 SHA-256，比较使用 `hmac.compare_digest`。配对码过期或使用一次后失效，再次配对同一节点会撤销旧 node token。节点凭据不能访问客户端查询或控制端点；管理员/UI 凭据不能冒充节点。
+`client-code` 为桌面端、CLI 或其他自动化客户端生成一次性配对码（输出 JSON：`code`、`scopes`、`ttl_s`）；`--role` 取 `owner`、`operator`、`viewer`，或用 `--scopes read,tasks` 逐项指定；两者都省略时签发 `owner`，即全部五项权限。配对码只存哈希，最长有效 1 小时。客户端凭据、权限与撤销见 `docs/protocol.md` §12.1。
+
+`admin-token` 只打印文件路径。管理员令牌首次生成于 `admin.token`；POSIX 权限为 0600，Windows 上写入前把 DACL 收紧到只留运行 controller 的用户，做不到时启动失败、不留下令牌文件。已存在的令牌文件不会被改动。此文件是协议要求的唯一明文凭据文件；数据库中的节点令牌、租约、UI 会话、CSRF 和配对码均只保存 SHA-256，比较使用 `hmac.compare_digest`。配对码过期或使用一次后失效，再次配对同一节点会撤销旧 node token。节点凭据不能访问客户端查询或控制端点；管理员/UI 凭据不能冒充节点。
 
 非 loopback 地址必须同时提供 `--tls-cert` 和 `--tls-key`，否则在创建监听器之前拒绝启动。例如：
 
@@ -50,6 +53,10 @@ serve 全生命周期持有 OS 文件锁 `controller.lock`；第二个 serve 或
   }
 }
 ```
+
+`web_console`（布尔，缺省 true）控制浏览器控制台：设为 false 后 `POST /session` 被拒绝、已有会话在关闭期间不能使用（会话记录保留，重新启用后未过期的会话恢复可用）、不再提供静态页面，客户端凭据与管理令牌不受影响。
+
+模型默认值与部署许可范围不在 `config.json` 里，而是保存在数据库的 `settings/models` 记录中，经 `GET` / `PUT /settings/models` 读写（`docs/protocol.md` §12.3）。新数据库从未设置开始；已有任务或节点记录但没有该记录的数据库，在升级后首次启动时写入一次迁移值，其中协调模型取 `standby_profiles` 里当时生效的 profile。之后设置里的协调模型优先于 profile 的 `model` 与 `effort`，profile 的 `node_ids` 与启用开关仍取自 `config.json`。
 
 顶层未知配置键、非正/非有限时间或尺寸、错误公开源均拒绝。`managed_coordinator` 与 `standby_profiles` 内部只读取已定义字段：未知子键被忽略，字段缺失或非法时 overview 显示 `profile_missing`（不报配置错误），请据此核对拼写。时间由 controller 的 `clock()` 决定；生产默认 wall clock，需保持主机时钟正常。以上间隔是协议默认值，不是实测 RTO/RPO。重启不会增加 generation；会延长已有活动租约并记录 `controller.started`，不重复建立 attempt。后台每秒 tick；claim/heartbeat 也调度。心跳正常而没有输出不会判为失联。
 

@@ -453,9 +453,11 @@ class EffectiveTests(unittest.TestCase):
         # 配置里附带的参数（这里是 codex 的 'wrapper'）只显示占位符，可执行文件原样显示。
         self.assertEqual(commands['codex']['argv'][1:], ['wrapper'])
         shown = {'codex': commands['codex']['argv'][:1] + ['<configured-argument>'], 'claude': commands['claude']['argv']}
-        expected = codex.build_argv(commands['codex']['argv'], '<work>', '<attempt>', system='Windows', windows_sandbox='unelevated')
+        expected = codex.build_argv(commands['codex']['argv'], '<work>', '<attempt>', dict(model='model', effort='effort'),
+                                    system='Windows', windows_sandbox='unelevated')
         expected[expected.index('--sandbox') + 1] = '<sandbox>'
-        expected = [s.replace('model_reasoning_effort="xhigh"', 'model_reasoning_effort="<effort>"') for s in expected]
+        expected[expected.index('--model') + 1] = '<model>'
+        expected = [s.replace('model_reasoning_effort="effort"', 'model_reasoning_effort="<effort>"') for s in expected]
         self.assertEqual(effective['harness']['codex']['managed_argv'], shown['codex'] + expected[2:])
         session = '00000000-0000-4000-8000-000000000000'
         expected = claude.build_argv(commands['claude']['argv'], dict(model='<profile.model>', effort='<profile.effort>'), d.DECISION_SCHEMA, session)

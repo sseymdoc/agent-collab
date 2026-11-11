@@ -1,4 +1,5 @@
 import { api } from '../api'
+import { can } from '../session'
 import { Action, Badge, Section, show, useData, when } from '../ui'
 
 const GROUPS: [string, string[]][] = [
@@ -40,24 +41,24 @@ export function Overview({ tick }: { tick: number }) {
         </dl>
       })()}
     </Section>
-    <Section title="受管协调者" extra={<span className="muted">主控会话中断后，由幸存节点上的 Claude 按事件续作</span>}>
+    <Section title="受管协调者" extra={<span className="muted">任务结束或需要处理时，由指定设备上的 Claude 做语义验收并决定是否返工</span>}>
       {(() => {
         const m = o.managed_coordinator ?? {}
         const label: Record<string, string> = { ready: '已配置', profile_missing: 'profile 缺失（不会猜测模型或强度）', disabled: '已关闭' }
         return <dl className="kv">
           <dt>状态</dt><dd>{label[m.status] ?? show(m.status)}</dd>
-          <dt>profile</dt><dd>{m.profile ? `${show(m.profile_id)}：${m.profile.model} / ${m.profile.effort}，节点 ${(m.profile.node_ids ?? []).join(', ')}` : '未配置'}</dd>
-          <dt>说明</dt><dd>“已配置”只表示字段完整；节点上的 CLI 是否已登录、是否在线，以协调回合的实际执行结果为准。</dd>
+          <dt>profile</dt><dd>{m.profile ? `${show(m.profile_id)}：${m.profile.model} / ${m.profile.effort}，设备 ${(m.profile.node_ids ?? []).join(', ')}` : '未配置'}</dd>
+          <dt>说明</dt><dd>“已配置”只表示字段完整；设备上的 CLI 是否已登录、是否在线，以协调回合的实际执行结果为准。模型与 effort 在“设置”里修改。</dd>
         </dl>
       })()}
     </Section>
     <Section title="派单" extra={<Badge v={o.dispatch_paused ? 'blocked' : 'ok'} />}>
       <p>{o.dispatch_paused ? '全局派单已暂停：新任务受理后排队，不分配节点；执行中的任务不受影响。' : '派单正常。'}</p>
-      <Action label={o.dispatch_paused ? '恢复派单' : '暂停派单'} danger={!o.dispatch_paused}
-        run={() => api.dispatch(!o.dispatch_paused, ctl.metadata_version).then(reload)} />
+      {can('maintain') && <Action label={o.dispatch_paused ? '恢复派单' : '暂停派单'} danger={!o.dispatch_paused}
+        run={() => api.dispatch(!o.dispatch_paused, ctl.metadata_version).then(reload)} />}
     </Section>
-    <Section title="节点摘要">
-      <table><thead><tr><th>节点</th><th>物理主机</th><th>状态</th><th>排空</th><th>最近联系</th></tr></thead>
+    <Section title="设备" extra={<a href="#/nodes">查看全部</a>}>
+      <table><thead><tr><th>设备</th><th>物理主机</th><th>状态</th><th>排空</th><th>最近联系</th></tr></thead>
         <tbody>{(o.nodes ?? []).map((n: any) => <tr key={n.node_id}>
           <td>{n.node_id}</td><td>{show(n.physical_host_id)}</td><td><Badge v={n.status} /></td><td>{show(n.drain)}</td><td>{when(n.last_seen_at)}</td>
         </tr>)}</tbody></table>

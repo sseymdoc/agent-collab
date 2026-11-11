@@ -111,7 +111,7 @@ class JobsTest(ControllerCase):
         expected = {'job_id', 'request_id', 'request_hash', 'work_package_id', 'title', 'contract', 'status', 'status_reason',
                     'protection', 'inputs_manifest_sha256', 'current_epoch', 'current_attempt_id', 'durable_checkpoint_id',
                     'durable_checkpoint_at', 'acceptance', 'delivery_version', 'delivery_checkpoint_id', 'integration_status',
-                    'counters', 'cancel', 'version', 'created_at', 'updated_at'}
+                    'counters', 'cancel', 'version', 'created_at', 'updated_at', 'model_policy', 'created_by'}
         self.assertEqual(set(job), expected)
 
 

@@ -3,6 +3,24 @@ import { ApiError } from './api'
 
 export const UNKNOWN = '未知'
 
+// 任务与设置的来源（created_by / updated_by 的 kind）。
+export const ORIGIN: Record<string, string> = { admin: '管理令牌', session: '浏览器控制台', controller: 'controller 自动创建', migration: '升级迁移' }
+// 模型与 effort 的取值来源（job.model_policy.source）。
+export const MODEL_SOURCE: Record<string, string> = {
+  task_override: '本任务指定', workspace_default: '工作区默认值', project_default: '项目默认值', root_frozen: '沿用根任务受理时冻结的值',
+  coordinator_override: '协调者在冻结的许可范围内指定', legacy_compat: '升级前的固定组合', deployment_profile: '部署配置的协调 profile',
+}
+
+// 主题是本机偏好，不进 controller 的设置；空值跟随系统。
+export function applyTheme(v: string | null) {
+  if (v === 'light' || v === 'dark') document.documentElement.dataset.theme = v
+  else delete document.documentElement.dataset.theme
+}
+
+// 模型与 effort 的字段格式（docs/protocol.md §12.3）：手工输入时先在页面校验，controller 仍会再校验。
+export const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}$/
+export const EFFORT_RE = /^[a-z][a-z0-9_-]{0,31}$/
+
 export function show(v: unknown): string {
   if (v === null || v === undefined || v === '') return UNKNOWN
   if (typeof v === 'boolean') return v ? '是' : '否'

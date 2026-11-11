@@ -259,7 +259,7 @@ class RuntimeTests(unittest.TestCase):
         for failure in (False, True):
             with self.subTest(failure=failure):
                 assignment = self.fake.add([])
-                assignment['contract'].update(harness='codex', harness_params={})
+                assignment['contract'].update(harness='codex', harness_params={'model': 'gpt-6-astra', 'effort': 'xhigh'})
                 events = [dict(type='thread.started', thread_id=session),
                           dict(type='turn.completed', usage={'input_tokens': 7, 'output_tokens': 9})]
                 if failure:

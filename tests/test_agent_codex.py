@@ -12,10 +12,27 @@ import unittest
 from unittest.mock import patch
 import uuid
 
-from agent_collab.adapters.codex import (MODEL, WindowsJob, OwnedProcess, CodexAdapter,
-    build_argv, classify_failure, parse_events, read_observed)
+from agent_collab.adapters.codex import (WindowsJob, OwnedProcess, CodexAdapter,
+    build_argv, classify_failure, model_catalog, parse_events, read_observed)
+
+MODEL = 'gpt-6-astra'  # 稳定 launcher 固定的模型；适配器本身不再带默认值
 
 ROOT = Path(__file__).resolve().parents[1]
+# 假的 `codex app-server`：两页 model/list，夹一行非 JSON 与一个名称不合约束的条目。
+FAKE_APP_SERVER = '''import json, sys
+assert sys.argv[1] == 'app-server'
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get('method') == 'initialize':
+        print(json.dumps({'id': m['id'], 'result': {}}), flush=True)
+    elif m.get('method') == 'model/list':
+        page = m['params']['cursor']
+        data = [{'model': 'm-two', 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}], 'defaultReasoningEffort': 'high'}] if page else [
+            {'model': 'm-one', 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'max'}], 'defaultReasoningEffort': 'low'},
+            {'model': 'bad name!', 'supportedReasoningEfforts': [], 'defaultReasoningEffort': None}]
+        print('not json', flush=True)
+        print(json.dumps({'id': m['id'], 'result': {'data': data, 'nextCursor': None if page else 'p2'}}), flush=True)
+'''
 SESSION = '5cb86daf-bcf1-44c2-9a68-8849447476e1'
 
 
@@ -33,8 +50,8 @@ class CodexTests(unittest.TestCase):
             '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true',
             '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
             '--model', 'gpt-6-astra', '--skip-git-repo-check', '--json', '-o', str(self.temp / 'result.txt')]
-        self.assertEqual(build_argv(['codex'], self.temp, self.temp, {'sandbox': 'workspace-write'}, system='Darwin'), common + ['-'])
-        self.assertEqual(build_argv(['codex'], self.temp, self.temp, {'sandbox': 'workspace-write'}, SESSION, system='Darwin'),
+        self.assertEqual(build_argv(['codex'], self.temp, self.temp, {'model': MODEL, 'effort': 'xhigh', 'sandbox': 'workspace-write'}, system='Darwin'), common + ['-'])
+        self.assertEqual(build_argv(['codex'], self.temp, self.temp, {'model': MODEL, 'effort': 'xhigh', 'sandbox': 'workspace-write'}, SESSION, system='Darwin'),
                          common + ['resume', SESSION, '-'])
 
     def test_argv_matches_installed_stable_launcher_function_without_running_it(self):
@@ -56,11 +73,42 @@ class CodexTests(unittest.TestCase):
                         expected = namespace['argv']({'codex': ['python', 'wrapper']}, q, self.temp)
                         expected.insert(expected.index('exec') + 1, '--ignore-user-config')
                         actual = build_argv(['python', 'wrapper'], self.temp, self.temp,
-                            {'sandbox': sandbox, 'effort': effort}, SESSION if operation == 'resume' else None, structured, system='Darwin')
+                            {'model': MODEL, 'sandbox': sandbox, 'effort': effort}, SESSION if operation == 'resume' else None, structured, system='Darwin')
                         self.assertEqual(actual, expected)
 
+    def test_contract_model_and_effort_are_passed_through_unchanged(self):
+        argv = build_argv('codex', self.temp, self.temp, {'model': 'gpt-6.1-sol', 'effort': 'low'}, system='Linux')
+        self.assertEqual(argv[argv.index('--model') + 1], 'gpt-6.1-sol')
+        self.assertIn('model_reasoning_effort="low"', argv)
+
+    def test_model_catalog_reads_model_list_over_stdio_and_reports_unknown_on_failure(self):
+        server = self.temp / 'fake_app_server.py'
+        server.write_text(FAKE_APP_SERVER)
+        catalog = model_catalog([sys.executable, str(server)])
+        self.assertEqual((catalog['status'], catalog['source'], catalog['reason']), ('ok', 'app-server:model/list', None))
+        self.assertEqual(catalog['models'], [{'id': 'm-one', 'efforts': ['low', 'max'], 'default_effort': 'low'},
+                                             {'id': 'm-two', 'efforts': ['high'], 'default_effort': 'high'}])
+        self.assertEqual(model_catalog(None)['reason'], 'command_missing')
+        self.assertEqual(model_catalog([str(self.temp / 'missing-binary')])['reason'], 'spawn_failed')
+        broken = self.temp / 'broken.py'
+        broken.write_text('import sys; sys.exit(3)')
+        failed = model_catalog([sys.executable, str(broken)], timeout=5)
+        self.assertEqual((failed['status'], failed['reason'], failed['models']), ('unknown', 'probe_failed', []))
+
+    def test_model_catalog_gives_up_at_the_deadline_even_while_notifications_keep_arriving(self):
+        chatty = self.temp / 'chatty.py'
+        chatty.write_text('import sys\nwhile True:\n    sys.stdout.write(\'{"method": "note"}\\n\')\n    sys.stdout.flush()\n',
+                          encoding='utf-8')
+        started = time.monotonic()
+        result = model_catalog([sys.executable, str(chatty)], timeout=2)
+        self.assertEqual((result['status'], result['reason']), ('unknown', 'probe_failed'))
+        self.assertLess(time.monotonic() - started, 15)
+
     def test_invalid_model_effort_sandbox_and_session_rejected(self):
-        for params in ({'model': 'another'}, {'effort': 'low'}, {'effort': None}, {'sandbox': 'danger-full-access'}):
+        # model 与 effort 必须由契约给出且形状合法；适配器不补默认值。
+        for params in ({}, {'model': MODEL}, {'effort': 'xhigh'}, {'model': 'bad model', 'effort': 'xhigh'},
+                       {'model': MODEL, 'effort': None}, {'model': MODEL, 'effort': 'X High'},
+                       {'model': MODEL, 'effort': 'xhigh', 'sandbox': 'danger-full-access'}):
             with self.assertRaises(ValueError):
                 build_argv('codex', self.temp, self.temp, params)
         with self.assertRaises(ValueError):
@@ -176,7 +224,7 @@ class CodexTests(unittest.TestCase):
         class Context:
             work = self.temp
             directory = self.temp
-            contract = {'prompt': 'no real model', 'harness_params': {}}
+            contract = {'prompt': 'no real model', 'harness_params': {'model': MODEL, 'effort': 'xhigh'}}
             def can_execute(self):
                 return True
             def start_process(self, factory, *args):

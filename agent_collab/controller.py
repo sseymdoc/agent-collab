@@ -1,5 +1,6 @@
 """Single-authority controller; App is socket-free, HTTP only transports Responses."""
 import argparse
+import copy
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -27,7 +28,7 @@ from . import domain as d
 from .release import release_info
 from . import protocol as p
 from .blobstore import BlobStore
-from .artifacts import DEFAULT_EXCLUDES, workspace_excluded
+from .artifacts import DEFAULT_EXCLUDES, owner_only, workspace_excluded
 from .store import Store
 
 
@@ -78,6 +79,28 @@ def new_id():
     return str(uuid.uuid4())
 
 
+def client_scopes(role=None, scopes=None):
+    """配对码授予的权限：给角色名，或直接给 scope 列表（§12.1）。"""
+    if (role is None) == (scopes is None):
+        raise ValueError('give exactly one of role or scopes')
+    if role is not None:
+        if role not in p.ROLES:
+            raise ValueError('role must be owner, operator or viewer')
+        return list(p.ROLES[role])
+    if not isinstance(scopes, list) or not scopes or any(s not in p.SCOPES for s in scopes):
+        raise ValueError('scopes must be a nonempty list of: ' + ', '.join(p.SCOPES))
+    return [s for s in p.SCOPES if s in scopes]
+
+
+def issue_client_code(store, scopes, ttl, now):
+    """调用方负责事务。只存哈希；配对码不以 '-' 开头，避免被命令行当成选项。"""
+    if type(ttl) is not int or not 0 < ttl <= 3600:
+        raise ValueError('ttl must be between 1 and 3600 seconds')
+    code = secrets.token_hex(18)
+    store.put('client_pairing', digest_token(code), {'hash': digest_token(code), 'scopes': scopes, 'expires': now + ttl})
+    return code
+
+
 def require_uuid(value, name='id'):
     p.check_uuid(value, name)
     if uuid.UUID(value).version != 4:
@@ -114,12 +137,20 @@ class App:
         self._validate_config()
         self.blobs = BlobStore(self.data_dir, self.config['max_blob_bytes'])
         self.store = Store(self.data_dir)
+        self.request = (('admin', None), '', '')  # 当前请求的 (identity, method, route)，供请求来源记录使用
         token_file = self.data_dir / 'admin.token'
         try:
             fd = os.open(str(token_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             pass
         else:
+            try:
+                owner_only(token_file)  # Windows 不认 0o600：写入令牌前先去掉继承的 ACL
+            except OSError:
+                os.close(fd)
+                token_file.unlink()
+                self.store.close()  # 构造失败：不留下打开的数据库
+                raise
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(secrets.token_urlsafe(32) + '\n')
                 f.flush()
@@ -132,6 +163,17 @@ class App:
             if self.store.get('meta', 'controller') is None:
                 self.store.put('meta', 'controller', {'controller_id': new_id(), 'authority_generation': 1,
                                'version': 1, 'dispatch_paused': False, 'created_at': d.timestamp(now)})
+            self.controller_id = self.meta()['controller_id']
+            if self.store.get('settings', 'models') is None:
+                # §12.3：记录在首次启动时就写下。已有任务或节点的库是升级前的部署，保留它此前写死的组合；
+                # 空库从未设置开始。之后凭记录是否存在区分，不会把迁移值写进新部署。
+                settings = copy.deepcopy(d.EMPTY_SETTINGS)
+                if self.store.all('job') or self.store.all('node'):
+                    profile = d.managed_profile(self.config)
+                    settings = dict(d.migrated_settings(profile['profile']), revision=1, updated_at=d.timestamp(now),
+                                    updated_by={'kind': 'migration', 'client_id': None, 'name': None})
+                    self.emit('settings.updated', {'revision': 1, 'actor': settings['updated_by']}, now)
+                self.store.put('settings', 'models', settings)
             for node in self.store.all('node'):
                 node['capability_evidence'] = d.capability_evidence(node)
                 self.store.put('node', node['node_id'], node)
@@ -148,8 +190,11 @@ class App:
 
     def _validate_config(self):
         if set(self.config) - (set(p.DEFAULTS) | {'public_origin', 'deployment_profile', 'guarantees', 'score_weights',
-                                               'managed_coordinator', 'standby_profiles'}):
+                                               'managed_coordinator', 'standby_profiles', 'web_console'}):
             raise ValueError('unknown controller config key')
+        # 浏览器控制台是迁移期的兼容入口（§12.1）；关闭后只剩客户端凭据与管理令牌。
+        if type(self.config.setdefault('web_console', True)) is not bool:
+            raise ValueError('web_console must be boolean')
         for key in p.DEFAULTS:
             value = self.config[key]
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
@@ -232,7 +277,13 @@ class App:
             credential = self.store.get('node_token', token_hash)
             if credential and hmac.compare_digest(token_hash, credential['hash']):
                 return ('node', credential['node_id'])
+            # 撤销时凭据记录即被删除，所以下一次请求（含事件流的下一轮）就认证失败。
+            credential = self.store.get('client_token', token_hash)
+            if credential and hmac.compare_digest(token_hash, credential['hash']):
+                return ('client', credential['client_id'])
             raise APIError('unauthorized', 'invalid credential')
+        if not self.config['web_console']:
+            raise APIError('unauthorized', 'authentication required')
         cookie = SimpleCookie()
         try:
             cookie.load(headers.get('cookie', ''))
@@ -249,10 +300,18 @@ class App:
                 raise APIError('forbidden', 'CSRF or Origin check failed')
         return ('session', hashed)
 
-    @staticmethod
-    def client(identity):
-        if identity[0] not in ('admin', 'session'):
+    def allow(self, identity, scope=None):
+        """客户端端点的授权：管理令牌与浏览器会话拥有全部权限，客户端凭据按配对时授予的 scope。"""
+        if identity[0] in ('admin', 'session'):
+            return
+        if identity[0] != 'client':
             raise APIError('forbidden', 'client credential required')
+        if scope is not None and scope not in self.get('client', identity[1])['scopes']:
+            raise APIError('forbidden', 'client lacks the required permission', required_scope=scope)
+
+    def actor(self, identity):
+        name = self.get('client', identity[1])['name'] if identity[0] == 'client' else None
+        return {'kind': identity[0], 'client_id': identity[1] if identity[0] == 'client' else None, 'name': name}
 
     @staticmethod
     def node(identity, node_id=None):
@@ -286,11 +345,14 @@ class App:
                         result = self.login(data, headers)
                     elif method == 'POST' and route == '/nodes/pair':
                         result = self.pair(data)
+                    elif method == 'POST' and route == '/clients/pair':
+                        result = self.pair_client(data)
                     else:
                         identity = self._authenticate(headers, method)
                         # Expiry is an independent authoritative fact, even when a request is rejected.
                         self._expire(self.clock())
                         self.store.db.execute('SAVEPOINT request')
+                        self.request = (identity, method, route)
                         try:
                             result = self.route('GET' if is_head else method, route, query, headers, body, data, identity)
                         except (APIError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
@@ -300,6 +362,9 @@ class App:
                             self.store.db.execute('RELEASE request')
         except (APIError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
             result = self.error(exc)
+        if target.startswith(p.API_PREFIX + '/'):
+            # §12.1：客户端据此确认应答来自它配对的那个 controller。
+            result.headers.append(('X-Controller-Id', self.controller_id))
         if is_head:
             result.headers.append(('Content-Length', str(len(result.body))))
             result.body, result.stream = b'', None
@@ -309,6 +374,8 @@ class App:
     def error(exc):
         if isinstance(exc, APIError):
             return exc.response()
+        if isinstance(exc, d.PolicyError):
+            return APIError('invalid', 'model policy: ' + str(exc), reason=exc.reason).response()
         if isinstance(exc, OverflowError):
             return APIError('too_large', str(exc)).response()
         # Do not reflect raw malformed request values (which can contain credentials).
@@ -320,7 +387,7 @@ class App:
             raise ValueError('unsafe static path')
         root = Path(__file__).parent / 'static'
         index = root / 'index.html'
-        if not index.is_file():
+        if not index.is_file() or not self.config['web_console']:
             if path == '/':
                 return Response(200, [('Content-Type', 'text/plain; charset=utf-8')], b'agent-collab controller; UI is not installed.\n')
             raise APIError('not_found', 'static UI not installed')
@@ -337,6 +404,8 @@ class App:
                               ('X-Content-Type-Options', 'nosniff'), ('Cache-Control', cache)], candidate.read_bytes())
 
     def login(self, data, headers):
+        if not self.config['web_console']:
+            raise APIError('forbidden', 'web console is disabled; pair a client instead')
         if headers.get('origin', '') not in ('', self.config['public_origin']):
             raise APIError('forbidden', 'Origin check failed')
         token = data.get('token', '')
@@ -369,6 +438,147 @@ class App:
         return response(dict(node_id=data['node_id'], node_token=token,
                              controller_id=self.meta()['controller_id'], authority_generation=self.meta()['authority_generation']))
 
+    def client_code(self, role='owner', scopes=None, ttl=600):
+        with self.store.transaction():
+            return issue_client_code(self.store, client_scopes(role if scopes is None else None, scopes), ttl, self.clock())
+
+    def controller_info(self):
+        meta = self.meta()
+        return {'controller_id': meta['controller_id'], 'authority_generation': meta['authority_generation'],
+                'version': RELEASE['version'], 'git_commit': RELEASE['git_commit'], 'features': list(p.FEATURES)}
+
+    def pair_client(self, data):
+        name, kind = data.get('name'), data.get('kind')
+        if not isinstance(name, str) or not name.strip() or len(name) > 80 or kind not in p.CLIENT_KINDS:
+            raise ValueError('client name and kind (desktop, cli or agent) are required')
+        hashed = digest_token(data.get('code'))
+        record = self.store.get('client_pairing', hashed)
+        if not record or not hmac.compare_digest(record['hash'], hashed) or record['expires'] <= self.clock():
+            raise APIError('unauthorized', 'invalid or expired pairing code')
+        self.store.delete('client_pairing', hashed)
+        token, now = secrets.token_urlsafe(32), self.clock()
+        client = {'client_id': new_id(), 'name': name.strip(), 'kind': kind, 'scopes': record['scopes'],
+                  'created_at': d.timestamp(now), 'revoked_at': None, 'version': 1}
+        self.store.put('client', client['client_id'], client)
+        self.store.put('client_token', digest_token(token), {'hash': digest_token(token), 'client_id': client['client_id']})
+        self.emit('client.paired', client, now)
+        info = self.controller_info()
+        return response(dict({k: client[k] for k in ('client_id', 'name', 'kind', 'scopes')}, client_token=token,
+                             controller_id=info['controller_id'], authority_generation=info['authority_generation'],
+                             controller={k: info[k] for k in ('version', 'git_commit')}, features=info['features']))
+
+    def _revoke_client(self, client, now):
+        for credential in self.store.all('client_token'):
+            if credential['client_id'] == client['client_id']:
+                self.store.delete('client_token', credential['hash'])
+        client = dict(client, revoked_at=client['revoked_at'] or d.timestamp(now), version=client['version'] + 1)
+        self.store.put('client', client['client_id'], client)
+        self.emit('client.revoked', client, now)
+        return client
+
+    def model_settings(self):
+        return self.store.get('settings', 'models')
+
+    def root_policy(self, root_id):
+        """根工作包冻结的模型策略；升级前创建的根按原行为推导（§12.4）。"""
+        policy = self.get('root', root_id).get('model_policy')
+        return policy or d.legacy_root_policy(next(j for j in self.store.all('job') if j['work_package_id'] == root_id))
+
+    def _resolve_contract(self, value, root_id):
+        """受理时把 codex 的 model/effort 解析成确定值并校验契约；返回 (契约, model_policy)。"""
+        policy = None
+        if isinstance(value, dict) and value.get('harness') == 'codex' and isinstance(value.get('harness_params', {}), dict):
+            if root_id and self.store.get('root', root_id):
+                frozen = self.root_policy(root_id)
+                base, source, revision = frozen['codex'], 'legacy_compat' if frozen.get('legacy') else 'root_frozen', frozen['settings_revision']
+                # 同一根的后续修订模型不变（ADR 0002）；即使另一模型也在冻结的许可范围内，也不能借修订换模型。
+                asked = value.get('harness_params', {}).get('model')
+                if asked is not None and base['model'] is not None and asked != base['model']:
+                    raise d.PolicyError('model_not_allowed', 'revisions of a work package keep the model frozen at its root')
+            else:
+                settings = self.model_settings()
+                base = dict(settings['codex']['default'], allowed=settings['codex']['allowed'])
+                source, revision = 'workspace_default', settings['revision']
+            resolved, requested, sources = d.resolve_codex(value.get('harness_params', {}), base, source)
+            value = dict(value, harness_params=dict(value.get('harness_params', {}), **resolved))
+            policy = {'schema': 1, 'settings_revision': revision, 'requested': requested, 'resolved': resolved, 'source': sources}
+        return d.validate_contract(value), policy
+
+    def _model_settings_view(self):
+        settings, nodes = self.model_settings(), self.store.all('node')
+        unknown = {'status': 'unknown', 'source': None, 'fetched_at': None, 'cli_version': None,
+                   'reason': 'no_catalog_interface', 'models': []}
+        catalog = {n['node_id']: {'codex': d.codex_catalog(n), 'claude': (n['capabilities'].get('models') or {}).get('claude') or unknown}
+                   for n in nodes}
+        return response({'settings': settings, 'catalog': {'nodes': catalog}, 'selectable': d.selectable_codex(settings, nodes),
+                         'history': self.store.all('settings_history')[-20:]})
+
+    def _put_model_settings(self, data, identity):
+        current, now = self.model_settings(), self.clock()
+        if set(data) - {'expected_revision', 'codex', 'claude', 'request_id'}:
+            raise ValueError('unknown settings fields')
+        if type(data.get('expected_revision')) is not int:
+            raise ValueError('expected_revision is required')
+        if data['expected_revision'] != current['revision']:
+            raise APIError('version_mismatch', 'settings changed', current=current)
+        values = d.validate_model_settings(data.get('codex', current['codex']), data.get('claude', current['claude']))
+        updated = dict(values, revision=current['revision'] + 1, updated_at=d.timestamp(now), updated_by=self.actor(identity))
+        self.store.put('settings', 'models', updated)
+        self.store.put('settings_history', '%012d' % updated['revision'], {
+            'revision': updated['revision'], 'at': updated['updated_at'], 'actor': updated['updated_by'],
+            'before': {k: current[k] for k in ('codex', 'claude')}, 'after': values})
+        self.emit('settings.updated', {'revision': updated['revision'], 'actor': updated['updated_by'], 'after': values}, now)
+        return response(updated)
+
+    def _baseline_view(self, record):
+        return dict(record, missing_blobs=self.blobs.missing(self.manifest(record['manifest_sha256'])))
+
+    def _create_baseline(self, data, identity):
+        name = data.get('name')
+        if not isinstance(name, str) or not name.strip() or len(name) > 120:
+            raise ValueError('baseline name is required')
+        manifest = p.validate_manifest(data['manifest'])
+        if manifest['base'] is not None:
+            raise ValueError('baseline manifest must not have a base')
+        ident, now = new_id(), self.clock()
+        # 记入 manifest_refs，备份按它收集基线的 manifest 与已上传的 blob。
+        digest = self.remember_manifest('baseline:' + ident, manifest)
+        record = {'baseline_id': ident, 'name': name.strip(), 'manifest_sha256': digest, 'files': len(manifest['files']),
+                  'bytes': sum(f['size'] for f in manifest['files']), 'created_at': d.timestamp(now), 'created_by': self.actor(identity)}
+        self.store.put('baseline', ident, record)
+        self.emit('baseline.created', record, now)
+        return response(self._baseline_view(record), 201)
+
+    def _draft(self, data):
+        """§12.6：模板 + 目标 → 可提交的契约；不改变状态。"""
+        manifest, warnings = data.get('inputs_manifest'), []
+        if data.get('baseline_id') is not None:
+            if manifest is not None:
+                raise ValueError('give baseline_id or inputs_manifest, not both')
+            manifest = self.manifest(self.get('baseline', data['baseline_id'])['manifest_sha256'])
+        if manifest is None:
+            manifest = {'version': 1, 'base': None, 'files': [], 'deleted': []}
+            warnings.append({'code': 'empty_inputs', 'detail': 'no input baseline was chosen; the workspace starts empty'})
+        elif self.blobs.missing(p.validate_manifest(manifest)):
+            warnings.append({'code': 'missing_blobs', 'detail': 'some input files are not uploaded yet; the job waits until they are'})
+        title, request = d.draft_contract(data, manifest)
+        contract, policy = self._resolve_contract(request, None)
+        settings = self.model_settings()
+        if policy:
+            choice = d.selectable_codex(settings, self.store.all('node'))
+            supported = any(e['model'] == policy['resolved']['model'] and policy['resolved']['effort'] in e['efforts'] for e in choice['codex'])
+            if not supported and not choice['unknown_nodes']:
+                warnings.append({'code': 'no_node_supports_model', 'detail': 'no registered node lists this model and effort; the job would wait'})
+        return response({'title': title, 'contract': request, 'preview': contract, 'model_policy': policy,
+                         'settings_revision': settings['revision'], 'warnings': warnings})
+
+    def _submit(self, data, identity):
+        expected = data.get('expected_settings_revision')
+        if expected is not None and expected != self.model_settings()['revision']:
+            # 草拟时看到的解析结果已过期：让客户端重新草拟，而不是按新默认值悄悄受理。
+            raise APIError('version_mismatch', 'model settings changed since the contract was drafted', current=self.model_settings())
+        return self._create_job(data, created_by=self.actor(identity))
+
     def idempotent(self, endpoint, data, operation, creation=False):
         ident = require_uuid(data.get('request_id'), 'request_id')
         hashed = p.value_hash(data)
@@ -381,6 +591,13 @@ class App:
         if 200 <= result.status < 300:
             self.store.db.execute('INSERT INTO requests VALUES(?,?,?,?,?,?)',
                                   (endpoint, ident, hashed, result.status, json.dumps(result.headers), result.body))
+            identity, method, route = self.request
+            if identity[0] != 'node':
+                # §12.2：只记实际执行的请求；重放在上面已返回。
+                pieces = route.strip('/').split('/')
+                job_id = pieces[1] if pieces[0] == 'jobs' and len(pieces) > 1 else json.loads(result.body)['job_id'] if route == '/jobs' else None
+                self.store.event('audit.action', {'actor': self.actor(identity), 'action': method + ' ' + route, 'request_id': ident},
+                                 d.timestamp(self.clock()), job_id=job_id)
         return result
 
     def remember_manifest(self, job_id, manifest):
@@ -449,8 +666,8 @@ class App:
                     lease['holder_kind'] == kind and lease['holder_ref'] == ref)
         if lease and not owns and not takeover:
             raise APIError('conflict', 'work package has an exclusive coordinator', reason='coordinator_lease')
-        if takeover and identity[0] not in ('admin', 'session'):
-            raise APIError('forbidden', 'administrator required for takeover')
+        if takeover:
+            self.allow(identity, 'maintain')
         if lease and not owns:
             self.emit('coordinator.takeover', {'work_package_id': root_id, 'previous_holder': lease['holder_ref'],
                       'holder_ref': ref, 'reason': data['reason']}, self.clock())
@@ -502,7 +719,8 @@ class App:
                 return
         elif trigger not in ('completed', 'waiting_reconcile', 'rework'):
             return
-        profile = d.managed_profile(self.config)
+        settings = self.model_settings()
+        profile = d.managed_profile(self.config, settings['claude']['default'])
         lease = self.coordinator(job['work_package_id'])
         if profile['status'] != 'ready' or (lease and lease['holder_kind'] == 'interactive'):
             return
@@ -517,6 +735,10 @@ class App:
                    'checkpoint_diff': p.manifest_diff(job['contract']['inputs_manifest'], self.manifest(cp['manifest_sha256'])) if cp else None,
                    'assessments': [a for a in self.store.all('assessment') if a['job_id'] == job['job_id']]}
         context.update(self._context_files(job))
+        frozen = self.root_policy(job['work_package_id'])['codex']
+        # 修复只能在根冻结的范围内选择 effort（§12.4）；这里把范围告诉协调者，最终由 controller 检查。
+        context['repair_policy'] = {'model': frozen['model'], 'effort': frozen['effort'],
+                                    'allowed_efforts': None if frozen['allowed'] is None else frozen['allowed'].get(frozen['model'], [])}
         files = []
         for name, value in (('context.json', context), ('decision-schema.json', d.DECISION_SCHEMA)):
             raw = p.canonical_json(value)
@@ -530,8 +752,12 @@ class App:
                     'requirements': {'tools': ['claude']}, 'recovery': {'auto': False, 'side_effects': 'none'},
                     'inputs_manifest': {'version': 1, 'base': None, 'files': files, 'deleted': []},
                     'publish': {'mode': 'manual', 'requires_acceptance': False}}
+        chosen = {k: selected[k] for k in ('model', 'effort')}
+        source = 'workspace_default' if settings['claude']['default']['model'] else 'deployment_profile'
         created = self._create_job({'request_id': new_id(), 'title': 'Coordinate: ' + job['title'], 'contract': contract},
-                                   managed={'node_ids': selected['node_ids'], 'target_state': self._decision_state(job)}, schedule=False)
+                                   managed={'node_ids': selected['node_ids'], 'target_state': self._decision_state(job)}, schedule=False,
+                                   model_policy={'schema': 1, 'settings_revision': settings['revision'], 'requested': chosen,
+                                                 'resolved': chosen, 'source': {'model': source, 'effort': source}})
         ident = json.loads(created.body)['job_id']
         self.store.put('coordinator_trigger', key, {'job_id': ident})
         self.emit('coordinator.triggered', {'coordinator_job_id': ident, 'trigger': trigger, 'target_version': job['version']}, now, job=job)
@@ -625,7 +851,14 @@ class App:
                 raise ValueError('follow_up requires rework')
             if target['cancel']['requested_at']:
                 raise ValueError('cancel_requested')
-            contract = d.repair_contract(target['contract'], follow, self.manifest(checkpoint['manifest_sha256']))
+            # 只读根冻结的策略，不读当前设置：模型不变，effort 只能在冻结的许可范围内改（§12.4）。
+            policy = self.root_policy(target['work_package_id'])
+            contract = d.repair_contract(target['contract'], follow, self.manifest(checkpoint['manifest_sha256']), policy)
+            inherited = 'legacy_compat' if policy.get('legacy') else 'root_frozen'
+            model_policy = {'schema': 1, 'settings_revision': policy['settings_revision'],
+                            'requested': {'model': None, 'effort': follow['effort']},
+                            'resolved': {k: contract['harness_params'][k] for k in ('model', 'effort')},
+                            'source': {'model': inherited, 'effort': inherited if follow['effort'] is None else 'coordinator_override'}}
             root = self.root(target)
             reason = d.budget_reason(dict(target, contract=contract), root['counters'], now, root['created_at'], repair=True)
             if any(v in ('unknown', 'intent') for v in self.store.get('effects', target['work_package_id'], {}).values()):
@@ -637,7 +870,7 @@ class App:
                 self.change('job', target, now, status='failed', status_reason='managed_rework')
             self._create_job({'request_id': new_id(), 'title': follow['title'],
                               'work_package_id': target['work_package_id'], 'contract': contract},
-                             input_checkpoint=checkpoint)
+                             input_checkpoint=checkpoint, model_policy=model_policy)
         except (APIError, ValueError, TypeError, KeyError, OverflowError) as exc:
             self.store.db.execute('ROLLBACK TO follow_up')
             if isinstance(exc, APIError) and exc.code == 'budget_exhausted':
@@ -890,9 +1123,11 @@ class App:
         cap = data['capabilities']
         required_cap = {'os', 'arch', 'tools', 'gpu', 'harness', 'labels'}
         if (not isinstance(cap, dict) or not required_cap <= set(cap) or
-                set(cap) - required_cap - {'harness_paths', 'harness_disabled', 'agent'} or
+                set(cap) - required_cap - {'harness_paths', 'harness_disabled', 'agent', 'models'} or
                 cap['os'] not in p.OS_NAMES or cap['arch'] not in ('x86_64', 'arm64')):
             raise ValueError('invalid capabilities')
+        if 'models' in cap:
+            d.validate_catalogs(cap['models'])
         for key in ('tools', 'harness', 'harness_paths', 'harness_disabled'):
             if key not in cap:
                 continue
@@ -936,8 +1171,9 @@ class App:
             node['capability_evidence'] = d.capability_evidence(node)
             self.store.put('node', node['node_id'], node)
             self.emit('node.registered', node, now, node=node['node_id'])
+        # features：节点看到 node_models 后才在注册里带模型目录（§12.5）；旧 controller 没有这个键。
         return response({'node': node, 'authority_generation': self.meta()['authority_generation'],
-                         'config': {k: self.config[k] for k in ('heartbeat_s', 'lease_ttl_s')}})
+                         'config': {k: self.config[k] for k in ('heartbeat_s', 'lease_ttl_s')}, 'features': list(p.FEATURES)})
 
     @staticmethod
     def _health(value):
@@ -1061,12 +1297,14 @@ class App:
             session = self.store.get('session', identity[1])
             return response({'csrf_token': self.csrf_for(identity[1]), 'expires_at': d.timestamp(session['expires'])})
         if route == '/session' and method == 'DELETE':
-            self.client(identity)
+            self.allow(identity)
             if identity[0] == 'session':
                 self.store.delete('session', identity[1])
             return response({}, headers=[('Set-Cookie', 'ac_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict')])
         if pieces[0] == 'blobs' and len(pieces) == 2:
             digest = p.check_sha256(pieces[1])
+            if identity[0] != 'node':
+                self.allow(identity, 'tasks' if method == 'PUT' else 'read')
             if method == 'PUT':
                 created = self.blobs.put(digest, body)
                 self._refresh_blobs(now)
@@ -1112,7 +1350,7 @@ class App:
                 if identity[0] == 'node':
                     self.node(identity, attempt['node_id'])
                 else:
-                    self.client(identity)
+                    self.allow(identity, 'tasks')
                 if identity[0] != 'node' or job['contract']['publish']['mode'] != 'auto':
                     self.coordinator_guard(job['work_package_id'], headers)
                 self.fence(attempt, data, client=identity[0] != 'node')
@@ -1123,16 +1361,73 @@ class App:
                 if job['contract']['integration']['target_node_id'] is None:
                     raise APIError('forbidden', 'no integration target node configured')
             else:
-                self.client(identity)
+                self.allow(identity, 'tasks')
             self.coordinator_guard(job['work_package_id'], headers)
             return self.idempotent(route, data, lambda: self._integration(job, data, identity))
-        self.client(identity)
+        self.allow(identity)
+        if route == '/client':
+            # 连接自检与自我撤销不需要任何 scope：只读客户端也要能确认身份、断开连接。
+            if method == 'GET':
+                scopes = self.get('client', identity[1])['scopes'] if identity[0] == 'client' else list(p.SCOPES)
+                return response({'identity': dict(self.actor(identity), scopes=scopes), 'controller': self.controller_info()})
+            if method == 'DELETE' and identity[0] == 'client':
+                self._revoke_client(self.get('client', identity[1]), now)
+                return response({})
+        # 其余客户端端点按路由所需权限检查（§12.1）。未列出的变更归入 tasks，未列出的读取归入 read。
+        if method == 'GET':
+            scope = 'maintain' if route in ('/doctor', '/clients') else 'read'
+        elif route == '/settings/models':
+            scope = 'settings'
+        elif pieces[0] == 'nodes':
+            scope = 'devices'
+        elif route == '/dispatch' or pieces[0] == 'clients':
+            scope = 'maintain'
+        else:
+            scope = 'tasks'
+        self.allow(identity, scope)
+        if route == '/clients' and method == 'GET':
+            return response({'clients': self.store.all('client')})
+        if route == '/clients/codes' and method == 'POST':
+            # 配对码只在这一次响应里出现，不进幂等回执；request_id 只用来拒绝重复请求。
+            ident = require_uuid(data.get('request_id'), 'request_id')
+            if self.store.get('client_code_request', ident):
+                raise APIError('conflict', 'request_id was already used to issue a pairing code')
+            scopes = client_scopes(data.get('role'), data.get('scopes'))
+            for scope in scopes:
+                self.allow(identity, scope)  # 客户端只能签发不超过自己权限的配对码，否则 maintain 即可换取 owner
+            ttl = data.get('ttl_s', 600)
+            code = issue_client_code(self.store, scopes, ttl, now)
+            self.store.put('client_code_request', ident, {'at': d.timestamp(now)})
+            self.store.event('audit.action', {'actor': self.actor(identity), 'action': 'POST /clients/codes', 'request_id': ident,
+                                              'scopes': scopes}, d.timestamp(now))
+            return response({'code': code, 'scopes': scopes, 'expires_at': d.timestamp(now + ttl)}, 201)
+        if pieces[0] == 'clients' and len(pieces) == 3 and pieces[2] == 'revoke' and method == 'POST':
+            def revoke():
+                client = self.get('client', pieces[1])
+                self.version(data, client)
+                return response(self._revoke_client(client, now))
+            return self.idempotent(route, data, revoke)
+        if route == '/settings/models':
+            if method == 'GET':
+                return self._model_settings_view()
+            if method == 'PUT':
+                # 应答丢失后原样重放返回第一次的结果，而不是 version_mismatch（protocol §5、§12.3）。
+                return self.idempotent(route, data, lambda: self._put_model_settings(data, identity))
+        if route == '/templates' and method == 'GET':
+            return response({'templates': list(d.TEMPLATES)})
+        if route == '/contracts/draft' and method == 'POST':
+            return self._draft(data)
+        if route == '/baselines':
+            if method == 'GET':
+                return response({'baselines': [self._baseline_view(b) for b in self.store.all('baseline')]})
+            if method == 'POST':
+                return self.idempotent(route, data, lambda: self._create_baseline(data, identity))
         if pieces[0] == 'packages' and len(pieces) == 3 and pieces[2] == 'coordinator':
             return self._coordinator_api(method, require_uuid(pieces[1], 'work_package_id'), data, headers, identity)
         if route == '/jobs' and method == 'POST':
             if data.get('work_package_id'):
                 self.coordinator_guard(data['work_package_id'], headers)
-            return self.idempotent(route, data, lambda: self._create_job(data), creation=True)
+            return self.idempotent(route, data, lambda: self._submit(data, identity), creation=True)
         if route == '/jobs' and method == 'GET':
             jobs = self.store.all('job')
             status = query.get('status', [''])[0]
@@ -1148,6 +1443,9 @@ class App:
                 jobs = jobs[ids.index(before) + 1:]
             if status:
                 jobs = [j for j in jobs if j['status'] == status]
+            package = query.get('work_package_id', [''])[0]
+            if package:
+                jobs = [j for j in jobs if j['work_package_id'] == package]
             return response({'jobs': jobs[:self.limit(query)]})
         if pieces[0] == 'jobs' and len(pieces) in (2, 3):
             job = self.get('job', pieces[1])
@@ -1159,6 +1457,9 @@ class App:
                 return response(result)
             if len(pieces) == 3 and pieces[2] == 'explain' and method == 'GET':
                 return response(self.explanation(job, now))
+            if len(pieces) == 3 and pieces[2] == 'events' and method == 'GET':
+                before = self.cursor(query.get('before', ['0'])[0])
+                return response({'events': self.store.events(job_id=job['job_id'], limit=self.limit(query), before=before or None)})
             if len(pieces) == 3 and method == 'POST' and pieces[2] in ('cancel', 'retry', 'assess'):
                 if pieces[2] != 'cancel':
                     self.coordinator_guard(job['work_package_id'], headers)
@@ -1167,6 +1468,9 @@ class App:
             cp = self.get('checkpoint', pieces[1])
             if len(pieces) == 2:
                 return response(cp)
+            if pieces[2] == 'files':
+                return response({'checkpoint_id': cp['checkpoint_id'], 'manifest_sha256': cp['manifest_sha256'],
+                                 'files': self.manifest(cp['manifest_sha256'])['files']})
             if pieces[2] == 'diff':
                 against = query.get('against', ['inputs'])[0]
                 job = self.get('job', cp['job_id'])
@@ -1185,7 +1489,14 @@ class App:
                 reasons = []
                 for job in jobs:
                     reasons = next(row['reasons'] for row in self.explanation(job, now)['nodes'] if row['node_id'] == node['node_id'])
-                nodes.append(dict(node, active_attempts=len(attempts), last_rejection_reasons=reasons))
+                current = []
+                for attempt in attempts:
+                    target = self.get('job', attempt['job_id'])
+                    current.append({'attempt_id': attempt['attempt_id'], 'job_id': target['job_id'], 'title': target['title'],
+                                    'status': attempt['status'], 'epoch': attempt['epoch'], 'lease_expires_at': attempt['lease_expires_at'],
+                                    'harness': target['contract']['harness'], 'model': attempt['runtime'].get('model'),
+                                    'effort': attempt['runtime'].get('effort'), 'coordinates': bool(target['contract'].get('coordinates'))})
+                nodes.append(dict(node, active_attempts=len(attempts), attempts=current, last_rejection_reasons=reasons))
             return response({'nodes': nodes})
         if pieces[0] == 'nodes' and len(pieces) == 3 and pieces[2] == 'drain' and method == 'POST':
             return self.idempotent(route, data, lambda: self._drain(pieces[1], data, headers))
@@ -1197,11 +1508,11 @@ class App:
             return response({'counts': {s: sum(j['status'] == s for j in jobs) for s in p.JOB_STATUSES},
                              'nodes': self.store.all('node'), 'durable_checkpoint_at': max((j['durable_checkpoint_at'] for j in jobs if j['durable_checkpoint_at']), default=None),
                              'controller': dict(self.meta(), version=RELEASE['version'], git_commit=RELEASE['git_commit'],
-                                                metadata_version=self.meta()['version'],
+                                                metadata_version=self.meta()['version'], features=list(p.FEATURES),
                                                 deployment_profile=self.config['deployment_profile'], guarantees=self.config['guarantees']),
                              'dispatch_paused': self.meta()['dispatch_paused'],
                              'backup': backup_summary(self.data_dir.parent / 'backups', now),
-                             'managed_coordinator': d.managed_profile(self.config)})
+                             'managed_coordinator': d.managed_profile(self.config, self.model_settings()['claude']['default'])})
         if route == '/events' and method == 'GET':
             after = self.cursor(query.get('after', ['0'])[0])
             return response({'events': self.store.events(after, self.limit(query)), 'min_seq': self.min_seq()})
@@ -1248,15 +1559,19 @@ class App:
     def sse_batch(self, cursor):
         minimum = self.min_seq()
         # Cursor zero on an unpruned stream means 'from the beginning'.
-        if minimum > 1 and cursor < minimum:
+        if minimum > 1 and cursor < minimum - 1:
             return [b'event: snapshot_required\ndata: ' + p.canonical_json({'min_seq': minimum}) + b'\n\n']
         events = self.store.events(cursor, 1000)
         return [('id: %d\nevent: %s\ndata: ' % (e['seq'], e['type'])).encode() + p.canonical_json(e) + b'\n\n' for e in events] or [b': ping\n\n']
 
-    def _create_job(self, data, managed=None, schedule=True, input_checkpoint=None):
+    def _create_job(self, data, managed=None, schedule=True, input_checkpoint=None, created_by=None, model_policy=None):
         if not isinstance(data.get('title', ''), str):
             raise ValueError('title must be a string')
-        contract = d.validate_contract(data['contract'])
+        if model_policy is None:
+            contract, model_policy = self._resolve_contract(data['contract'], data.get('work_package_id'))
+        else:
+            # controller 派生的契约（受管修复、协调回合）已按冻结策略或协调设置确定了参数。
+            contract = d.validate_contract(data['contract'])
         inputs = contract['inputs_manifest']
         if input_checkpoint is not None:
             source_job = self.get('job', input_checkpoint['job_id'])
@@ -1276,8 +1591,13 @@ class App:
             if any(j['work_package_id'] == root_id and j['status'] not in ('completed', 'failed', 'cancelled') for j in self.store.all('job')):
                 raise APIError('conflict', 'work_package revisions must be serial')
         else:
-            root = {'counters': dict(attempts=0, infra_retries=0, migrations=0, repairs=0), 'created_at': d.timestamp(now)}
+            # 根受理时冻结模型策略：后续修订与受管修复只读这里，不读之后修改的设置（§12.4）。
+            root = {'counters': dict(attempts=0, infra_retries=0, migrations=0, repairs=0), 'created_at': d.timestamp(now),
+                    'model_policy': d.frozen_policy(self.model_settings(),
+                                                    model_policy['resolved'] if contract['harness'] == 'codex' else None)}
         job = {
+            'model_policy': model_policy,
+            'created_by': created_by or {'kind': 'controller', 'client_id': None, 'name': None},
             'job_id': ident, 'request_id': data['request_id'], 'request_hash': p.value_hash(data),
             'work_package_id': root_id, 'title': data.get('title', ''), 'contract': contract,
             'status': 'queued', 'status_reason': '', 'protection': 'preparing' if contract['recovery']['auto'] else 'unprotected',
@@ -2088,6 +2408,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 self.server.stopping.wait(0.25)
                 result = self.server.app.handle('GET', p.API_PREFIX + '/events/stream?cursor=' + str(cursor), headers, b'')
                 if result.status != 200 or result.stream is None:
+                    if result.status in (401, 403):
+                        # 每轮都重新认证：凭据被撤销或权限被收回后，告知客户端再关闭，客户端不必猜测断开原因。
+                        self.wfile.write(b'event: unauthorized\ndata: {}\n\n')
+                        self.wfile.flush()
                     return
         except APIError as exc:
             self.close_connection = True
@@ -2147,10 +2471,16 @@ def serve(data_dir, bind='127.0.0.1:18669', public_origin=None, tls_cert=None, t
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('serve', 'pairing-code', 'admin-token', 'backup', 'restore', 'prune-events'):
+    for name in ('serve', 'pairing-code', 'client-code', 'admin-token', 'backup', 'restore', 'prune-events'):
         command = sub.add_parser(name)
         command.add_argument('--data-dir', required=True)
-        if name == 'serve':
+        if name == 'client-code':
+            # 桌面端、CLI 与其他自动化客户端的一次性配对码（§12.1）；只能在 controller 本机生成。
+            grant = command.add_mutually_exclusive_group()
+            grant.add_argument('--role', choices=sorted(p.ROLES), default=None)
+            grant.add_argument('--scopes', help='逗号分隔：' + ','.join(p.SCOPES))
+            command.add_argument('--ttl', type=int, default=600)
+        elif name == 'serve':
             command.add_argument('--bind', default='127.0.0.1:18669')
             command.add_argument('--public-origin')
             command.add_argument('--tls-cert')
@@ -2180,6 +2510,16 @@ def main(argv=None):
                     app.close()
             if args.command == 'admin-token':
                 print(str(data_dir / 'admin.token'))
+            elif args.command == 'client-code':
+                scopes = client_scopes(args.role or ('owner' if not args.scopes else None),
+                                       args.scopes.split(',') if args.scopes else None)
+                store = Store(data_dir)
+                try:
+                    with store.transaction():
+                        code = issue_client_code(store, scopes, args.ttl, time.time())
+                finally:
+                    store.close()
+                print(json.dumps({'code': code, 'scopes': scopes, 'ttl_s': args.ttl}))
             elif args.command == 'prune-events':
                 store = Store(data_dir)
                 try:
