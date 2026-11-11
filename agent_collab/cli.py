@@ -7,6 +7,7 @@
     agent-collab submit 任务.json  [--url U] [--token-file F] [--ca-file F]
     agent-collab install ...      # 本地 release 安装、升级、回退、卸载
     agent-collab doctor ...       # 安装完整性、服务及 controller/agent 检查
+    agent-collab service ...      # 受管服务 start、stop、status
 
 api/submit 使用管理令牌；变更请求缺 request_id 时自动生成。证书始终校验，http:// 仅限 loopback。
 """
@@ -95,9 +96,9 @@ def main(argv=None):
         return importlib.import_module(MODULES[cmd]).main(rest) or 0
     if cmd in ('api', 'submit'):
         return _client(rest, cmd == 'submit')
-    if cmd in ('install', 'doctor'):
+    if cmd in ('install', 'doctor', 'service'):
         from . import installer
-        return installer.main((['doctor'] if cmd == 'doctor' else []) + rest)
+        return installer.main(([cmd] if cmd != 'install' else []) + rest)
     raise SystemExit('未知子命令：' + cmd)
 
 

@@ -23,7 +23,9 @@ def build_argv(command, params, schema, session_id):
         raise ValueError('claude requires explicit profile model and effort')
     return command + ['-p', '--model', params['model'], '--effort', params['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(schema).decode(),
-            '--permission-mode', 'dontAsk', '--tools', '', '--session-id', p.check_uuid(session_id)]
+            '--permission-mode', 'dontAsk', '--tools', '', '--session-id', p.check_uuid(session_id),
+            # --setting-sources local 仍会读取工作目录及各级上级目录的 CLAUDE.local.md；--safe-mode 关闭全部记忆文件与定制。
+            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode']
 
 
 class ClaudeAdapter:
@@ -48,6 +50,12 @@ class ClaudeAdapter:
                 self.done = True
             return
         if not self.process:
+            settings = self.context.work / '.claude'
+            if settings.exists() or settings.is_symlink():
+                self.notes = 'Claude workspace contains .claude; local settings are not allowed'
+                self.context.finish('failed', 'code_failure', self.notes)
+                self.done = True
+                return
             schema = json.loads((self.context.work / 'decision-schema.json').read_text(encoding='utf-8'))
             if schema != d.DECISION_SCHEMA:
                 raise ValueError('unrecognized decision schema')

@@ -236,8 +236,10 @@ def run(command, cwd=None, check=True):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
     if cwd is not None:
         env['PYTHONPATH'] = str(cwd)
-    result = subprocess.run([str(x) for x in command], cwd=str(cwd) if cwd else None,
-                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # errors='replace'：本地化 Windows 的 schtasks/icacls 按控制台代码页（如 936）输出，不是 UTF-8；
+    # 严格解码会让读取线程抛异常、stdout 变成 None（经 SSH 或 cmd 调用时实测）。需要解析的输出都是 ASCII。
+    result = subprocess.run([str(x) for x in command], cwd=str(cwd) if cwd else None, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace')
     if check and result.returncode:
         # Commands can contain one-time codes; never echo argv or credential-bearing output.
         raise RuntimeError('{} failed (exit {}); inspect local service logs'.format(Path(command[0]).name, result.returncode))
@@ -428,12 +430,18 @@ def render_services(config, directory, user_sid=None):
             task = ET.Element('Task', version='1.2', xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task')
             registration = ET.SubElement(task, 'RegistrationInfo')
             ET.SubElement(registration, 'Description').text = 'agent-collab prefix: ' + str(prefix)
-            trigger = ET.SubElement(ET.SubElement(task, 'Triggers'), 'LogonTrigger')
-            repetition = ET.SubElement(trigger, 'Repetition')
-            ET.SubElement(repetition, 'Interval').text = 'PT5M'
+            triggers = ET.SubElement(task, 'Triggers')
+            logon = ET.SubElement(triggers, 'LogonTrigger')
+            ET.SubElement(logon, 'Enabled').text = 'true'
+            ET.SubElement(logon, 'UserId').text = user_sid
+            # 进程退出后由这个每分钟重复的时间触发器拉起（IgnoreNew 保证单实例）。实测：登录触发器上的重复
+            # 要等下一次登录事件才生效，会话中途注册的任务（每次安装、升级）没有它；RestartOnFailure 不处理进程退出。
+            timer = ET.SubElement(triggers, 'TimeTrigger')
+            repetition = ET.SubElement(timer, 'Repetition')
+            ET.SubElement(repetition, 'Interval').text = 'PT1M'
             ET.SubElement(repetition, 'StopAtDurationEnd').text = 'false'
-            ET.SubElement(trigger, 'Enabled').text = 'true'
-            ET.SubElement(trigger, 'UserId').text = user_sid
+            ET.SubElement(timer, 'StartBoundary').text = '2020-01-01T00:00:00'
+            ET.SubElement(timer, 'Enabled').text = 'true'
             principal = ET.SubElement(ET.SubElement(task, 'Principals'), 'Principal', id='CurrentUser')
             for key, value in [('UserId', user_sid), ('LogonType', 'InteractiveToken'), ('RunLevel', 'LeastPrivilege')]:
                 ET.SubElement(principal, key).text = value
@@ -543,18 +551,25 @@ class Services:
             else:
                 run(['schtasks', '/Create', '/TN', 'agent-collab-' + kind, '/XML', str(source), '/F'])
 
-    def stop(self):
+    def stop(self, disable_autostart=False):
         if not self.enabled:
             return
         for kind, target in reversed(list(self.destinations())):
             if self.system == 'Linux':
+                action = ['disable', '--now'] if disable_autostart else ['stop']
                 if kind == 'controller':
-                    self.privileged(['systemctl', 'stop', target.name])
+                    self.privileged(['systemctl'] + action + [target.name])
                 else:
-                    run(['systemctl', '--user', 'stop', target.name])
+                    run(['systemctl', '--user'] + action + [target.name])
             elif self.system == 'Darwin':
-                run(['launchctl', 'bootout', 'gui/' + str(os.getuid()) + '/org.agent-collab.' + kind], check=False)
+                label = 'gui/' + str(os.getuid()) + '/org.agent-collab.' + kind
+                if disable_autostart:
+                    run(['launchctl', 'disable', label])
+                run(['launchctl', 'bootout', label], check=False)
             else:
+                # 结束前总是先禁用：否则每分钟的触发器可能在结束进程与安装器取得状态锁之间把它拉起。
+                # start() 与重新注册都会恢复启用。
+                run(['schtasks', '/Change', '/TN', 'agent-collab-' + kind, '/DISABLE'], check=disable_autostart)
                 run(['schtasks', '/End', '/TN', 'agent-collab-' + kind], check=False)
 
     def start(self):
@@ -563,17 +578,19 @@ class Services:
         for kind, target in self.destinations():
             if self.system == 'Linux':
                 if kind == 'controller':
-                    self.privileged(['systemctl', 'start', target.name])
+                    self.privileged(['systemctl', 'enable', '--now', target.name])
                 else:
-                    run(['systemctl', '--user', 'start', target.name])
+                    run(['systemctl', '--user', 'enable', '--now', target.name])
             elif self.system == 'Darwin':
                 domain = 'gui/' + str(os.getuid())
                 label = domain + '/org.agent-collab.' + kind
+                run(['launchctl', 'enable', label])
                 if run(['launchctl', 'print', label], check=False).returncode == 0:
                     run(['launchctl', 'kickstart', label])
                 else:
                     run(['launchctl', 'bootstrap', domain, str(target)])
             else:
+                run(['schtasks', '/Change', '/TN', 'agent-collab-' + kind, '/ENABLE'])
                 run(['schtasks', '/Run', '/TN', 'agent-collab-' + kind])
 
     def remove(self):
@@ -612,12 +629,53 @@ class Services:
             try:
                 response = run(command, check=False)
                 text = response.stdout.strip()
+                if response.returncode:
+                    # systemctl is-active 用非零退出码报告 inactive/failed：保留这个状态词；其余查询失败为未知。
+                    result[kind] = text if self.system == 'Linux' and text and text != 'active' else 'unknown'
+                    continue
                 if self.system == 'Darwin':
                     result[kind] = 'active' if 'state = running' in text else 'unknown'
                 else:
                     result[kind] = 'active' if text.lower() in ('active', 'running') else (text or 'unknown')
             except OSError:
                 result[kind] = 'unknown'
+        return result
+
+    def autostart(self):
+        result = {}
+        for kind, target in self.destinations():
+            result[kind] = 'unknown'
+            if not self.enabled:
+                continue
+            if self.system == 'Linux':
+                command = ['systemctl'] + (['--user'] if kind == 'worker' else []) + ['is-enabled', target.name]
+            elif self.system == 'Darwin':
+                command = ['launchctl', 'print-disabled', 'gui/' + str(os.getuid())]
+            else:
+                command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                           "(Get-ScheduledTask -TaskName 'agent-collab-" + kind + "' -ErrorAction Stop).State"]
+            try:
+                response = run(command, check=False)
+                text = response.stdout.strip()
+                if self.system == 'Linux':
+                    # is-enabled exits nonzero for a disabled unit.
+                    if text == 'disabled':
+                        result[kind] = 'disabled'
+                    elif response.returncode == 0 and text == 'enabled':
+                        result[kind] = 'enabled'
+                elif response.returncode == 0:
+                    if self.system == 'Darwin' and 'disabled services = {' in text:
+                        # 旧版 macOS 输出 true/false，新版（实测 27.2）输出 disabled/enabled。
+                        match = re.search(r'"org\.agent-collab\.' + re.escape(kind) + r'"\s*=>\s*(true|false|disabled|enabled)', text)
+                        # No override means enabled in this launchd domain.
+                        result[kind] = 'disabled' if match and match[1] in ('true', 'disabled') else 'enabled'
+                    elif self.system == 'Windows':
+                        if text.lower() == 'disabled':
+                            result[kind] = 'disabled'
+                        elif text.lower() in ('ready', 'running', 'queued'):
+                            result[kind] = 'enabled'
+            except OSError:
+                pass
         return result
 
 
@@ -735,7 +793,7 @@ def refuse_active_worker(config, allow_active=False):
 
 def wait_worker_status(config, directory, manifest, started_at, timeout=60, clock=time.monotonic, sleep=time.sleep):
     """Require a fresh heartbeat from the actual new code, not doctor reachability."""
-    deadline = clock() + min(60, max(0, timeout))
+    deadline = clock() + max(0, timeout)
     while True:
         try:
             status = read_json(Path(config['state_dir']) / 'worker/status.json')
@@ -744,19 +802,20 @@ def wait_worker_status(config, directory, manifest, started_at, timeout=60, cloc
                     and status['version'] == manifest['version'] and status['git_commit'] == manifest.get('git_commit')
                     and type(status['pid']) is int and status['pid'] > 0 and heartbeat >= started_at):
                 return status
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             pass
         if clock() >= deadline:
-            raise RuntimeError('new worker did not report a successful heartbeat from its version directory within 60 seconds')
+            raise RuntimeError('new worker did not report a successful heartbeat from its version directory before the timeout')
         sleep(min(1, max(0, deadline - clock())))
 
 
 @contextmanager
-def stopped_locks(config, code_directory=None):
+def stopped_locks(config, code_directory=None, timeout=30):
     """Prove manual/managed processes have released their state before switching."""
     from .controller import ControllerLock
     from .node_agent import AgentLock
     with ExitStack() as stack:
+        deadline = time.monotonic() + timeout
         state = Path(config['state_dir'])
         for kind in components(config):
             directory = state / kind
@@ -765,7 +824,9 @@ def stopped_locks(config, code_directory=None):
             if kind == 'controller' and config['system'] == 'Linux' and config['service']:
                 # Keep the low-privilege process holding its lock until the whole switch completes.
                 script = ('import sys; from agent_collab.controller import ControllerLock; '
-                          'lock=ControllerLock(' + repr(str(directory)) + '); lock.__enter__(); '
+                          'from agent_collab.installer import wait_lock; '
+                          'lock=wait_lock(lambda: ControllerLock(' + repr(str(directory)) + '), timeout=' +
+                          repr(max(0, deadline - time.monotonic())) + '); '
                           'print("locked", flush=True); sys.stdin.read(); lock.__exit__()')
                 current = current_version(Path(config['prefix']), config['system'])
                 code = code_directory or (Path(config['prefix']) / 'versions' / current)
@@ -793,7 +854,8 @@ def stopped_locks(config, code_directory=None):
                         raise RuntimeError('controller lock helper failed')
                 stack.callback(release, child)
             else:
-                lock = wait_lock(lambda: ControllerLock(directory) if kind == 'controller' else AgentLock(directory))
+                lock = wait_lock(lambda: ControllerLock(directory) if kind == 'controller' else AgentLock(directory),
+                                 timeout=max(0, deadline - time.monotonic()))
                 stack.callback(lock.__exit__, None, None, None)
         yield
 
@@ -809,7 +871,7 @@ def wait_lock(factory, timeout=30, clock=time.monotonic, sleep=time.sleep):
         except (ValueError, RuntimeError):  # AgentLock 抛 ValueError，ControllerLock 抛 RuntimeError
             if clock() >= deadline:
                 raise
-            sleep(.5)
+            sleep(min(.5, max(0, deadline - clock())))
 
 
 def backup_controller(config, directory):
@@ -1132,9 +1194,127 @@ def create_root(path, config):
                                           '-g', str(os.getgid()), str(path)])
 
 
+def controller_listening(config):
+    """Unauthenticated loopback probe: a service manager can report active before the socket answers."""
+    from .client import APIError, Client, ConnectionFailure
+    try:
+        return Client('http://' + config['bind'], timeout=2).json('GET', '/healthz').get('ok') is True
+    except (APIError, ConnectionFailure, OSError, ValueError, KeyError, AttributeError):
+        return False
+
+
+def service_command(argv):
+    ap = argparse.ArgumentParser(prog='agent-collab service')
+    ap.add_argument('action', choices=('start', 'stop', 'status'))
+    ap.add_argument('--prefix', default=str(Path.home() / '.local/share/agent-collab'))
+    ap.add_argument('--allow-active', action='store_true')
+    ap.add_argument('--timeout', type=float, default=60)
+    args = ap.parse_args(argv)
+    report = dict(action=args.action)
+    reason = 'service requires an existing managed installation with a current version'
+    try:
+        if not 0 <= args.timeout <= 600:
+            reason = 'service timeout must be between 0 and 600 seconds'
+            raise ValueError(reason)
+        prefix = Path(args.prefix).expanduser().resolve()
+        old = read_json(prefix / 'installation.json')
+        config = old['config']
+        if not old.get('version') or config.get('service') is not True:
+            raise ValueError(reason)
+        if config['system'] != platform.system() or Path(config['prefix']).resolve() != prefix:
+            reason = 'installation platform or prefix does not match this invocation'
+            raise ValueError(reason)
+        version = current_version(prefix, config['system'])
+        if version != old['version']:
+            reason = 'current pointer and installation record differ; inspect interrupted installation'
+            raise ValueError(reason)
+        directory = prefix / 'versions' / version
+        manager = Services(config, directory)
+        report['current'] = version
+        # 服务名在整台机器上共用：定义属于另一个前缀的安装时，既不查询也不改动它。
+        reason = 'service definition belongs to another installation or cannot be verified; use that installation\'s prefix'
+        manager.check_ownership()
+        if args.action == 'status':
+            reason = 'could not read managed service state'
+            report.update(services=manager.status(), autostart=manager.autostart(), worker=None)
+            if 'worker' in components(config):
+                try:
+                    worker = read_json(Path(config['state_dir']) / 'worker/status.json')
+                    worker['heartbeat_age_s'] = None
+                    try:
+                        stamp = datetime.datetime.fromisoformat(worker['last_heartbeat_ok_at'].replace('Z', '+00:00'))
+                        worker['heartbeat_age_s'] = max(0, time.time() - stamp.timestamp())
+                    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+                        pass
+                    report['worker'] = worker
+                except (OSError, ValueError, TypeError):
+                    pass
+            success = all(value == 'active' for value in report['services'].values())
+        else:
+            reason = 'another installer or service command owns this prefix'
+            lock = prefix / '.install-lock'
+            lock.mkdir()
+            try:
+                if read_json(prefix / 'installation.json') != old:
+                    reason = 'installation changed concurrently; rerun service command'
+                    raise ValueError(reason)
+                if args.action == 'stop':
+                    reason = 'worker has preparing/running attempts; drain first or pass --allow-active'
+                    refuse_active_worker(config, args.allow_active)
+                    reason = 'could not disable autostart and stop managed services; inspect local service logs'
+                    manager.stop(disable_autostart=True)
+                    reason = 'process state locks were not released before the stop timeout'
+                    with stopped_locks(config, directory, timeout=args.timeout):
+                        pass
+                    report.update(stopped=True, autostart='disabled')
+                else:
+                    reason = 'installed release could not be verified'
+                    manifest = read_installed(directory)
+                    if manifest['version'] != version:
+                        raise ValueError(reason)
+                    started_at = time.time()
+                    deadline = time.monotonic() + args.timeout
+                    reason = 'could not enable and start managed services; inspect local service logs'
+                    manager.start()
+                    if 'worker' in components(config):
+                        reason = 'worker has no fresh successful heartbeat matching the current directory, version, commit and pid'
+                        report['worker'] = wait_worker_status(config, directory, manifest, started_at,
+                                                             timeout=max(0, deadline - time.monotonic()))
+                    reason = 'managed services or the local controller did not become ready before the start timeout'
+                    while True:
+                        states = manager.status()
+                        # The service entry point needs no admin token: reuse doctor's local manifest/schema
+                        # checks, then prove the controller answers on its loopback address.
+                        healthy = ('controller' not in components(config) or
+                                   (doctor(dict(config, role='controller'), offline=True)['ok'] and controller_listening(config)))
+                        if healthy and all(value == 'active' for value in states.values()):
+                            break
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError(reason)
+                        time.sleep(min(1, max(0, deadline - time.monotonic())))
+                    report.update(ready=True, services=states)
+                success = True
+            finally:
+                lock.rmdir()
+        print(json.dumps(report, ensure_ascii=False))
+        return 0 if success else 1
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError, sqlite3.Error,
+            subprocess.SubprocessError, ET.ParseError) as exc:
+        report.update(error=reason, error_type=type(exc).__name__)
+        if args.action == 'start':
+            report['ready'] = False
+        elif args.action == 'stop':
+            report['stopped'] = False
+        print('Installer: ' + reason, file=sys.stderr)
+        print(json.dumps(report, ensure_ascii=False))
+        return 1
+
+
 def main(argv=None):
     from .client import APIError, ConnectionFailure
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ['service']:
+        return service_command(argv[1:])
     if argv[:1] == ['_schema']:
         internal = argparse.ArgumentParser()
         internal.add_argument('--state-dir', required=True)

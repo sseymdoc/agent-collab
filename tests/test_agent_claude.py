@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
 
 from agent_collab import domain as d, protocol as p
@@ -37,10 +37,30 @@ class ClaudeTests(unittest.TestCase):
         argv = build_argv('/custom/claude', params, d.DECISION_SCHEMA, session)
         self.assertEqual(argv, ['/custom/claude', '-p', '--model', PROFILE['model'], '--effort', PROFILE['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(d.DECISION_SCHEMA).decode(),
-            '--permission-mode', 'dontAsk', '--tools', '', '--session-id', session])
+            '--permission-mode', 'dontAsk', '--tools', '', '--session-id', session,
+            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode'])
+        self.assertNotIn('--bare', argv)
         for value in ({}, {'model': 'x'}, {'model': 'x', 'effort': ''}):
             with self.assertRaises(ValueError):
                 build_argv('claude', value, d.DECISION_SCHEMA, session)
+
+    def test_workspace_local_settings_fail_before_starting_claude(self):
+        settings = self.temp / '.claude'
+        for kind in ('file', 'directory'):
+            with self.subTest(kind=kind):
+                settings.mkdir() if kind == 'directory' else settings.write_text('untrusted settings')
+                context = Mock(work=self.temp)
+                context.can_execute.return_value = True
+                factory = Mock(side_effect=AssertionError('must not spawn Claude'))
+                adapter = ClaudeAdapter(context, process_factory=factory)
+                adapter.tick()
+                adapter.tick()
+                context.start_process.assert_not_called()
+                factory.assert_not_called()
+                self.assertEqual(context.finish.call_args.args[:2], ('failed', 'code_failure'))
+                self.assertIn('.claude', context.finish.call_args.args[2])
+                context.finish.assert_called_once()
+                settings.rmdir() if kind == 'directory' else settings.unlink()
 
     def run_adapter(self, stdout, stderr='', code=0):
         case = self

@@ -6,7 +6,8 @@
 默认安装不会把 `agent_collab` 加入全局 Python 路径，在普通目录下 `python -m agent_collab` 无法导入。
 运行前先把 `PREFIX` 设为安装时的 `--prefix`：Linux 受管 controller/all-in-one 默认 `PREFIX=/opt/agent-collab`，
 其余 POSIX 安装默认 `PREFIX="$HOME/.local/share/agent-collab"`。Windows 的入口是 PowerShell 脚本
-`<前缀>\bin\agent-collab.ps1`（默认前缀 `$env:LOCALAPPDATA\agent-collab\code`），写法见下方节点配对。
+`<前缀>\bin\agent-collab.ps1`（未指定 `--prefix` 时为 `~\.local\share\agent-collab`；install.md 的示例用的是
+`$env:LOCALAPPDATA\agent-collab\code`），写法见下方节点配对。
 
 ## 访问与身份
 
@@ -26,7 +27,7 @@
 cd /opt/agent-collab/current && runuser -u agent-collab -- python3 -B -m agent_collab.controller pairing-code --data-dir <DATA> --node-id <节点名>
 ```
 
-在节点上（Windows 与同机 WSL 使用相同 `--physical-host-id` / `--failure-domain`，`--host-slots` 为该主机总并发）：
+在节点上（默认每台物理主机一个原生节点；同机再装可选节点（如 WSL）时使用相同 `--physical-host-id`，`--host-slots` 为该主机总并发；`--failure-domain` 按节点实际所在的故障域填写）：
 
 ```sh
 "$PREFIX/bin/agent-collab" agent pair --controller <CONTROLLER> --code <配对码> --node-id <节点名> \
@@ -55,7 +56,7 @@ $Prefix = "$env:LOCALAPPDATA\agent-collab\code"   # 安装时的 --prefix
 2. 停止节点服务，编辑节点数据目录中 `agent.json` 的 `slots` / `host_slots`，再启动服务（节点在启动注册时读取这两个值）。
 3. 解除排空（`drain:false`；排空了多个同机节点时逐个解除）。
 
-同一物理主机上的节点（如 Windows 与同机 WSL，共用 `physical_host_id`）按各节点 `host_slots` 的最小值限制主机总并发：
+同一物理主机上有多个节点时（如 Windows 原生节点加按需启用的 WSL 节点，共用 `physical_host_id`），按各节点 `host_slots` 的最小值限制主机总并发：
 调整主机上限时，所有同机节点都要按上述步骤改成同一个值，只改一个不会生效。
 
 组织策略禁止执行 PowerShell 脚本（如 `Restricted`）时，遵循该策略、不要自行放宽；改为直接用安装记录的解释器运行启动器：
@@ -82,6 +83,27 @@ $Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).conf
 ```
 
 `<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点从确认检查点继续。
+
+## 停用、启动与退役节点
+
+在节点本机，或经已配置的 SSH 管理入口，使用固定命令（参数与输出见 [install.md](install.md) 的“服务管理与 SSH 管理入口”）：
+
+```sh
+"$PREFIX/bin/agent-collab" service status --prefix "$PREFIX"
+"$PREFIX/bin/agent-collab" service stop   --prefix "$PREFIX"   # 有意停用，保持停用
+"$PREFIX/bin/agent-collab" service start  --prefix "$PREFIX"   # 恢复自启动并启动，新心跳到达才算成功
+```
+
+让一个节点退出常驻调度（例如不再需要的 WSL 节点）：
+
+1. 排空（`drain:true, migrate:true`），等 `active_attempts` 为 0。未结束的任务按检查点迁移；原生会话不能跨平台续接。
+2. 在该节点执行 `service stop`。节点随后显示为 unreachable 且保持排空，不会再被派单。
+3. 保留它的 node_id、执行证据和数据目录，不要删除节点记录或卸载。要重新启用：`service start`，再解除排空。
+
+对已停用的节点运行安装器升级或回退会重新启用并启动它的服务，并恢复升级前的排空设置：只有升级前已排空的节点才不会被派单。要继续停用，之后再执行一次 `service stop`。
+
+只有被排空节点才具备的能力不会被别的节点替代：仅 Linux 可满足的任务进入 `waiting_capability`，`status_reason` 列出各节点的拒绝原因
+（如 `os_mismatch`、`gpu_missing`、`tool_missing:<名称>`）。macOS 的 POSIX shell 不等于 Linux，controller 主机也不是 worker。
 
 ## 备份与恢复
 
@@ -110,7 +132,7 @@ systemctl start agent-collab-controller
 `python -m agent_collab.backup` 只依赖标准库，兼容 Python 3.9。安装器尚不自动注册本节任务；需要先将含本模块和模板的发行版本安装到 ECS 与 Mac，再手动启用。远端代码固定从 `/opt/agent-collab/current` 运行；自定义安装前缀需要相应修改 `remote_command()` 的工作目录，不能把 shell 命令塞进 `--python-cmd`。
 
 - ECS：状态根目录 `/var/lib/agent-collab`，controller 数据在其 `controller/`，定时备份在同级 `backups/`。禁止把备份放进 controller 数据目录或其祖先。HTTP `/overview`、`/doctor` 的 `backup` 对象读取 `<controller 数据目录的父目录>/backups/status.json`；缺文件时为 `unknown`，损坏文件报告读取错误。安装器在线 doctor 在 `components.controller.backup` 转发这个对象；离线 doctor 仍为 `unknown`。
-- 默认每 6 小时一轮，ECS `keep=8`、`max_bytes=500000000`（十进制 500 MB），Mac `keep_offsite=28`。按当前约 2 MB/份估算，本地 8 份约 16 MB、实例外 28 份约 56 MB；相当于按时运行时约 2 天与 7 天的历史。确定性 tar 不压缩，实际尺寸以 COMPLETE 为准；500 MB 给增长留余量。这些是调度与保留配置，不是保证的 RPO。
+- 默认每 6 小时一轮，ECS `keep=8`、`max_bytes=500000000`（十进制 500 MB），Mac `keep_offsite=28`。按时运行时 8 份与 28 份分别相当于约 2 天与 7 天的历史。单份大小等于数据库加全部被引用 blob（确定性 tar 不压缩，以 COMPLETE 为准），随任务工件增长：一次现场测量为 89 MB，此时本地先碰到 500 MB 上限、实际保留约 5 份，实例外 28 份约 2.5 GB。按实际尺寸调整 `max_bytes` 与 `--keep-offsite`。这些是调度与保留配置，不是保证的 RPO。
 - 本地 `.lock` 使用非阻塞 `flock`；Windows 使用等效字节锁。锁忙退出码 `75`，不改变状态；其他失败为 `1`。锁文件不删除，崩溃由 OS 解锁。遗留 `.tmp-*` 下一轮自动删除；其他不完整目录不计入保留策略。`upgrade-*` 完全不受定时保留策略管理。
 - 完整集是 `<id>/backup.tar` 与最后原子发布的 `COMPLETE.json`，其中含 tar/DB SHA-256、tar 字节数、备份创建时间和 generation。tar 只包含 manifest 声明的数据库和 blob，名称排序、mtime/uid/gid 固定。保留策略按 tar 字节总和删除最旧完整集，永远保留最新集和最新已确认实例外复制的集；保护集可使份数/容量超过配置。没有实例外确认时仍至少保留最新完整集。
 - `OFFSITE.json` 是 Mac 校验成功后的回执；同 ID 重复确认幂等，较旧的延迟回执不覆盖较新的实例外确认。ECS 的 `status.json` 分别记录 `local.last_success_* / last_failure_at / last_error` 和 `offsite.last_confirmed_* / location`。
@@ -168,11 +190,15 @@ systemctl reset-failed agent-collab-backup.service || true
 
 ### Mac 实例外拉取 LaunchAgent
 
-在拥有已验证 Workbench 配置的 Mac 登录用户下执行。`CODE_DIR` 必须是本机已安装、包含本模块的代码绝对路径；示例默认用独立安装的 `current`，不要指向临时工作包 clone。`STATE_DIR` 是实例外持久目录（放在内置盘：macOS 的 LaunchAgent 进程默认无权访问外置卷，TCC 会返回 Operation not permitted），实例 ID 用现场值替换。模板不含令牌，也不会复制 Workbench 登录资料；需确保该登录用户无需交互即可执行 Workbench。
+在拥有已验证 Workbench 配置的 Mac 登录用户下执行。`CODE_DIR` 必须是本机已安装、包含本模块的代码绝对路径；示例默认用独立安装的 `current`，不要指向临时工作包 clone。`STATE_DIR` 是实例外持久目录，放在**内置盘**的用户目录下，实例 ID 用现场值替换。模板不含令牌，也不会复制 Workbench 登录资料；需确保该登录用户无需交互即可执行 Workbench。
+
+不要把 `STATE_DIR` 放在外置卷：macOS 的隐私控制（TCC）会拒绝 LaunchAgent 里的 `/usr/bin/python3` 访问可移除卷（`PermissionError: Operation not permitted`），
+而同一命令在 SSH 会话里手动执行可能成功，这不说明后台任务也能访问。确需外置卷时由用户在“隐私与安全性”里为实际运行的程序授权，
+不要为此给通用解释器完全磁盘访问。
 
 ```sh
-CODE_DIR="$HOME/Library/Application Support/agent-collab/current"
-STATE_DIR="$HOME/.local/state/agent-collab-backup-state"
+CODE_DIR="$HOME/.local/share/agent-collab/current"
+STATE_DIR="$HOME/.local/state/agent-collab"
 INSTANCE_ID="i-替换为实际实例ID"
 PLIST="$HOME/Library/LaunchAgents/org.agent-collab.backup-pull.plist"
 umask 077
@@ -212,7 +238,7 @@ tail -n 50 "$STATE_DIR/logs/backup-pull.err.log"
   --remote-backups-dir /var/lib/agent-collab/backups --keep-offsite 28
 ```
 
-LaunchAgent 依赖用户登录、外置盘挂载和 Workbench 当前可用；`StartInterval=21600` 不是未登录启动保证，不声称补齐休眠/离线期间每轮任务。日志只追加，可在停用时按实际容量归档；本工作包未增加日志轮转服务。Workbench exec 以 root 运行，但 list/confirm 命令均经 `runuser -u agent-collab`；download 读取的路径固定为严格验证目录内 `<id>/backup.tar`。exec 超时为 300 秒，download 为 3600 秒，超时记录失败并释放本地锁；远端 exec 超时后可能仍在完成短命令，确认重试保持幂等。Windows 主控可复跑单元测试，Linux/Mac 模板不能用于 Windows 服务注册。
+LaunchAgent 依赖用户登录和 Workbench 当前可用；`StartInterval=21600` 不是未登录启动保证，不声称补齐休眠/离线期间每轮任务。日志只追加，可在停用时按实际容量归档；本工作包未增加日志轮转服务。Workbench exec 以 root 运行，但 list/confirm 命令均经 `runuser -u agent-collab`；download 读取的路径固定为严格验证目录内 `<id>/backup.tar`。exec 超时为 300 秒，download 为 3600 秒，超时记录失败并释放本地锁；远端 exec 超时后可能仍在完成短命令，确认重试保持幂等。Windows 主控可复跑单元测试，Linux/Mac 模板不能用于 Windows 服务注册。
 
 停用与回退（保留 Mac 副本、状态与日志；恢复旧模板不自动启用）：
 
