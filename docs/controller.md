@@ -144,7 +144,7 @@ context.json 另附 files 与 files_omitted：优先最新 final，无则最新 
 
 acceptance 必须是非空字符串数组，effort 仅 high/xhigh/max。schema 的 follow_up 对象为 additionalProperties=false；旧 contract、scope、base_checkpoint_id 或 budgets 字段都不接受。adapter 仅作 schema 形状复核，schema 合法就写 decision.json；assessment 的 checkpoint/状态语义和修复准入条件由 controller 判断。缺字段、旧形状等在 adapter 端仍会失败，controller 的部分应用不绕过这一节点边界。
 
-当前 decision schema（follow_up 为修复请求）要求 controller 与 Claude adapter 同步升级；已创建协调 job 的 inputs 中保存的是创建时的固定 schema，不自动改写。新 adapter 遇到不匹配的旧 schema 会拒绝启动该回合，应由管理员处置旧的待执行回合并重新触发使用新 schema 的协调 job，不迁移历史数据。
+当前 decision schema（follow_up 为修复请求）要求 controller 与 Claude adapter 同步升级；已创建协调 job 的 inputs 中保存的是创建时的固定 schema，不自动改写。新 adapter 遇到不匹配的旧 schema 会拒绝启动该回合，不迁移历史数据。管理员可以取消旧的待执行回合，但取消不会清除去重记录：同一去重键（目标 job、触发、durable 检查点、验收状态）不会再创建协调 job，也没有手动触发接口；只有目标产生新的触发状态、新的 durable 检查点或验收状态变化时，才会按新 schema 创建协调 job。在此之前该目标需要人工协调（interactive 租约）。
 
 controller 生成的修复契约使用 codex、gpt-6-astra、workspace-write，effort 取请求；goal/acceptance 取请求，prompt 由 instructions、目标、验收项和目标契约 excludes 组成。excludes、requirements、recovery、resources、publish、integration、workspace、checks、coordination 继承目标；requirements.tools 增加 codex，不替换既有工具。budgets 继承目标的累计上限并保留取较小值约束，沿同根计数，不让模型填写预算或将上限误写为剩余额度。inputs_manifest 原样取被验收检查点（含 base/deleted），由 domain.validate_contract 验证结构，再由 controller 校验同根检查点来源；普通客户端仍不能提交带未知 base 的初始输入。
 

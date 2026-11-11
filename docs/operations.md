@@ -33,7 +33,7 @@
 ```
 
 `recovery.auto` 缺省为 true，这时契约必须带 `inputs_manifest`（没有输入文件就写上面的空基线），且清单里的 blob 都已上传，
-否则任务停在 `waiting_capability`，不会派给任何节点（`status_reason` 中会有 `protection_not_ready`，或在没有注册节点时只有 `no_registered_nodes` 与 `missing_blobs:…`）。清单完整而缺 blob 时补传 blob 即可解除；提交时没带 `inputs_manifest` 则无法补救（契约受理后不可修改），要取消该任务、补上清单后重新提交。`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
+否则任务停在 `waiting_capability`，不会派给任何节点（`status_reason` 中会有 `protection_not_ready`，或在没有注册节点时只有 `no_registered_nodes` 与 `missing_blobs:…`）。清单完整而缺 blob 时补传 blob 即可解除；`missing_blobs` 也包括 blob 已存在但长度与清单 `size` 不符的情况，这时重复上传同样内容不能解除，要核对长度，若清单写错了就取消任务、修正清单后重新提交；提交时没带 `inputs_manifest` 则无法补救（契约受理后不可修改），要取消该任务、补上清单后重新提交。`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
 `waiting_capability`，不会派到不满足条件的节点；等待计入 `budgets.deadline_s`（缺省 3600 秒），从首次提交起算，到期后任务转为
 `failed`（`budget_exhausted:deadline_s`）。需要等更久时调大该预算，或在失败后重新提交：期限按工作包（`work_package_id`）的首次创建时间计算，沿用旧的 `work_package_id` 不会重新计时，预算已耗尽时还会直接拒绝，所以重新提交时省略 `work_package_id`（新建工作包）；`request_id` 也要用新的，CLI 未提供时会自动生成。管理令牌只在 controller 主机上时，从其他机器提交有两种做法：
 经云厂商的远程执行通道在 controller 主机上以服务用户运行同一条命令（令牌不离开该主机），
