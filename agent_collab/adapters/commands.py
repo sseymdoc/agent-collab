@@ -89,15 +89,22 @@ def probe_auth_detail(name, command, runner=None, system=None):
     当前进程读不到凭据存储时是 unknown + credential_store_unreadable，不据此推断凭据过期。"""
     if not command['argv']:
         return 'unknown', 'command_missing'
-    try:
-        result = (runner or subprocess.run)(command['argv'] + (['login', 'status'] if name == 'codex' else ['auth', 'status']),
+    def status():
+        return (runner or subprocess.run)(command['argv'] + (['login', 'status'] if name == 'codex' else ['auth', 'status']),
             env=command['env'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    try:
+        result = status()
         if name == 'claude':
             logged_in = json.loads(result.stdout).get('loggedIn')
             if logged_in is False:
                 if not credential_store_readable(command, runner, system):
                     return 'unknown', 'credential_store_unreadable'
-                return 'expired', 'not_logged_in'
+                if (system or platform.system()) == 'Darwin':
+                    # show-keychain-info 可能刚解锁了被手动锁定的钥匙串，先前的 loggedIn=false 已过时：以重探结果为准。
+                    result = status()
+                    logged_in = json.loads(result.stdout).get('loggedIn')
+                if logged_in is False:
+                    return 'expired', 'not_logged_in'
             return ('ok', 'logged_in') if result.returncode == 0 and logged_in is True else ('unknown', 'probe_inconclusive')
         text = (result.stdout + '\n' + result.stderr).lower()
         if any(word in text for word in ('not logged in', 'not signed in', 'login required', 'token expired', 'auth expired')):

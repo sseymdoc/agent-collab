@@ -6,6 +6,7 @@ import uuid
 from .. import domain as d
 from .. import protocol as p
 from ..artifacts import atomic_write
+from .commands import credential_store_readable
 from .codex import OwnedProcess, classify_failure as classify_process_failure, tail
 
 
@@ -34,10 +35,11 @@ def build_argv(command, params, schema, session_id):
 
 
 class ClaudeAdapter:
-    def __init__(self, context, command='claude', process_factory=OwnedProcess, env=None):
+    def __init__(self, context, command='claude', process_factory=OwnedProcess, env=None, store_readable=None):
         self.context, self.command, self.process_factory = context, command, process_factory
         self.process = None
         self.env = dict(os.environ if env is None else env, **MANAGED_ENV)
+        self.store_readable = store_readable or (lambda: credential_store_readable(dict(env=self.env)))
         self.done = False
         self.session_id = str(uuid.uuid4())
         self.decision = None
@@ -103,8 +105,12 @@ class ClaudeAdapter:
             decision = d.validate_decision_schema(result.get('structured_output'))
         except (ValueError, TypeError, KeyError):
             self.notes = 'Claude failed or returned an invalid structured decision'
-            self.context.finish('failed', classify_failure(stderr + stdout, code, not stopped),
-                                self.notes)
+            failure = classify_failure(stderr + stdout, code, not stopped)
+            if failure == 'auth_expired' and not self.store_readable():
+                # 本进程读不到凭据存储（macOS 钥匙串需要图形登录会话）不说明账户过期；
+                # 报 auth_expired 会让 controller 把共享同一账户的节点都标成过期，这里只记为本节点能力缺失。
+                failure, self.notes = 'capability_missing', 'Claude credential store is unreadable in this worker process'
+            self.context.finish('failed', failure, self.notes)
         else:
             self.decision, self.notes = decision['decision'], decision['notes']
             atomic_write(self.context.work / 'decision.json', p.canonical_json(decision))

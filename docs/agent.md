@@ -28,7 +28,7 @@ python3 -m agent_collab.node_agent run --data-dir /absolute/agent-data
 `worker_auth` 是 worker 服务进程随心跳写入 status.json 的结果（`context=worker_service`、`auth_health`、`checked_at`、`pid`、
 `last_heartbeat_ok_at`），没有 status.json 或 worker 版本较旧没写这两项时为 null。doctor 只输出，不向 controller 上报，
 它的结果不会改动 controller 上由 worker 上报的 `auth_health`。`reasons` 的取值：`logged_in`、`not_logged_in`、
-`credential_store_unreadable`（当前进程读不到凭据存储）、`probe_inconclusive`（输出无法识别）、`probe_failed`（命令失败或超时）、
+`credential_store_unreadable`（当前进程读不到凭据存储）、`probe_inconclusive`（输出无法识别，含退出码非零而输出无法判断的情况）、`probe_failed`（探测异常：命令无法启动、超时，或 Claude 的输出不是 JSON）、
 `command_missing`。
 Windows 工作区位于 USERPROFILE 内且 Codex 可用时，在 warnings 中报告 `workspace_in_profile`。
 `doctor` 还检查 attempt 租约文件及 POSIX 权限，并在 `restart_blockers` 中列出阻塞领取的
@@ -81,9 +81,10 @@ PATH 前置该可执行文件目录，不加载 shell rc；Codex 线程来源变
 不保存账户标识、凭据或命令输出。超时及无法识别的结果为 unknown，明确未登录为 expired。
 macOS 上 Claude 的订阅登录存在登录钥匙串里，只有图形登录会话能读：`claude auth status` 报未登录时再运行
 `security show-keychain-info`，钥匙串读不到（SSH 会话里 exit 36）就记为 unknown，原因 `credential_store_unreadable`，
-不据此判定凭据过期；钥匙串可读而 CLI 仍报未登录才是 expired。其他平台的凭据是文件，不做这一步。
-worker 若运行在读不到钥匙串的上下文里，同样上报 unknown；派到它的 Claude 回合会以 `auth_expired` 失败，
-controller 再依据这次实际失败标记 expired。
+不据此判定凭据过期；钥匙串可读时再调用一次 `claude auth status`（这一步可能刚解锁了被手动锁定的钥匙串，前一次结果已过时），仍报未登录才是 expired。其他平台的凭据是文件，不做这一步。
+worker 若运行在读不到钥匙串的上下文里，同样上报 unknown；派到它的 Claude 回合失败且输出是认证错误时，适配器再检查一次钥匙串，
+读不到就以 `capability_missing` 结束（只记本节点该 harness 能力降级），不报 `auth_expired`，
+因为 controller 收到 `auth_expired` 会把共享同一 `provider_account_refs` 的节点都标成 expired。
 Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.sandbox="elevated"`（可配置）。
 已有 model、effort、approval_policy、sandbox_workspace_write 隔离参数继续显式传递。
 `--ignore-user-config` 跳过整个用户 config.toml，不只是 MCP 与 notify：模型、effort、沙箱模式、审批策略、工作目录、
@@ -148,7 +149,7 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 
 环境变量另加 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`，其余环境沿用节点解析出的命令环境。
 
-各项的作用范围不同，合起来才是“任务相关输入只来自契约”：`--tools ""` 只关闭内置工具，不关 MCP 工具；
+各项的作用范围不同，合起来才是“用户与任务可控的输入只来自契约”（管理员下发的托管策略是受信任的例外，见下）：`--tools ""` 只关闭内置工具，不关 MCP 工具；
 `--strict-mcp-config` 不加载任何 MCP 服务（含账户级连接器）；`--setting-sources ""` 不加载 user、project、local 三个来源的设置，
 因此用户级 settings、插件、hooks、各级 CLAUDE.md 与 CLAUDE.local.md、工作目录的 `.claude/settings.local.json` 都不进入受管回合
 （受管回合用不到任何一个来源，所以列表为空）；自动记忆（`~/.claude/projects/<项目>/memory/`）不受来源列表控制，

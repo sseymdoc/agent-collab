@@ -131,6 +131,13 @@ class ResolutionTests(unittest.TestCase):
             self.assertEqual(probe_auth_detail('claude', command, run, system), expected)
             self.assertEqual(probe_auth('claude', command, run, system), expected[0])
             self.assertEqual(any(call[0][0][0] == '/usr/bin/security' for call in run.call_args_list), system == 'Darwin')
+        # 钥匙串检查可能刚解锁了被锁定的钥匙串：以重探结果为准。
+        answers = iter(['false', 'true'])
+        def unlocked(argv, **kwargs):
+            if argv[0] == '/usr/bin/security':
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            return subprocess.CompletedProcess(argv, 0, '{"loggedIn":%s}' % next(answers), '')
+        self.assertEqual(probe_auth_detail('claude', command, Mock(side_effect=unlocked), 'Darwin'), ('ok', 'logged_in'))
         # 已登录或 codex 时不碰钥匙串。
         run = runner(36, 'true')
         self.assertEqual(probe_auth_detail('claude', command, run, 'Darwin'), ('unknown', 'probe_inconclusive'))

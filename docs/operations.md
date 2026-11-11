@@ -106,7 +106,7 @@ $Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).conf
 "$PREFIX/bin/agent-collab" api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file <DATA>/admin.token
 ```
 
-`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点从确认检查点继续。合格指该节点在线（用户已登录、服务在运行）、认证正常、能取得恢复所需的检查点与输入，并具备契约 `requirements` 要求的平台、工具和硬件；只有某个平台或某块硬件能做的任务，等待符合条件的节点，不会换到别的平台上执行。
+`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点继续：有 durable 检查点时从最新的那个开始，没有时从 inputs 基线开始。合格指该节点在线（心跳新鲜，即服务在运行；macOS、Windows 的服务只在用户登录后运行，Linux 启用 linger 后无人登录也可在线）、所需 harness 的认证未被确认过期（`unknown` 不排除）、能取得恢复所需的检查点与输入，并具备契约 `requirements` 要求的平台、工具和硬件；只有某个平台或某块硬件能做的任务，等待符合条件的节点，不会换到别的平台上执行。
 
 ## 停用、启动与退役节点
 
