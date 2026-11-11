@@ -347,6 +347,99 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 **11.11 Claude 协调说明语言**：claude 适配器提示词要求 method、result、notes、follow_up 的 title/goal/acceptance/instructions 使用简体中文；结构化枚举值与字段名不变。
 
-## 12. 不在 v1 承诺范围
+## 12. 客户端授权、模型策略与统一入口（向后兼容；旧字段语义不变）
+
+桌面端、CLI 与其他自动化客户端共用本节的端点和授权模型。controller 在 `GET /client`、`GET /overview` 的 `controller.features` 和节点注册响应的 `features` 中列出已支持的能力名：`clients`、`model_settings`、`node_models`、`contract_draft`、`baselines`。客户端和节点只在对端列出相应能力后使用对应字段。
+
+**12.1 客户端凭据**
+
+| 主体 | 凭据 | 用途 |
+| --- | --- | --- |
+| 客户端（桌面、CLI、Agent） | `Authorization: Bearer <client_token>`；配对时签发一次，controller 只存 SHA-256 | 按授予的权限访问客户端端点；与节点令牌、管理令牌互不通用，可单独撤销 |
+| 客户端配对码 | `controller client-code --data-dir D [--role R \| --scopes a,b] [--ttl 600]`（controller 本机），或 `POST /clients/codes`；一次性，只存哈希，缺省 10 分钟、最长 1 小时 | 只能调用 `POST /clients/pair` |
+
+权限（scope）：
+
+| scope | 允许 |
+| --- | --- |
+| `read` | 全部 GET：任务、事件与事件流、检查点与文件清单、blob、节点、总览、调度解释、协调租约、模型设置与目录、模板、输入基线 |
+| `tasks` | 创建任务、契约草拟、取消、重试、验收、发布、回写结果、协调租约取得与释放、上传 blob、登记输入基线 |
+| `settings` | 修改模型设置 |
+| `devices` | 节点排空与迁移 |
+| `maintain` | 暂停与恢复派单、doctor、客户端列表与撤销、签发客户端配对码、接管协调租约 |
+
+角色是 scope 的固定组合：`owner` 为全部五项，`operator` 为 `read`+`tasks`，`viewer` 为 `read`。权限在每个路由上由 controller 检查；缺少权限返回 403 `forbidden`，`details.required_scope` 给出所需权限。管理令牌与浏览器会话等同于全部权限。节点令牌不能调用客户端端点。
+
+- `POST /clients/pair`（无需认证）`{"code", "name", "kind": "desktop|cli|agent"}` → 200 `{"client_id", "client_token", "name", "kind", "scopes", "controller_id", "authority_generation", "controller": {"version", "git_commit"}, "features"}`。配对码用后即废；`client_token` 只在这次响应里出现。
+- `GET /client`（任意客户端凭据、管理令牌或会话）→ `{"identity": {"kind": "client|admin|session", "client_id", "name", "scopes"}, "controller": {"controller_id", "authority_generation", "version", "git_commit", "features"}}`。
+- `DELETE /client`（客户端凭据）→ 撤销调用者自己。
+- `GET /clients`（maintain）→ `{"clients": [client...]}`；client 为 `{"client_id", "name", "kind", "scopes", "created_at", "revoked_at", "version"}`，不含凭据。
+- `POST /clients/codes`（maintain）`{"request_id", "role" | "scopes", "ttl_s"}` → 201 `{"code", "scopes", "expires_at"}`；响应不进入幂等回执，重复的 request_id 返回 409。
+- `POST /clients/{client_id}/revoke`（maintain）`{"request_id", "expected_version"}` → 更新后的 client。
+
+撤销从下一次请求起生效，不影响节点凭据和其他客户端。已建立的事件流在下一个轮询周期（缺省 0.25 秒）重新认证，收到一帧 `event: unauthorized` 后被服务端关闭。
+
+所有 `/api/v1` 响应带 `X-Controller-Id: <controller_id>`。客户端把连接绑定到配对时得到的 controller_id；响应里的值不同即停止使用该连接。
+
+浏览器控制台（`POST /session`、Cookie、CSRF、Origin 检查与静态页面）在配置 `web_console` 为 true（缺省）时保持原行为；设为 false 后 `POST /session` 返回 403，不再提供静态页面，已有会话失效。它是迁移期的兼容入口，退出条件见 `docs/migration.md`。
+
+**12.2 请求来源**：新建的 job 记录带 `created_by: {"kind": "client|admin|session|controller", "client_id", "name"}`（旧记录没有此字段）。每个带 `request_id` 幂等回执的客户端变更请求在实际执行时（重放不计）写一条 `audit.action` 事件：`{"actor": {...同上}, "action": "<METHOD> <路由>", "request_id"}`，与任务有关的记在该任务名下。签发配对码同样写这条事件；模型设置的修改记在 `settings.updated` 与修改历史里，客户端配对与撤销记为 `client.paired`、`client.revoked`。
+
+**12.3 模型设置**（controller 保存，记录 `settings/models`）
+
+```json
+{"revision": 0, "updated_at": null, "updated_by": null,
+ "codex": {"default": {"model": null, "effort": null}, "allowed": null},
+ "claude": {"default": {"model": null, "effort": null}}}
+```
+
+- `codex.default`：执行任务的工作区默认值；null 表示未设置。
+- `codex.allowed`：部署策略。null 表示部署不作限制；否则为 `{"<model>": ["<effort>", ...]}`，只有列出的组合可用，默认值必须在其中。
+- `claude.default`：受管协调回合的模型与 effort；null 时沿用 `config.json` 中 `standby_profiles` 所选 profile 的值。两组设置互不覆盖。
+- model 匹配 `[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}`，effort 匹配 `[a-z][a-z0-9_-]{0,31}`。
+- 新建的 controller 数据库从上述未设置状态开始。已有任务或节点记录、但没有该记录的数据库（升级前的部署）在启动时写入一次迁移值：`codex.default = gpt-6-astra / xhigh`，`codex.allowed = {"gpt-6-astra": ["high", "xhigh", "max"]}`，`claude.default` 取当时生效的 standby profile；`updated_by.kind` 为 `migration`。之后与其他设置一样可编辑。
+- 项目默认层尚未实现；优先级预留为 任务覆盖 > 项目默认 > 工作区默认。
+
+端点：
+
+- `GET /settings/models`（read）→ `{"settings", "catalog", "selectable", "history"}`。
+  - `catalog.nodes.<node_id>.<harness>` = `{"status": "ok|unknown|legacy", "source", "fetched_at", "cli_version", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}`，见 12.5。
+  - `selectable.codex` = `[{"model", "efforts": [...], "nodes": [node_id...]}]`：部署策略与各节点目录（status 为 ok 或 legacy）的交集；`selectable.unknown_nodes` 列出目录未知的节点。目录条目来自节点上的 CLI，不表示该账号已成功调用过这个模型。
+  - `history`：最近 20 次修改 `{"revision", "at", "actor", "before", "after"}`。
+- `PUT /settings/models`（settings）`{"expected_revision", "codex"?, "claude"?}` → 更新后的 settings；`expected_revision` 与当前不同返回 409 `version_mismatch`，`details.current` 为当前 settings。写 `settings.updated` 事件。
+
+**12.4 受理时解析与冻结**
+
+- `harness: codex` 的契约可以省略 `harness_params.model` 与 `effort`。受理时逐项解析：请求里显式给出的值 → 工作区默认值；同一根工作包内的后续修订改用根冻结的默认值。解析不出返回 400，`details.reason` 为 `model_default_unset`；解析结果不在许可范围返回 400，`details.reason` 为 `model_not_allowed`。不会换成别的模型或 effort。
+- 解析结果写入 job 的 `contract.harness_params`（与此前由固定常量填充的位置相同），受理后不变；之后修改设置不影响已受理的 job，包括排队中的。
+- job 记录带 `model_policy`：`{"schema": 1, "settings_revision", "requested": {"model", "effort"}, "resolved": {"model", "effort"}, "source": {"model", "effort"}}`。`requested` 是请求显式给出的值（没有则为 null）；`source` 取 `task_override`、`workspace_default`、`root_frozen`、`coordinator_override`、`legacy_compat`（`project_default` 预留）。升级前受理的 job 没有此字段；`request_hash` 与既有契约内容不重算。
+- 根工作包记录带冻结策略 `model_policy`：`{"schema": 1, "settings_revision", "codex": {"model", "effort", "allowed": {...}|null}}`，取根 job 受理时的解析结果与当时的 `codex.allowed`；根 job 不是 codex 时取当时的工作区默认值（未设置则 model、effort 为 null）。
+- 受管修复只读根的冻结策略：模型固定为冻结的 model；`follow_up.effort` 为 null 时用冻结的 effort，给出值时必须在冻结的许可范围内（`allowed` 为 null 时不限），并在子 job 的 `model_policy.source.effort` 记 `coordinator_override`。不在范围内时拒绝该修复请求（`coordinator.follow_up_rejected`，原因 `effort_not_allowed`），验收结论保留。冻结的 model 为 null 时修复请求以 `model_default_unset` 被拒绝。根工作包的累计预算规则不变。
+- 升级前创建的根没有冻结策略，读取时按原行为推导：model 与 effort 取根 job 的 codex 参数（根不是 codex 时为 `gpt-6-astra` / `xhigh`），`allowed` 为 `{"<model>": ["high", "xhigh", "max"]}`，来源记 `legacy_compat`。
+- 协调决策 schema 的 `follow_up.effort` 为 `string | null`，不带枚举；`context.json` 增加 `repair_policy: {"model", "effort", "allowed_efforts"}` 供协调者参考。节点同时接受此前的 schema（effort 必填、枚举 high/xhigh/max），以便先升级节点、后升级 controller。
+- 受管协调回合在创建时读取当时的 `claude.default`（或 profile 值）并写入自己的契约。
+
+**12.5 节点模型目录**
+
+- 节点注册可带 `capabilities.models`：`{"codex": {"status": "ok|unknown", "source", "fetched_at", "cli_version", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}, "claude": {...}}`。codex 目录由节点在自己的服务进程上下文里启动 `codex app-server`（stdio，不监听网络端口），发送 `initialize` 与 `model/list` 取得，按 `model_catalog_s`（缺省 21600 秒）刷新；取不到时 `status` 为 `unknown` 并给出 `reason`。claude CLI 没有目录接口，`status` 为 `unknown`、`reason` 为 `no_catalog_interface`。读取目录不调用模型。
+- 节点第一次注册不带 `models`；注册响应的 `features` 含 `node_models` 时再带上它重新注册。
+- 没有上报 `models` 的节点（旧版本）按其适配器实际接受的固定集合处理：`status: legacy`，`gpt-6-astra` 配 `high`、`xhigh`、`max`。
+- 调度过滤（§6）：codex 任务的 model 不在节点目录里记 `model_unsupported:<model>`，effort 不在该模型的列表里记 `effort_unsupported:<model>/<effort>`；只对 status 为 ok 或 legacy 的目录判断。目录 unknown 的节点不因此被排除，调度解释里该节点带 `model_catalog: "unknown"`。
+
+**12.6 模板、契约草拟与输入基线**
+
+- `GET /templates`（read）→ `{"templates": [{"id", "title", "description", "harness", "diagnostic"}]}`。当前模板：`codex-change`（Codex 修改并运行检查；失败或接管时才触发协调，结果自动发布）、`codex-change-accept`（执行并验收：`publish = {"mode": "manual", "requires_acceptance": true}`、`coordination.policy = always`，验收通过后由客户端发布）、`diagnostic`（确定性步骤，不调用模型，用于检查 controller、节点、检查与工件链路）。
+- `POST /contracts/draft`（tasks）`{"template", "title"?, "goal", "acceptance"?: [...], "excludes"?: [...], "baseline_id"? | "inputs_manifest"?, "checks"?: [{"name", "run", "timeout_s"?}], "model"?, "effort"?, "requirements"?}` → `{"title", "contract", "preview", "model_policy", "settings_revision", "warnings"}`。只生成并校验契约，不改变状态。`contract` 是可原样用于 `POST /jobs` 的请求（只含显式选择的 model、effort）；`preview` 是按当前设置解析并补全默认值后的完整契约，`model_policy` 是对应的解析结果。`warnings` 为 `[{"code", "detail"}]`：`empty_inputs`（没有输入基线）、`missing_blobs`（基线有文件未上传）、`no_node_supports_model`（已登记节点的目录都不含该组合）。
+- `POST /jobs` 可带 `expected_settings_revision`：与当前模型设置的 revision 不同时返回 409 `version_mismatch`（`details.current` 为当前设置），用于保证受理时的解析结果就是草拟时看到的那一份。
+- `GET /jobs` 可带 `work_package_id=<根工作包>`，只列出该根的各次修订（新的在前）。
+- `POST /baselines`（tasks）`{"request_id", "name", "manifest"}` → 201 baseline；`GET /baselines`（read）→ `{"baselines": [...]}`。baseline 为 `{"baseline_id", "name", "manifest_sha256", "files", "bytes", "missing_blobs", "created_at", "created_by"}`；manifest 的 `base` 必须为 null，文件内容经 `PUT /blobs/<sha256>` 上传。基线及其 blob 计入备份。
+
+**12.7 读取补充**
+
+- `GET /jobs/{id}/events?before=<seq>&limit=<n>`（read）→ `{"events": [...]}`：该 job 序号小于 `before` 的事件，按序号升序，最多 `limit` 条（1–1000，缺省 200）。
+- `GET /nodes` 的每个节点带 `attempts`：该节点上有效（assigned、leased、running）的 attempt，`[{"attempt_id", "job_id", "title", "status", "epoch", "lease_expires_at", "harness", "model", "effort", "coordinates"}]`；`coordinates` 为 true 表示它是受管协调回合。
+- `GET /checkpoints/{id}/files`（read）→ `{"checkpoint_id", "manifest_sha256", "files": [{"path", "sha256", "size", "executable"}]}`；文件内容用 `GET /blobs/<sha256>` 读取。
+
+## 13. 不在 v1 承诺范围
 
 活进程迁移、模型内部推理状态、未上传的本地改动、任意 Shell 或模型调用的 exactly-once、控制面高可用。见 README 的保障说明。

@@ -96,13 +96,12 @@ def validate_contract(value):
     if not isinstance(params, dict):
         raise ValueError('harness_params must be an object')
     if c['harness'] == 'codex':
-        params.setdefault('model', 'gpt-6-astra')
-        params.setdefault('effort', 'xhigh')
         params.setdefault('sandbox', 'workspace-write')
-        if (params['model'] != 'gpt-6-astra' or params['effort'] not in ('high', 'xhigh', 'max')
-                or params['sandbox'] not in ('read-only', 'workspace-write')
-                or set(params) - {'model', 'effort', 'sandbox'}):
-            raise ValueError('invalid codex model, effort or sandbox')
+        if params['sandbox'] not in ('read-only', 'workspace-write') or set(params) - {'model', 'effort', 'sandbox'}:
+            raise ValueError('invalid codex parameters or sandbox')
+        # model 与 effort 由 controller 受理时按模型策略解析后写入（§12.4）；这里只校验形状，不带默认值。
+        p.check_model(params.get('model'))
+        p.check_effort(params.get('effort'))
     elif c['harness'] == 'claude':
         if set(params) != {'model', 'effort'} or any(not isinstance(v, str) or not v.strip() for v in params.values()):
             raise ValueError('claude requires explicit model and effort')
@@ -223,22 +222,33 @@ DECISION_SCHEMA = {
             'properties': {'title': {'type': 'string'}, 'goal': {'type': 'string'},
                            'acceptance': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
                            'instructions': {'type': 'string'},
-                           'effort': {'type': 'string', 'enum': ['high', 'xhigh', 'max']}}}]},
+                           # null：沿用根工作包冻结的 effort；给出值时由 controller 按冻结的许可范围检查（§12.4）。
+                           'effort': {'type': ['string', 'null']}}}]},
         'notes': {'type': 'string'}}}
 
+# 升级前的 controller 下发的 schema：effort 必填且只有这三个值。节点两种都接受，便于先升级节点。
+LEGACY_DECISION_SCHEMA = copy.deepcopy(DECISION_SCHEMA)
+LEGACY_DECISION_SCHEMA['properties']['follow_up']['anyOf'][1]['properties']['effort'] = {
+    'type': 'string', 'enum': list(p.LEGACY_CODEX['efforts'])}
 
-def validate_follow_up(value):
+
+def validate_follow_up(value, legacy=False):
     schema = DECISION_SCHEMA['properties']['follow_up']['anyOf'][1]
     if not isinstance(value, dict) or set(value) != set(schema['required']):
         raise ValueError('follow_up requires only title, goal, acceptance, instructions and effort')
-    if any(not isinstance(value[key], str) for key in ('title', 'goal', 'instructions', 'effort')):
-        raise ValueError('follow_up title, goal, instructions and effort must be strings')
+    if any(not isinstance(value[key], str) for key in ('title', 'goal', 'instructions')):
+        raise ValueError('follow_up title, goal and instructions must be strings')
     string_list(value['acceptance'], 'follow_up.acceptance')
-    if not value['acceptance'] or value['effort'] not in schema['properties']['effort']['enum']:
-        raise ValueError('follow_up requires nonempty acceptance and effort high/xhigh/max')
+    if not value['acceptance']:
+        raise ValueError('follow_up requires nonempty acceptance')
+    if legacy:
+        if value['effort'] not in p.LEGACY_CODEX['efforts']:
+            raise ValueError('follow_up requires effort high/xhigh/max')
+    elif value['effort'] is not None:
+        p.check_effort(value['effort'])
 
 
-def validate_decision_schema(value, check_follow_up=True):
+def validate_decision_schema(value, check_follow_up=True, legacy=False):
     """Validate the fixed wire schema; no target-dependent or contract validation.
 
     Only the controller skips follow_up here, so its errors cannot discard an assessment.
@@ -259,7 +269,7 @@ def validate_decision_schema(value, check_follow_up=True):
         if 'follow_up' not in value:
             raise ValueError('follow_up is required')
         if value['follow_up'] is not None:
-            validate_follow_up(value['follow_up'])
+            validate_follow_up(value['follow_up'], legacy)
     return copy.deepcopy(value)
 
 
@@ -277,9 +287,216 @@ def validate_decision(value, check_follow_up=True):
     return value
 
 
-def repair_contract(target, follow_up, inputs_manifest):
+class PolicyError(ValueError):
+    """模型策略拒绝；reason 进入 API 错误的 details 或协调事件的原因。"""
+    def __init__(self, reason, message=None):
+        super().__init__(message or reason)
+        self.reason = reason
+
+
+EMPTY_SETTINGS = {'revision': 0, 'updated_at': None, 'updated_by': None,
+                  'codex': {'default': {'model': None, 'effort': None}, 'allowed': None},
+                  'claude': {'default': {'model': None, 'effort': None}}}
+
+
+def migrated_settings(profile):
+    """升级前的部署启动时写入一次：此前写死在代码里的 Codex 组合，加上当时生效的协调 profile。"""
+    value = copy.deepcopy(EMPTY_SETTINGS)
+    legacy = p.LEGACY_CODEX
+    value['codex'] = {'default': {'model': legacy['model'], 'effort': legacy['effort']},
+                      'allowed': {legacy['model']: list(legacy['efforts'])}}
+    try:
+        if profile:
+            value['claude']['default'] = {'model': p.check_model(profile['model']), 'effort': p.check_effort(profile['effort'])}
+    except ValueError:
+        pass  # profile 的取值不符合设置的字段约束：不迁入，协调回合继续直接用 profile
+    return value
+
+
+def permitted(allowed, model, effort):
+    return allowed is None or effort in allowed.get(model, ())
+
+
+def _model_pair(value, name):
+    if not isinstance(value, dict) or set(value) != {'model', 'effort'}:
+        raise ValueError(name + ' requires exactly model and effort')
+    if value['model'] is None and value['effort'] is None:
+        return dict(value)
+    return {'model': p.check_model(value['model']), 'effort': p.check_effort(value['effort'])}
+
+
+def validate_model_settings(codex, claude):
+    if not isinstance(codex, dict) or set(codex) != {'default', 'allowed'}:
+        raise ValueError('codex settings require exactly default and allowed')
+    default, allowed = _model_pair(codex['default'], 'codex.default'), codex['allowed']
+    if allowed is not None:
+        if not isinstance(allowed, dict) or not allowed or len(allowed) > 64:
+            raise ValueError('codex.allowed must be null or a nonempty model map')
+        for model, efforts in allowed.items():
+            p.check_model(model)
+            if not isinstance(efforts, list) or not efforts or len(efforts) > 16 or len(set(map(str, efforts))) != len(efforts):
+                raise ValueError('codex.allowed values must be nonempty lists of distinct efforts')
+            for effort in efforts:
+                p.check_effort(effort)
+        allowed = copy.deepcopy(allowed)
+        if default['model'] is not None and not permitted(allowed, default['model'], default['effort']):
+            raise PolicyError('model_not_allowed', 'codex.default must be within codex.allowed')
+    if not isinstance(claude, dict) or set(claude) != {'default'}:
+        raise ValueError('claude settings require exactly default')
+    return {'codex': {'default': default, 'allowed': allowed}, 'claude': {'default': _model_pair(claude['default'], 'claude.default')}}
+
+
+def resolve_codex(params, base, default_source):
+    """请求显式给出的值优先，其次 base（工作区默认值或根冻结值）；解析不出或不在许可范围时拒绝，不替换。"""
+    requested = {key: params.get(key) for key in ('model', 'effort')}
+    resolved, source = {}, {}
+    for key in ('model', 'effort'):
+        if requested[key] is not None:
+            resolved[key], source[key] = requested[key], 'task_override'
+        elif base.get(key) is not None:
+            resolved[key], source[key] = base[key], default_source
+        else:
+            raise PolicyError('model_default_unset', 'no codex %s was given and no default is configured' % key)
+    p.check_model(resolved['model'])
+    p.check_effort(resolved['effort'])
+    if not permitted(base.get('allowed'), resolved['model'], resolved['effort']):
+        raise PolicyError('model_not_allowed', 'codex model/effort is outside the permitted set')
+    return resolved, requested, source
+
+
+def frozen_policy(settings, resolved=None):
+    """根工作包受理时冻结；之后的修订与受管修复只读它，不读后来的设置。"""
+    base = resolved or settings['codex']['default']
+    return {'schema': 1, 'settings_revision': settings['revision'],
+            'codex': {'model': base['model'], 'effort': base['effort'], 'allowed': copy.deepcopy(settings['codex']['allowed'])}}
+
+
+def legacy_root_policy(root_job):
+    """升级前创建的根没有冻结策略：按当时写死的行为推导。"""
+    params = root_job['contract']['harness_params'] if root_job['contract']['harness'] == 'codex' else {}
+    model = params.get('model') or p.LEGACY_CODEX['model']
+    return {'schema': 1, 'settings_revision': None, 'legacy': True,
+            'codex': {'model': model, 'effort': params.get('effort') or p.LEGACY_CODEX['effort'],
+                      'allowed': {model: list(p.LEGACY_CODEX['efforts'])}}}
+
+
+def codex_catalog(node):
+    """节点上报的 codex 模型目录。没有上报的旧节点取其适配器实际接受的固定集合，不猜测更多。"""
+    models = node['capabilities'].get('models')
+    if models is None:
+        legacy = p.LEGACY_CODEX
+        return {'status': 'legacy', 'source': 'adapter_fixed_set', 'fetched_at': None, 'reason': None,
+                'cli_version': node['capabilities']['harness'].get('codex'),
+                'models': [{'id': legacy['model'], 'efforts': list(legacy['efforts']), 'default_effort': legacy['effort']}]}
+    return models.get('codex') or {'status': 'unknown', 'source': None, 'fetched_at': None, 'reason': 'not_reported',
+                                   'cli_version': None, 'models': []}
+
+
+def validate_catalogs(value):
+    """节点注册里的 capabilities.models（§12.5）。"""
+    if not isinstance(value, dict) or set(value) - {'codex', 'claude'}:
+        raise ValueError('invalid models capability')
+    for entry in value.values():
+        if (not isinstance(entry, dict) or set(entry) != {'status', 'source', 'fetched_at', 'cli_version', 'reason', 'models'}
+                or entry['status'] not in ('ok', 'unknown') or not isinstance(entry['models'], list) or len(entry['models']) > 200
+                or any(entry[k] is not None and not isinstance(entry[k], str) for k in ('source', 'fetched_at', 'cli_version', 'reason'))):
+            raise ValueError('invalid model catalog')
+        for model in entry['models']:
+            if not isinstance(model, dict) or set(model) != {'id', 'efforts', 'default_effort'} or not isinstance(model['efforts'], list):
+                raise ValueError('invalid model catalog entry')
+            p.check_model(model['id'])
+            for effort in model['efforts'][:32] + ([model['default_effort']] if model['default_effort'] is not None else []):
+                p.check_effort(effort)
+            if len(model['efforts']) > 32:
+                raise ValueError('too many efforts in model catalog entry')
+
+
+def selectable_codex(settings, nodes):
+    """部署策略与节点目录的交集；目录未知的节点单独列出，不计入也不排除。"""
+    allowed, combos, unknown = settings['codex']['allowed'], {}, []
+    for node in nodes:
+        if node['capabilities']['harness'].get('codex') is None:
+            continue
+        catalog = codex_catalog(node)
+        if catalog['status'] not in ('ok', 'legacy'):
+            unknown.append(node['node_id'])
+            continue
+        for model in catalog['models']:
+            efforts = [e for e in model['efforts'] if permitted(allowed, model['id'], e)]
+            if efforts:
+                entry = combos.setdefault(model['id'], {'model': model['id'], 'efforts': [], 'nodes': []})
+                entry['efforts'] += [e for e in efforts if e not in entry['efforts']]
+                entry['nodes'].append(node['node_id'])
+    return {'codex': list(combos.values()), 'unknown_nodes': unknown}
+
+
+TEMPLATES = (
+    {'id': 'codex-change', 'title': '修改并检查', 'harness': 'codex', 'diagnostic': False,
+     'description': 'Codex 按目标修改工作区并运行检查；失败或发生接管时才触发协调，结果自动发布。'},
+    {'id': 'codex-change-accept', 'title': '执行并验收', 'harness': 'codex', 'diagnostic': False,
+     'description': 'Codex 修改并运行检查，随后做语义验收；验收通过后由你发布成果。'},
+    {'id': 'diagnostic', 'title': '链路自检', 'harness': 'stub', 'diagnostic': True,
+     'description': '确定性步骤，不调用模型；用于检查 controller、节点、检查与工件链路。'},
+)
+
+
+def draft_contract(data, inputs_manifest):
+    """把模板与自然语言目标展开成可提交的契约请求；只做展开，校验与模型解析由受理路径完成。"""
+    allowed = {'template', 'title', 'goal', 'acceptance', 'excludes', 'baseline_id', 'inputs_manifest', 'checks',
+               'model', 'effort', 'requirements', 'request_id'}
+    if set(data) - allowed:
+        raise ValueError('unknown draft fields')
+    template = next((t for t in TEMPLATES if t['id'] == data.get('template')), None)
+    if template is None:
+        raise ValueError('unknown template')
+    goal = data.get('goal')
+    if not isinstance(goal, str) or not goal.strip():
+        raise ValueError('goal is required')
+    goal = goal.strip()
+    acceptance, excludes = data.get('acceptance', []), data.get('excludes', [])
+    string_list(acceptance, 'acceptance')
+    string_list(excludes, 'excludes')
+    title = data.get('title') or goal.splitlines()[0][:80]
+    if not isinstance(title, str):
+        raise ValueError('title must be a string')
+    requirements = dict(data.get('requirements') or {})
+    contract = {'goal': goal, 'acceptance': acceptance, 'excludes': excludes, 'inputs_manifest': inputs_manifest,
+                'checks': data.get('checks', []), 'requirements': requirements}
+    if template['harness'] == 'stub':
+        if data.get('model') is not None or data.get('effort') is not None:
+            raise ValueError('the diagnostic template does not take a model')
+        contract.update(harness='stub', coordination={'policy': 'none'},
+                        harness_params={'steps': [{'write': {'path': 'agent-collab-diagnostic.txt', 'content': goal + '\n'}}]})
+        return title, contract
+    checks = contract['checks'] if isinstance(contract['checks'], list) else []
+    sections = ['Goal:\n' + goal]
+    if acceptance:
+        sections.append('Acceptance:\n' + '\n'.join('- ' + item for item in acceptance))
+    if excludes:
+        sections.append('Excludes:\n' + '\n'.join('- ' + item for item in excludes))
+    if checks:
+        sections.append('Checks run after you finish (they must pass):\n' + '\n'.join(
+            '- %s: %s' % (c.get('name'), ' '.join(map(str, c.get('run', [])))) for c in checks if isinstance(c, dict)))
+    tools = requirements.setdefault('tools', [])
+    if isinstance(tools, list) and 'codex' not in tools:
+        tools.append('codex')
+    params = {key: data[key] for key in ('model', 'effort') if data.get(key) is not None}
+    accept = template['id'] == 'codex-change-accept'
+    contract.update(harness='codex', harness_params=dict(params, sandbox='workspace-write'), prompt='\n\n'.join(sections),
+                    coordination={'policy': 'always' if accept else 'on_failure'},
+                    publish={'mode': 'manual', 'requires_acceptance': True} if accept else {'mode': 'auto', 'requires_acceptance': False})
+    return title, contract
+
+
+def repair_contract(target, follow_up, inputs_manifest, policy):
     """Derive execution policy from the target; the model supplies only a repair request."""
     validate_follow_up(follow_up)
+    codex = policy['codex']
+    effort = follow_up['effort'] or codex['effort']
+    if codex['model'] is None or effort is None:
+        raise PolicyError('model_default_unset')
+    if follow_up['effort'] is not None and not permitted(codex['allowed'], codex['model'], effort):
+        raise PolicyError('effort_not_allowed')
     spec = {key: copy.deepcopy(target[key]) for key in
             ('excludes', 'requirements', 'recovery', 'resources', 'publish', 'integration', 'workspace', 'budgets',
              'checks', 'coordination')
@@ -288,7 +505,7 @@ def repair_contract(target, follow_up, inputs_manifest):
     tools = requirements.setdefault('tools', [])
     if 'codex' not in tools:
         tools.append('codex')
-    spec.update(harness='codex', harness_params={'model': 'gpt-6-astra', 'effort': follow_up['effort'], 'sandbox': 'workspace-write'},
+    spec.update(harness='codex', harness_params={'model': codex['model'], 'effort': effort, 'sandbox': 'workspace-write'},
                 goal=follow_up['goal'], acceptance=copy.deepcopy(follow_up['acceptance']), inputs_manifest=inputs_manifest,
                 prompt='Instructions:\n' + follow_up['instructions'] + '\n\nGoal:\n' + follow_up['goal'] +
                        '\n\nAcceptance:\n' + '\n'.join('- ' + item for item in follow_up['acceptance']) +
@@ -298,7 +515,15 @@ def repair_contract(target, follow_up, inputs_manifest):
     return contract
 
 
-def managed_profile(config):
+def managed_profile(config, claude_default=None):
+    """claude_default：设置里的协调模型（§12.3）；给出时覆盖 profile 的 model 与 effort，节点列表仍取 profile。"""
+    result = _managed_profile(config)
+    if result['status'] == 'ready' and claude_default and claude_default.get('model'):
+        result['profile'].update(model=claude_default['model'], effort=claude_default['effort'])
+    return result
+
+
+def _managed_profile(config):
     setting = config.get('managed_coordinator')
     profile_id = setting.get('profile_id') if isinstance(setting, dict) else None
     if not isinstance(profile_id, str):
@@ -417,6 +642,15 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
         reasons.extend('label_missing:' + label for label in req['labels'] if label not in cap['labels'])
         if cap['harness'].get(harness) is None:
             reasons.append('harness_missing:' + harness)
+        catalog = codex_catalog(node) if harness == 'codex' else None
+        if catalog and catalog['status'] in ('ok', 'legacy'):
+            # §12.5：目录明确不含该组合才排除；目录未知不等于不支持，也不等于支持。
+            model, effort = (job['contract']['harness_params'].get(k) for k in ('model', 'effort'))
+            entry = next((m for m in catalog['models'] if m['id'] == model), None)
+            if entry is None:
+                reasons.append('model_unsupported:%s' % model)
+            elif effort not in entry['efforts']:
+                reasons.append('effort_unsupported:%s/%s' % (model, effort))
         # 只排除已确认过期的认证；unknown 不等于失败，本地登录状态也不等于服务端接受。
         if harness != 'stub' and node['auth_health'].get(harness) == 'expired':
             reasons.append('auth_unhealthy:' + harness)
@@ -443,6 +677,7 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
         breakdown = {k: v * weights[k] for k, v in breakdown.items()}
         result.append({'node_id': node['node_id'], 'eligible': not reasons, 'reasons': reasons,
                        'score': sum(breakdown.values()), 'breakdown': breakdown,
-                       'capability_evidence': capability_evidence(node)})
+                       'capability_evidence': capability_evidence(node),
+                       **({'model_catalog': catalog['status']} if catalog else {})})
     eligible = sorted((row for row in result if row['eligible']), key=lambda r: (-r['score'], r['node_id']))
     return {'nodes': result, 'selected_node_id': eligible[0]['node_id'] if eligible else None}

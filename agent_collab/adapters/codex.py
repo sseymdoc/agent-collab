@@ -9,8 +9,6 @@ import time
 
 from .. import protocol as p
 
-MODEL = 'gpt-6-astra'
-EFFORTS = ('high', 'xhigh', 'max')
 CREATE_SUSPENDED = 0x00000004  # Windows CreateProcess 标志
 
 
@@ -18,11 +16,8 @@ def build_argv(command, cwd, output_dir, params=None, session_id=None, structure
                system=None, windows_sandbox='elevated'):
     # Ported argv()/validate(): launcher.py SHA256 7862865fadc8c2a1.
     params = params or {}
-    if params.get('model', MODEL) != MODEL:
-        raise ValueError('model must be ' + MODEL)
-    effort = params.get('effort', 'xhigh')
-    if effort not in EFFORTS:
-        raise ValueError('effort must be high, xhigh or max')
+    # model 与 effort 由 controller 受理时解析后写进契约（protocol §12.4）：这里不带默认值，也不替换成别的组合。
+    model, effort = p.check_model(params.get('model')), p.check_effort(params.get('effort'))
     sandbox = params.get('sandbox', 'read-only')
     if sandbox not in ('read-only', 'workspace-write'):
         raise ValueError('invalid sandbox')
@@ -33,7 +28,7 @@ def build_argv(command, cwd, output_dir, params=None, session_id=None, structure
         '-c', 'sandbox_workspace_write.network_access=false',
         '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true',
         '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
-        '--model', MODEL, '--skip-git-repo-check', '--json', '-o', str(Path(output_dir) / 'result.txt')]
+        '--model', model, '--skip-git-repo-check', '--json', '-o', str(Path(output_dir) / 'result.txt')]
     windows = system == 'Windows' if system is not None else os.name == 'nt'
     if windows:
         argv += ['-c', 'windows.sandbox=' + json.dumps(windows_sandbox)]
@@ -44,6 +39,80 @@ def build_argv(command, cwd, output_dir, params=None, session_id=None, structure
     else:
         argv += ['-']
     return argv
+
+
+def model_catalog(argv, env=None, timeout=20, popen=subprocess.Popen):
+    """向本机 `codex app-server` 询问 model/list（protocol §12.5）。
+
+    经 stdio 交互，不监听端口，不调用模型；在调用方的用户、CODEX_HOME 与登录上下文里运行，
+    所以目录反映的是这个节点上这个账户能看到的模型。取不到时 status 为 unknown 并给出原因。
+    """
+    import queue
+    import threading
+    result = {'status': 'unknown', 'source': 'app-server:model/list', 'fetched_at': None, 'cli_version': None,
+              'reason': None, 'models': []}
+    if not argv:
+        return dict(result, reason='command_missing')
+    options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
+    try:
+        process = popen(list(argv) + ['app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, env=env, **options)
+    except OSError:
+        return dict(result, reason='spawn_failed')
+    lines, deadline = queue.Queue(), time.monotonic() + timeout
+
+    def read():
+        for line in process.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    def send(value):
+        process.stdin.write(json.dumps(value).encode('utf-8') + b'\n')
+        process.stdin.flush()
+
+    def reply(ident):
+        while True:
+            line = lines.get(timeout=max(.1, deadline - time.monotonic()))
+            if line is None:
+                raise OSError('app-server closed its output')
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and message.get('id') == ident:
+                return message
+
+    threading.Thread(target=read, name='codex-model-list', daemon=True).start()
+    try:
+        send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'agent-collab', 'version': '1'}}})
+        reply(1)
+        send({'method': 'initialized'})
+        models, cursor = [], None
+        for ident in range(2, 12):  # 目录分页；十页以上按异常处理，不无限翻页
+            send({'id': ident, 'method': 'model/list', 'params': {'cursor': cursor, 'includeHidden': False}})
+            message = reply(ident)
+            if not isinstance(message.get('result'), dict):
+                return dict(result, reason='model_list_error')
+            for item in message['result'].get('data', []):
+                try:
+                    efforts = [p.check_effort(e['reasoningEffort']) for e in item.get('supportedReasoningEfforts', [])]
+                    default = item.get('defaultReasoningEffort')
+                    models.append({'id': p.check_model(item['model']), 'efforts': efforts[:32],
+                                   'default_effort': p.check_effort(default) if default is not None else None})
+                except (ValueError, KeyError, TypeError):
+                    continue  # 名称不符合契约字段约束的条目不进目录，其余照常上报
+            cursor = message['result'].get('nextCursor')
+            if not cursor:
+                return dict(result, status='ok', models=models[:200])
+        return dict(result, reason='too_many_pages')
+    except (OSError, queue.Empty, KeyError, TypeError, AttributeError, ValueError):
+        return dict(result, reason='probe_failed')
+    finally:
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def classify_failure(text, returncode=None, abnormal=False):

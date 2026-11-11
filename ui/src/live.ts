@@ -1,52 +1,54 @@
-import { useEffect, useRef, useState } from 'react'
-import { streamUrl } from './api'
+import { useEffect, useState } from 'react'
+import { lost } from './api'
+import { openStream } from './transport'
 
-// SSE 只触发刷新；事实以 GET 快照为准。EventSource 断线自动重连并带 Last-Event-ID；
-// 服务端游标过期时发 snapshot_required，这里整体刷新，再从它给出的 min_seq 续读。
+// 事件流只触发刷新；事实以 GET 快照为准。这里负责：按序号续读与去重、断线退避重连、
+// 游标过期（snapshot_required）后整体刷新并从 controller 给出的最小序号继续、凭据失效时交回连接页。
+// lastAt 是最近一次收到事件或成功连上的时间：断线期间页面显示它，不把旧数据当作实时。
 export type Live = { state: 'connecting' | 'open' | 'retrying'; lastSeq: number | null; tick: number; lastAt: number | null }
-
-// SSE 没有通配订阅；与 controller 实际发出的事件类型一致（2026-11-10 按 controller.emit 与 store.event 调用核对）。
-// 不订阅 attempt.renewed：它随每次心跳出现，不改变页面上的事实。
-export const EVENT_TYPES = [
-  'controller.started', 'controller.backup', 'controller.restored', 'job.created', 'job.updated', 'job.published', 'job.assessed', 'job.integration', 'job.evidence_gap',
-  'attempt.assigned', 'attempt.leased', 'attempt.updated', 'attempt.started', 'attempt.progress', 'attempt.log',
-  'attempt.side_effect', 'attempt.succeeded', 'attempt.failed', 'attempt.cancelled', 'attempt.lost', 'attempt.superseded',
-  'checkpoint.uploading', 'checkpoint.durable', 'node.paired', 'node.registered', 'node.updated', 'meta.updated',
-  'coordinator.triggered', 'coordinator.takeover', 'coordinator.released', 'coordinator.escalated',
-  'coordinator.decision_applied', 'coordinator.decision_rejected',
-]
 
 export function useLive(enabled: boolean): Live {
   const [live, setLive] = useState<Live>({ state: 'connecting', lastSeq: null, tick: 0, lastAt: null })
-  const seq = useRef<number | null>(null)
   useEffect(() => {
     if (!enabled) return
-    let es: EventSource | null = null
-    let timer: number | undefined
-    let retry: number | undefined
+    let cursor = 0, close = () => {}, timer: number | undefined, retry: number | undefined, delay = 1000, stopped = false
+    // 250 毫秒内的多条事件合并成一次刷新：长日志或批量状态变化不会让页面逐条重绘。
     const bump = () => {
       window.clearTimeout(timer)
-      timer = window.setTimeout(() => setLive(l => ({ ...l, tick: l.tick + 1, lastSeq: seq.current, lastAt: Date.now() })), 250)
+      timer = window.setTimeout(() => setLive(l => ({ ...l, tick: l.tick + 1, lastSeq: cursor || null, lastAt: Date.now() })), 250)
     }
-    const onEvent = (e: MessageEvent) => { const n = Number(e.lastEventId); if (n) seq.current = n; bump() }
-    const reopen = (ms: number) => { es?.close(); window.clearTimeout(retry); retry = window.setTimeout(open, ms) }
+    const reopen = (ms: number) => { close(); window.clearTimeout(retry); retry = window.setTimeout(open, ms) }
     const open = () => {
-      es = new EventSource(streamUrl(seq.current), { withCredentials: true })
-      es.onopen = () => setLive(l => ({ ...l, state: 'open' }))
-      // 网络中断时浏览器自行重连；收到非 200 响应（会话过期 401、代理 502 等）时浏览器关闭连接不再重试，这里延时重开。
-      es.onerror = () => { setLive(l => ({ ...l, state: 'retrying' })); if (es?.readyState === EventSource.CLOSED) reopen(5000) }
-      es.onmessage = onEvent
-      for (const t of EVENT_TYPES) es.addEventListener(t, onEvent as EventListener)
-      // controller 要求 cursor ≥ min_seq，省略游标按 0 处理会再次收到本事件；页面以快照刷新，之后从 min_seq 续读。
-      es.addEventListener('snapshot_required', e => {
-        let m = NaN
-        try { m = Number(JSON.parse((e as MessageEvent).data).min_seq) } catch { /* 数据异常时延时重试 */ }
-        bump()
-        if (Number.isInteger(m) && m > 0) { seq.current = m; reopen(0) } else reopen(5000)
+      if (stopped) return
+      close = openStream(cursor, e => {
+        if (stopped) return
+        if (e.kind === 'open') {
+          delay = 1000
+          // 重连成功后补一次刷新：断线期间的变化可能已被服务端裁剪，不能只靠续读。
+          setLive(l => ({ ...l, state: 'open', lastAt: Date.now(), tick: l.state === 'retrying' ? l.tick + 1 : l.tick }))
+        } else if (e.kind === 'event') {
+          const n = Number(e.id)
+          if (!n || n <= cursor) return // 重连后服务端可能重发已读过的事件
+          cursor = n
+          bump()
+        } else if (e.kind === 'snapshot_required') {
+          // controller 已裁剪到 min_seq 之后（或恢复过数据）：以快照为准，再从它给出的位置续读。
+          let m = NaN
+          try { m = Number(JSON.parse(e.data ?? '').min_seq) } catch { /* 数据异常时按断线重试 */ }
+          bump()
+          if (Number.isInteger(m) && m > 0) { cursor = m; reopen(0) } else reopen(5000)
+        } else if (e.kind === 'unauthorized') {
+          stopped = true
+          lost('unauthorized')
+        } else {
+          setLive(l => ({ ...l, state: 'retrying' }))
+          reopen(delay)
+          delay = Math.min(delay * 2, 10000)
+        }
       })
     }
     open()
-    return () => { window.clearTimeout(timer); window.clearTimeout(retry); es?.close() }
+    return () => { stopped = true; window.clearTimeout(timer); window.clearTimeout(retry); close() }
   }, [enabled])
   return live
 }

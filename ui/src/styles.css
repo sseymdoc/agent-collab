@@ -4,13 +4,20 @@
   --bad: #b42318; --bad-bg: #fde8e6; --info: #1f5fa8; --info-bg: #e5effa; --muted-bg: #eef0f3;
   color-scheme: light;
 }
+/* 深色：跟随系统，或在“设置 → 本机偏好”里指定（data-theme）。 */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #12151b; --panel: #1a1f27; --text: #e6e9ef; --muted: #98a2b3; --line: #2a313c;
     --accent: #7ea2ff; --good: #6fd39b; --good-bg: #173326; --warn: #f0c060; --warn-bg: #3a2f14;
     --bad: #ff8a80; --bad-bg: #3d1d1b; --info: #8ab8ff; --info-bg: #182c45; --muted-bg: #252b35;
     color-scheme: dark;
   }
+}
+:root[data-theme="dark"] {
+  --bg: #12151b; --panel: #1a1f27; --text: #e6e9ef; --muted: #98a2b3; --line: #2a313c;
+  --accent: #7ea2ff; --good: #6fd39b; --good-bg: #173326; --warn: #f0c060; --warn-bg: #3a2f14;
+  --bad: #ff8a80; --bad-bg: #3d1d1b; --info: #8ab8ff; --info-bg: #182c45; --muted-bg: #252b35;
+  color-scheme: dark;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
@@ -57,3 +64,18 @@ pre.json { background: var(--muted-bg); padding: 8px; border-radius: 6px; overfl
 .login { display: grid; place-items: center; min-height: 80vh; }
 .login form { width: min(420px, 100%); }
 @media (max-width: 640px) { dl.kv { grid-template-columns: 1fr; } main { padding: 12px; } }
+h3 { font-size: 14px; margin: 14px 0 4px; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 10px 0; padding: 8px 12px; }
+legend { color: var(--muted); padding: 0 4px; }
+label.row { flex-direction: row; align-items: center; gap: 6px; margin: 4px 0; }
+label.row.inline { display: inline-flex; margin-right: 14px; }
+label.narrow { max-width: 240px; }
+input.wide { flex: 1; min-width: 280px; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 16px; }
+.draft { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 4px; }
+.notice { background: var(--warn-bg); color: var(--text); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+.notice .actions { margin-top: 6px; }
+.pre { white-space: pre-wrap; }
+code.code { font-size: 14px; user-select: all; padding: 2px 6px; background: var(--muted-bg); border-radius: 4px; }
+main.connect { max-width: 760px; }

@@ -44,6 +44,7 @@ class ClaudeAdapter:
         self.session_id = str(uuid.uuid4())
         self.decision = None
         self.notes = ''
+        self.legacy = False
 
     def report(self):
         return {'harness': 'claude', 'decision': self.decision, 'notes': self.notes}
@@ -64,8 +65,13 @@ class ClaudeAdapter:
                 self.done = True
                 return
             schema = json.loads((self.context.work / 'decision-schema.json').read_text(encoding='utf-8'))
-            if schema != d.DECISION_SCHEMA:
+            if schema not in (d.DECISION_SCHEMA, d.LEGACY_DECISION_SCHEMA):
                 raise ValueError('unrecognized decision schema')
+            # 升级前的 controller 下发旧 schema（effort 必填、三个固定值）；按它给的 schema 提示和校验。
+            self.legacy = schema == d.LEGACY_DECISION_SCHEMA
+            effort_rule = ('effort (high, xhigh, or max)' if self.legacy else
+                           'effort (null to keep the effort frozen for this work package; otherwise a value from '
+                           'repair_policy.allowed_efforts in context.json, or any CLI-supported value when that list is null)')
             argv = build_argv(self.command, self.context.contract['harness_params'], schema, self.session_id)
             # 不给 Claude 任何工具（--tools ""）：context.json 直接放进提示词，任务数据里的提示注入
             # 无法让它读取节点上的其他文件（如令牌、登录资料）。
@@ -78,7 +84,7 @@ class ClaudeAdapter:
                       'Bind assessment.checkpoint_id to job.durable_checkpoint_id; if no checkpoint exists, escalate. '
                       'Assess only the supplied evidence; do not claim checks you did not observe. Escalate when evidence is insufficient. '
                       'For rework, follow_up is null or a repair request with exactly title, goal, acceptance '
-                      '(a nonempty list of strings), instructions (modification guidance for Codex), and effort (high, xhigh, or max). '
+                      '(a nonempty list of strings), instructions (modification guidance for Codex), and ' + effort_rule + '. '
                       'Do not write a contract, execution policy, budgets, input manifest or checkpoint fields in follow_up. '
                       'The controller generates the complete Codex repair contract from the assessed checkpoint and inherited target policy. '
                       'Do not write files or execute commands. Follow-up work must honor the target budgets and scope.'
@@ -102,7 +108,7 @@ class ClaudeAdapter:
             result = json.loads(stdout)
             if code != 0 or not stopped or not isinstance(result, dict) or result.get('is_error'):
                 raise ValueError('Claude did not complete successfully')
-            decision = d.validate_decision_schema(result.get('structured_output'))
+            decision = d.validate_decision_schema(result.get('structured_output'), legacy=self.legacy)
         except (ValueError, TypeError, KeyError):
             self.notes = 'Claude failed or returned an invalid structured decision'
             failure = classify_failure(stderr + stdout, code, not stopped)

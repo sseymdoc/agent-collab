@@ -51,6 +51,8 @@ class FakeController:
         self.checkpoint_requests = []
         self.heartbeat_s = 1
         self.lease_ttl_s = 5
+        self.features = None  # 列表：模拟声明了 §12 能力的 controller；None：升级前的 controller
+        self.registrations = []
 
     def add(self, steps=None, manifest=None, summary=None, side_effects='none', publish='auto', integration=None):
         sha = p.manifest_sha256(manifest) if manifest else None
@@ -113,8 +115,10 @@ class FakeController:
                 return self.response(201)
         value = json.loads(body or b'{}')
         if path == '/nodes/register':
+            self.registrations.append(value)
             return self.response(200, dict(node=value, authority_generation=self.generation,
-                config=dict(heartbeat_s=self.heartbeat_s, lease_ttl_s=self.lease_ttl_s)))
+                config=dict(heartbeat_s=self.heartbeat_s, lease_ttl_s=self.lease_ttl_s),
+                **({} if self.features is None else {'features': self.features})))
         if path.endswith('/heartbeat'):
             self.last_heartbeat = copy.deepcopy(value)
             for entry in value['attempts']:

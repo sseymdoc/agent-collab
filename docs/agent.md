@@ -66,6 +66,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 | workspace_root | 可选，工作区改为 `<workspace_root>/<attempt_id>`；元数据和输出仍在 data 下 |
 | codex_windows_sandbox | Windows Codex 的 windows.sandbox，缺省 elevated |
 | auth_probe_s | 认证状态探测周期，缺省 900 秒；启动探测，后续后台探测，不阻塞心跳 |
+| model_catalog_s | 模型目录刷新周期，缺省 21600 秒；后台读取，不阻塞心跳 |
 | provider_account_refs | 可选，非凭据账户分组；auth_health 由实际探测产生，旧配置中的静态 auth_health 不再作为探测结果 |
 
 同一物理主机上的多个节点（例如 Windows 原生节点与按需启用的 WSL 节点）应显式使用相同 `physical_host_id` 和 `host_slots`。
@@ -136,6 +137,15 @@ lease.token）。检查若导入模型刚写出的工作区代码（如 `{python
 超时、耗时和脱敏输出尾部（各 ≤4 KiB）。harness 失败时不运行检查，checks=null。
 成功但未配置检查时 results=[]。64 KiB 总限制优先压缩检查尾部；极端超大 argv 仍可能使检查证据被清空，
 此时 controller 应按缺证据处理，不能当作通过。检查原始本地输出与 harness 日志一样只保存在节点。
+
+## 模型目录
+
+controller 在注册响应的 `features` 里声明 `node_models` 之后，节点在后台读取 Codex 的模型目录并随注册上报（`capabilities.models`，`docs/protocol.md` §12.5）；连接旧版本 controller 时不读取也不上报。
+
+- 读取方式：以节点解析出的 codex 命令启动 `codex app-server`，经 stdin/stdout 发送 `initialize` 与 `model/list`，取到应答后结束该进程。不监听端口，不调用模型；进程继承节点服务的用户、`CODEX_HOME` 与登录状态，所以目录是这个节点上这个账户能看到的模型及各自支持的 effort。
+- 取不到（命令缺失、启动失败、20 秒内没有应答、应答格式不符）时上报 `status: unknown` 与原因，controller 不因此排除该节点。名称不符合字段约束的条目不进目录。
+- 目录内容变化时重新注册；没有变化则在下一个周期前不重复读取。Claude CLI 没有目录接口，固定上报 `unknown` / `no_catalog_interface`。
+- Codex 的 `--model` 与 `model_reasoning_effort` 取自契约的 `harness_params`，适配器不带默认值；契约缺少其中任何一项时该 attempt 以代码失败结束。
 
 ## Claude 受管协调适配器
 

@@ -8,6 +8,7 @@ import unittest
 import uuid
 
 from agent_collab.controller import App
+from agent_collab import domain as d
 from agent_collab import protocol as p
 
 
@@ -63,6 +64,16 @@ class ControllerCase(unittest.TestCase):
         self.clock = Clock()
         self.app = App(self.temp / 'data', clock=self.clock)
         self.admin = (self.temp / 'data' / 'admin.token').read_text().strip()
+        if self.legacy_settings:
+            self.settings(d.migrated_settings(None))
+
+    # 既有用例描述的是升级前部署的行为，按那类部署启动时迁移得到的模型设置运行（protocol §12.3）；
+    # 新部署从未设置开始，相关用例把它设为 False。
+    legacy_settings = True
+
+    def settings(self, value):
+        with self.app.store.transaction():
+            self.app.store.put('settings', 'models', value)
 
     def tearDown(self):
         if self.app:

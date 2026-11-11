@@ -98,9 +98,11 @@ class Store:
         self.db.execute('UPDATE events SET data=? WHERE seq=?', (p.canonical_json(data).decode(), data['seq']))
         return data
 
-    def events(self, after=0, limit=200, job_id=None):
+    def events(self, after=0, limit=200, job_id=None, before=None):
         if job_id is not None:
-            rows = self.db.execute('SELECT data FROM events WHERE job_id=? ORDER BY seq DESC LIMIT ?', (job_id, limit)).fetchall()
+            # before：只取序号更小的事件，供界面向前翻页；缺省取最近的 limit 条。
+            rows = self.db.execute('SELECT data FROM events WHERE job_id=? AND seq<? ORDER BY seq DESC LIMIT ?',
+                                   (job_id, before if before is not None else 1 << 62, limit)).fetchall()
             return [json.loads(row[0]) for row in reversed(rows)]
         return [json.loads(row[0]) for row in self.db.execute('SELECT data FROM events WHERE seq>? ORDER BY seq LIMIT ?', (after, limit))]
 

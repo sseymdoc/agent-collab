@@ -20,7 +20,7 @@ import uuid
 from . import protocol as p
 from .artifacts import DEFAULT_EXCLUDES, EMPTY, atomic_write, checked_manifest, integrate, materialize, snapshot
 from .client import APIError, Client, ConnectionFailure, validate_url
-from .adapters.codex import CodexAdapter, process_stamp, process_status
+from .adapters.codex import CodexAdapter, model_catalog, process_stamp, process_status
 from .adapters.claude import ClaudeAdapter
 from .adapters.stub import StubAdapter
 from .adapters.checks import ContractChecks
@@ -358,8 +358,8 @@ class Attempt:
         harness = self.contract.get('harness', 'stub')
         return dict(agent_version=self.agent.release['version'], agent_commit=self.agent.release['git_commit'], harness=harness,
                     harness_version=self.agent.capabilities.get('harness', {}).get(harness),
-                    model=params.get('model', 'gpt-6-astra') if harness == 'codex' else params.get('model') if harness == 'claude' else None,
-                    effort=params.get('effort', 'xhigh') if harness == 'codex' else params.get('effort') if harness == 'claude' else None,
+                    model=params.get('model') if harness in ('codex', 'claude') else None,
+                    effort=params.get('effort') if harness in ('codex', 'claude') else None,
                     observed=self.observed)
 
     def checkpoint(self, kind, summary=None):
@@ -572,7 +572,7 @@ class Attempt:
 
 class Agent:
     def __init__(self, data_dir, transport=None, clock=time.monotonic, rng=None, capabilities=None,
-                 fault_exit_after_checkpoint=None, commands=None, auth_runner=None, system=None):
+                 fault_exit_after_checkpoint=None, commands=None, auth_runner=None, system=None, catalog_probe=None):
         self.directory = Path(data_dir).absolute()
         self.config = load(self.directory / 'agent.json')
         p.check_node_id(self.config['node_id'])
@@ -594,6 +594,15 @@ class Agent:
         self.auth_thread = None
         self.next_auth_probe = 0
         self.refresh_auth()
+        # 模型目录（protocol §12.5）：controller 声明支持后才探测和上报；旧 controller 会拒绝未知的能力键。
+        self.catalog_probe = catalog_probe or model_catalog
+        self.model_catalog_s = float(self.config.get('model_catalog_s', 21600))
+        if not 0 < self.model_catalog_s < float('inf'):
+            raise ValueError('model_catalog_s must be positive and finite')
+        self.controller_models = False
+        self.models = None
+        self.catalog_thread = None
+        self.next_catalog = 0
         self.rng = rng or random.Random()
         self.backoff = Backoff(self.rng)
         self.capabilities = dict(capabilities) if capabilities is not None else detect(self.config, self.commands)
@@ -640,6 +649,27 @@ class Agent:
         else:
             run()
 
+    def refresh_catalog(self):
+        if (not self.controller_models or self.clock() < self.next_catalog or
+                (self.catalog_thread and self.catalog_thread.is_alive())):
+            return
+        self.next_catalog = self.clock() + self.model_catalog_s
+        def run():
+            command = self.commands['codex']
+            codex = dict(self.catalog_probe(command['argv'], command['env']), fetched_at=now(),
+                         cli_version=self.capabilities.get('harness', {}).get('codex'))
+            claude = dict(status='unknown', source=None, fetched_at=now(), reason='no_catalog_interface',
+                          cli_version=self.capabilities.get('harness', {}).get('claude'), models=[])
+            models = dict(codex=codex, claude=claude)
+            changed = self.models is None or any(
+                (self.models[name]['status'], self.models[name]['models']) != (models[name]['status'], models[name]['models'])
+                for name in models)
+            self.models = models
+            if changed:
+                self.registered = False  # 下一轮带上新目录重新注册
+        self.catalog_thread = threading.Thread(target=run, name='model-catalog', daemon=True)
+        self.catalog_thread.start()
+
     def clean(self, value):
         return redact(value, sorted(self.secrets, key=len, reverse=True))
 
@@ -665,13 +695,15 @@ class Agent:
 
     def register(self):
         config = self.config
+        capabilities = dict(self.capabilities, models=self.models) if self.controller_models and self.models else self.capabilities
         record = dict(node_id=config['node_id'], physical_host_id=config['physical_host_id'],
-            failure_domain=config['failure_domain'], capabilities=self.capabilities,
+            failure_domain=config['failure_domain'], capabilities=capabilities,
             runtime_profile=dict(user=getpass.getuser(), workspace_policy='isolated-attempt'),
             resources=dict(slots=config.get('slots', 1), host_slots=config.get('host_slots', 1), mem_mb=None),
             provider_account_refs=config.get('provider_account_refs', {}),
             auth_health=self.auth_health, agent_version=self.release['version'])
         result = self.client.json('POST', '/nodes/register', record)
+        self.controller_models = 'node_models' in result.get('features', [])
         self.generation = result['authority_generation']
         for attempt in self.attempts.values():
             if attempt.assignment['authority_generation'] != self.generation and attempt.meta['state'] != 'reported':
@@ -867,6 +899,7 @@ class Agent:
 
     def cycle(self, claim_allowed=True):
         self.refresh_auth(background=True)
+        self.refresh_catalog()
         for attempt in self.attempts.values():
             attempt.refresh_restart()
         if self.clock() >= self.next_network:
@@ -975,10 +1008,12 @@ def effective_configuration(config, directory, commands, capabilities, system=No
                          cleared_env=list(CODEX_CLEARED_ENV))
         if argv:
             if name == 'codex':
-                managed = codex.build_argv(argv, '<work>', '<attempt>', system=system or platform.system(),
+                managed = codex.build_argv(argv, '<work>', '<attempt>', dict(model='model', effort='effort'),
+                                          system=system or platform.system(),
                                           windows_sandbox=config.get('codex_windows_sandbox', 'elevated'))
-                # Effort and sandbox come from the attempt contract, not the node config.
+                # Model, effort and sandbox come from the attempt contract, not the node config.
                 managed[managed.index('--sandbox', len(argv)) + 1] = '<sandbox>'
+                managed[managed.index('--model', len(argv)) + 1] = '<model>'
                 index = next(i for i in range(len(argv), len(managed)) if managed[i].startswith('model_reasoning_effort='))
                 managed[index] = managed[index].split('=', 1)[0] + '="<effort>"'
             else:

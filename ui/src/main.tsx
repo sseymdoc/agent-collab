@@ -1,14 +1,19 @@
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, ApiError, onUnauthorized } from './api'
+import { api, ApiError, forgetCoordinators, onUnauthorized } from './api'
 import { useLive } from './live'
-import { errText } from './ui'
+import { session, setSession } from './session'
+import { invoke, isDesktop, setEpoch } from './transport'
+import { applyTheme, errText, short } from './ui'
+import { Connect, bridgeText } from './pages/Connect'
 import { Overview } from './pages/Overview'
 import { Nodes } from './pages/Nodes'
 import { Jobs } from './pages/Jobs'
 import { JobDetail } from './pages/JobDetail'
 import { Settings } from './pages/Settings'
 import './styles.css'
+
+try { applyTheme(localStorage.getItem('ac_theme')) } catch { /* 存储不可用时跟随系统 */ }
 
 function useHash() {
   const [h, setH] = useState(location.hash || '#/overview')
@@ -33,49 +38,82 @@ function Login({ onDone }: { onDone: () => void }) {
   </main>
 }
 
+// 上一次连接的 controller：换了 controller 才丢弃协调令牌，重连同一个不必重新接管自己的租约。
+let lastController: string | null = null
+
 function App() {
-  const [authed, setAuthed] = useState<boolean | null>(null)
-  const hash = useHash()
-  const live = useLive(authed === true)
-  const [bootErr, setBootErr] = useState<string | null>(null)
-  const boot = () => {
-    setBootErr(null)
-    api.resume().then(() => setAuthed(true), e => {
-      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) setAuthed(false)
-      else setBootErr(errText(e))
-    })
+  // 每次建立连接 generation 加一，主界面按它整体重建：上一条连接留下的弹窗、表单和在途请求的结果随之丢弃。
+  const [phase, setPhase] = useState<{ at: 'boot' | 'login' | 'ready'; generation: number; reason: string | null; error: string | null }>(
+    { at: 'boot', generation: 0, reason: null, error: null })
+  const enter = async () => {
+    const who = await api.whoami()
+    if (lastController !== who.controller.controller_id) forgetCoordinators()
+    lastController = who.controller.controller_id
+    setSession(who)
+    setPhase(p => ({ at: 'ready', generation: p.generation + 1, reason: null, error: null }))
   }
-  useEffect(() => { onUnauthorized(() => setAuthed(false)); boot() }, []) // eslint-disable-line
-  // 事件流断开期间定时探测会话：页面空闲时会话过期也能由 401 切回登录页（网络未恢复时探测本身也会失败，需要重试）。
+  const leave = (reason: string | null) => {
+    setSession(null)
+    if (isDesktop) void invoke('connection_close').catch(() => {})
+    setPhase(p => ({ ...p, at: 'login', reason, error: null }))
+  }
+  const boot = async () => {
+    setPhase(p => ({ ...p, at: 'boot', error: null }))
+    try {
+      if (isDesktop) {
+        const { active } = await invoke('connections_list')
+        if (!active) return leave(null)
+        setEpoch(active.epoch)
+      } else await api.resume()
+      await enter()
+    } catch (e) {
+      if (isDesktop) return setPhase(p => ({ ...p, at: 'login', reason: null, error: e instanceof ApiError ? errText(e) : bridgeText(e) }))
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) leave(null)
+      else setPhase(p => ({ ...p, error: errText(e) }))
+    }
+  }
+  useEffect(() => { onUnauthorized(leave); void boot() }, []) // eslint-disable-line
+  if (phase.at === 'boot') return <main className="login">{phase.error
+    ? <div className="card"><p className="err">无法连接 controller：{phase.error}</p>
+      <div className="actions"><button onClick={() => void boot()}>重试</button><button className="link" onClick={() => leave(null)}>改用令牌登录</button></div></div>
+    : <p className="muted">连接 controller…</p>}</main>
+  if (phase.at === 'login') return isDesktop
+    ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={opened => { setEpoch(opened.epoch); void enter().catch(e => leave(errText(e))) }} />
+    : <Login onDone={() => void enter().catch(e => setPhase(p => ({ ...p, at: 'boot', error: errText(e) })))} />
+  return <Shell key={phase.generation} onLeave={() => { if (!isDesktop) void api.logout().catch(() => {}); leave(null) }} />
+}
+
+// 导航按“总览 → 任务 → 设备 → 设置”排列；项目与活动两页在后续版本加入同一列表。
+const NAV = [['overview', '总览'], ['jobs', '任务'], ['nodes', '设备'], ['settings', '设置']]
+
+function Shell({ onLeave }: { onLeave: () => void }) {
+  const hash = useHash()
+  const live = useLive(true)
+  const who = session()
+  // 浏览器会话可能在页面空闲时过期：事件流断开期间定时探测，过期由 401 切回登录页。
   useEffect(() => {
-    if (!authed || live.state !== 'retrying') return
+    if (isDesktop || live.state !== 'retrying') return
     const probe = () => { void api.resume().catch(() => {}) }
     probe()
     const timer = window.setInterval(probe, 5000)
     return () => window.clearInterval(timer)
-  }, [authed, live.state])
-  if (bootErr) return <main className="login"><div className="card">
-    <p className="err">无法连接 controller：{bootErr}</p>
-    <div className="actions"><button onClick={boot}>重试</button><button className="link" onClick={() => { setBootErr(null); setAuthed(false) }}>改用令牌登录</button></div>
-  </div></main>
-  if (authed === null) return <main className="login"><p className="muted">连接 controller…</p></main>
-  if (!authed) return <Login onDone={() => setAuthed(true)} />
+  }, [live.state])
   const [, page, id] = hash.split('/')
-  const nav = [['overview', '总览'], ['nodes', '节点'], ['jobs', '工作包'], ['settings', '设置与诊断']]
-  const conn = live.state === 'open' ? ['good', '事件流已连接'] : live.state === 'retrying' ? ['bad', '事件流重连中'] : ['warn', '事件流连接中']
+  const at = live.lastAt ? new Date(live.lastAt).toLocaleTimeString('zh-CN', { hour12: false }) : '尚无'
+  const conn = live.state === 'open' ? ['good', '实时'] : live.state === 'retrying' ? ['bad', '连接中断 · 数据截至 ' + at] : ['warn', '连接中']
   return <>
     <header className="top">
-      <strong>agent-collab</strong>
-      <nav>{nav.map(([k, t]) => <a key={k} href={'#/' + k} className={page === k ? 'on' : ''}>{t}</a>)}</nav>
+      <strong>Agent Collab</strong>
+      <nav>{NAV.map(([k, t]) => <a key={k} href={'#/' + k} className={page === k || (!page && k === 'overview') ? 'on' : ''}>{t}</a>)}</nav>
       <span className={'badge ' + conn[0]} title={'最后事件序号 ' + (live.lastSeq ?? '无')}>{conn[1]}</span>
-      {/* 服务端会话可能已失效（DELETE 返回 401），无论结果都回到登录页。 */}
-      <button className="link" onClick={() => { void api.logout().catch(() => {}).finally(() => setAuthed(false)) }}>退出</button>
+      <small className="muted" title={'controller ' + who?.controller.controller_id}>{who?.identity.name ?? (who?.identity.kind === 'session' ? '浏览器会话' : '管理令牌')} · controller {short(who?.controller.controller_id)}</small>
+      <button className="link" onClick={onLeave}>{isDesktop ? '断开' : '退出'}</button>
     </header>
     <main>
       {page === 'nodes' ? <Nodes tick={live.tick} />
         : page === 'jobs' && id ? <JobDetail key={id} id={id} tick={live.tick} />
         : page === 'jobs' ? <Jobs tick={live.tick} />
-        : page === 'settings' ? <Settings tick={live.tick} />
+        : page === 'settings' ? <Settings tick={live.tick} onLeave={onLeave} />
         : <Overview tick={live.tick} />}
     </main>
   </>

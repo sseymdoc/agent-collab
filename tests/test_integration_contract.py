@@ -15,7 +15,7 @@ def node(**cap):
 
 def job(harness='stub', tools=(), gpu=None):
     return {'job_id': 'j', 'protection': 'unprotected', 'contract': {
-        'harness': harness, 'resources': {'slots': 1},
+        'harness': harness, 'resources': {'slots': 1}, 'harness_params': {'model': 'gpt-6-astra', 'effort': 'xhigh'},
         'requirements': {'os': [], 'arch': [], 'tools': list(tools), 'gpu': gpu, 'labels': []}}}
 
 

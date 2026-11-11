@@ -1,4 +1,6 @@
-// 只对接真实 controller API（docs/protocol.md §5、§8）；没有 mock。
+// 只对接真实 controller API（docs/protocol.md §5、§8、§12）；没有 mock。传输见 transport.ts。
+import { request, setCsrf } from './transport'
+
 export type J = Record<string, any>
 
 export class ApiError extends Error {
@@ -7,17 +9,8 @@ export class ApiError extends Error {
   }
 }
 
-const P = '/api/v1'
-let csrf: string | null = null
-try { csrf = sessionStorage.getItem('ac_csrf') } catch { /* 隐私模式 */ }
-
-function setCsrf(v: string | null) {
-  csrf = v
-  try { v ? sessionStorage.setItem('ac_csrf', v) : sessionStorage.removeItem('ac_csrf') } catch { /* 忽略 */ }
-}
-
-// 协调令牌按根工作包保存在当前标签页；持有租约时，变更请求附带 X-Coordinator-Token。
-// 内存为准，sessionStorage 只用于刷新页面后恢复（隐私模式下不可用时仍能用内存中的令牌）。
+// 协调令牌按根工作包保存在当前窗口；持有租约时，变更请求附带 X-Coordinator-Token。
+// 内存为准，sessionStorage 只用于刷新页面后恢复（不可用时仍能用内存中的令牌）。
 // 同时记下取得时的租约身份（恢复代次, 版本）：变了（被接管、续租、重建或数据恢复），本页不再算持有者。
 // 版本单调递增，不会像时间戳那样在同一毫秒重复；数据恢复后版本可能重新从 1 开始，所以要连同代次一起比较。
 export type CoordHeld = { token: string; version: number; generation: number }
@@ -36,6 +29,12 @@ function setCoord(wp: string, v: CoordHeld | null) {
   coordMem.set(wp, v)
   try { v ? sessionStorage.setItem(coordKey(wp), JSON.stringify(v)) : sessionStorage.removeItem(coordKey(wp)) } catch { /* 忽略 */ }
 }
+// 切换 controller 连接时丢弃全部协调令牌：它们属于上一个 controller。
+export function forgetCoordinators() {
+  for (const wp of coordMem.keys()) setCoord(wp, null)
+  coordMem.clear()
+  pendingTake.clear()
+}
 // 取得请求的响应丢失（网络错误）时保留请求体，由用户显式“恢复”时原样重放：controller 按 request_id 返回同一令牌，
 // 而不是因租约已被（自己）占用而拒绝。新的取得/接管总是新请求，不会悄悄重放旧请求。收到 controller 的明确答复后丢弃。
 const pendingTake = new Map<string, J>()
@@ -45,7 +44,7 @@ async function sendTake(wp: string, body: J) {
   pendingTake.set(wp, body)
   let d: any
   try { d = await call('POST', '/packages/' + wp + '/coordinator', body, coordHeader(wp)) } catch (e) {
-    if (e instanceof ApiError) pendingTake.delete(wp)
+    if (e instanceof ApiError && e.status) pendingTake.delete(wp)
     throw e
   }
   pendingTake.delete(wp)
@@ -53,26 +52,26 @@ async function sendTake(wp: string, body: J) {
   return d
 }
 
-// 任何请求得到 401 都表示会话已失效（如超过会话有效期），由 App 切回登录页。
-let unauthorized = () => {}
-export function onUnauthorized(f: () => void) { unauthorized = f }
+// 401（会话过期、凭据被撤销）或连接已失效（切换了连接、应答不是来自配对的 controller）：由 App 回到登录或连接页。
+let unauthorized = (_reason: string) => {}
+export function onUnauthorized(f: (reason: string) => void) { unauthorized = f }
+export const lost = (reason: string) => unauthorized(reason)
 
 async function call(method: string, path: string, body?: unknown, extra: Record<string, string> = {}): Promise<any> {
-  const headers: Record<string, string> = { Accept: 'application/json', ...extra }
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
-  if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf
-  const r = await fetch(P + path, {
-    method, headers, credentials: 'same-origin',
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
+  let r
+  try { r = await request(method, path, body === undefined ? undefined : JSON.stringify(body), extra) } catch (e: any) {
+    // 原生桥的错误是 {code, message}；浏览器 fetch 失败是 TypeError。status 0 表示没有得到 controller 的答复。
+    const code = typeof e?.code === 'string' ? e.code : 'network'
+    if (code === 'stale_connection' || code === 'controller_mismatch') unauthorized(code)
+    throw new ApiError(0, code, typeof e?.message === 'string' ? e.message : '无法连接 controller')
+  }
   if (r.status === 204) return null
-  const text = await r.text()
   let data: any = null
-  try { data = text ? JSON.parse(text) : null } catch { data = { raw: text } }
-  if (!r.ok) {
-    if (r.status === 401) { setCsrf(null); unauthorized() }
+  try { data = r.body ? JSON.parse(r.body) : null } catch { data = { raw: r.body } }
+  if (r.status < 200 || r.status >= 300) {
+    if (r.status === 401) { setCsrf(null); unauthorized('unauthorized') }
     const e = data?.error ?? {}
-    throw new ApiError(r.status, e.code ?? 'http_' + r.status, e.message ?? text.slice(0, 200), e.details ?? {})
+    throw new ApiError(r.status, e.code ?? 'http_' + r.status, e.message ?? r.body.slice(0, 200), e.details ?? {})
   }
   return data
 }
@@ -85,14 +84,30 @@ export const api = {
   logout: async () => { try { await call('DELETE', '/session') } finally { setCsrf(null) } },
   // 刷新页面后凭 HttpOnly Cookie 取回 CSRF 令牌；401 表示需要重新登录。
   resume: async () => { const d = await call('GET', '/session'); setCsrf(d?.csrf_token ?? null); return d },
+  whoami: () => call('GET', '/client'),
   overview: () => call('GET', '/overview'),
   // 按创建时间倒序分页：before 为上一页最后一个 job_id。
   jobs: (status = '', before = '') => call('GET', '/jobs?limit=' + JOBS_PAGE + (status ? '&status=' + encodeURIComponent(status) : '') + (before ? '&before=' + encodeURIComponent(before) : '')),
   job: (id: string) => call('GET', '/jobs/' + id),
+  jobEvents: (id: string, before: number) => call('GET', '/jobs/' + id + '/events?limit=200&before=' + before),
   explain: (id: string) => call('GET', '/jobs/' + id + '/explain'),
   nodes: () => call('GET', '/nodes'),
   doctor: () => call('GET', '/doctor'),
   diff: (cp: string, against: string) => call('GET', '/checkpoints/' + cp + '/diff?against=' + encodeURIComponent(against)),
+  files: (cp: string) => call('GET', '/checkpoints/' + cp + '/files'),
+  blobText: async (sha: string) => (await request('GET', '/blobs/' + sha)).body,
+  // 模型设置：保存时带读到的 revision，别人先改过则得到 version_mismatch 与当前值。
+  models: () => call('GET', '/settings/models'),
+  // 只带要改的那一组；没给的那组 controller 保持原值。
+  saveModels: (revision: number, codex?: J, claude?: J) => call('PUT', '/settings/models', { expected_revision: revision, codex, claude }),
+  templates: () => call('GET', '/templates'),
+  baselines: () => call('GET', '/baselines'),
+  draft: (body: J) => call('POST', '/contracts/draft', body),
+  // 提交带上草拟时的设置版本：期间默认模型被改动则被拒绝，不会按没看过的解析结果受理。
+  submit: (title: string, contract: J, revision: number) => call('POST', '/jobs', { request_id: uuid(), title, contract, expected_settings_revision: revision }),
+  clients: () => call('GET', '/clients'),
+  revokeClient: (id: string, v: number) => call('POST', '/clients/' + id + '/revoke', { request_id: uuid(), expected_version: v }),
+  issueCode: (role: string) => call('POST', '/clients/codes', { request_id: uuid(), role, ttl_s: 600 }),
   // 变更：每次都带新的幂等键与当前记录版本，陈旧页面得到 version_mismatch。
   cancel: (id: string, v: number) => call('POST', '/jobs/' + id + '/cancel', { request_id: uuid(), expected_version: v }),
   retry: (id: string, wp: string, v: number, reason: string, exclude: string[]) =>
@@ -102,8 +117,8 @@ export const api = {
   assess: (id: string, wp: string, v: number, body: J) =>
     call('POST', '/jobs/' + id + '/assess', { request_id: uuid(), expected_version: v, assessment_id: uuid(), ...body }, coordHeader(wp)),
   coordinator: (wp: string) => call('GET', '/packages/' + wp + '/coordinator'),
-  takeCoordinator: (wp: string, takeover: boolean, reason: string) =>
-    sendTake(wp, { request_id: uuid(), holder_kind: 'interactive', holder_ref: 'web-console', ttl_s: 1800, takeover, reason }),
+  takeCoordinator: (wp: string, takeover: boolean, reason: string, holder: string) =>
+    sendTake(wp, { request_id: uuid(), holder_kind: 'interactive', holder_ref: holder, ttl_s: 1800, takeover, reason }),
   resumeTake: (wp: string) => { const body = pendingTake.get(wp); return body ? sendTake(wp, body) : Promise.reject(new Error('没有待恢复的请求')) },
   // 成功后才清除令牌：失败或响应丢失时保留，便于重试释放。
   releaseCoordinator: async (wp: string) => {
@@ -120,6 +135,3 @@ function coordHeader(wp: string): Record<string, string> {
   const t = coordHeld(wp)
   return t ? { 'X-Coordinator-Token': t.token } : {}
 }
-
-export const blobUrl = (sha: string) => P + '/blobs/' + sha
-export const streamUrl = (cursor: number | null) => P + '/events/stream' + (cursor != null ? '?cursor=' + cursor : '')

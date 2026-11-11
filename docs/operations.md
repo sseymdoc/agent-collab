@@ -18,6 +18,9 @@
 | UI | 浏览器打开 `<CONTROLLER>/`，输入管理令牌；会话为 HttpOnly Cookie，刷新可自动取回 CSRF |
 | CLI 管理调用 | `"$PREFIX/bin/agent-collab" api GET /overview --url <CONTROLLER> --token-file <DATA>/admin.token`（证书始终校验；非 loopback 必须 https）。Linux 受管安装中令牌文件仅 `agent-collab` 可读：在 controller 主机上以 `runuser -u agent-collab --` 执行，或改用已安全交给执行用户、仅其可读的令牌副本 |
 | doctor | `"$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role controller` |
+| 客户端配对码（桌面端、CLI、Agent） | 在 controller 主机上：`"$PREFIX/bin/agent-collab" controller client-code --data-dir <DATA> --role owner|operator|viewer`；一次性，缺省 10 分钟有效 |
+| 桌面端 | 打开桌面端，在“配对新的 controller”里填地址与配对码；凭据保存在系统凭据存储，可在“设置 → 客户端”里撤销 |
+| CLI 客户端 | `agent-collab client pair --url <CONTROLLER> --code <配对码>`，之后的 `submit`、`job`、`settings` 等命令使用这份凭据；用法见 `docs/integration.md` |
 
 ## 提交任务与平台约束
 

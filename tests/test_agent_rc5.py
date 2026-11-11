@@ -23,6 +23,8 @@ import test_agent_runtime as runtime
 ROOT = Path(__file__).resolve().parents[1]
 
 
+PARAMS = {'model': 'gpt-6-astra', 'effort': 'xhigh'}  # controller 受理时已解析进契约
+
 class ResolutionTests(unittest.TestCase):
     def setUp(self):
         (ROOT / '.dev/tmp').mkdir(parents=True, exist_ok=True)
@@ -155,10 +157,10 @@ class ResolutionTests(unittest.TestCase):
 
     def test_codex_windows_isolation_parameters_are_injectable(self):
         for mode in ('elevated', 'unelevated'):
-            argv = build_argv(['/fixture/codex'], self.temp, self.temp, system='Windows', windows_sandbox=mode)
+            argv = build_argv(['/fixture/codex'], self.temp, self.temp, PARAMS, system='Windows', windows_sandbox=mode)
             self.assertIn('--ignore-user-config', argv)
             self.assertIn('windows.sandbox="' + mode + '"', argv)
-        self.assertFalse(any('windows.sandbox' in x for x in build_argv('codex', self.temp, self.temp, system='Linux')))
+        self.assertFalse(any('windows.sandbox' in x for x in build_argv('codex', self.temp, self.temp, PARAMS, system='Linux')))
 
 
 class ClientAndAdapterTests(unittest.TestCase):
@@ -253,7 +255,7 @@ class RuntimeRC5Tests(unittest.TestCase):
         self.addCleanup(self.agent.close)
         self.assertEqual(self.agent.auth_health['codex'], 'ok')
         task = self.fake.add()
-        task['contract'].update(harness='codex', harness_params={})
+        task['contract'].update(harness='codex', harness_params=dict(PARAMS))
         self.run_to_completion(task)
         observed = json.loads((self.attempt(task).work / 'observed.json').read_text())
         self.assertEqual(observed['argv'][0], str(script))
@@ -404,7 +406,7 @@ class RuntimeRC5Tests(unittest.TestCase):
     def test_disabled_harness_assignment_is_rejected_before_any_process(self):
         self.agent.commands = resolve_commands({'disabled_harnesses': {'codex': 'known failure', 'claude': 'fixture'}})
         task = self.fake.add()
-        task['contract'].update(harness='codex', harness_params={})
+        task['contract'].update(harness='codex', harness_params=dict(PARAMS))
         complete = self.run_to_completion(task)
         self.assertEqual(complete['failure_class'], 'capability_missing')
         self.assertIsNone(self.attempt(task).adapter)

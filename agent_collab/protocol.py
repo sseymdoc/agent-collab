@@ -55,6 +55,15 @@ OS_NAMES = ('windows', 'linux', 'macos')
 
 NODE_EVENT_TYPES = ('attempt.started', 'attempt.progress', 'attempt.log', 'attempt.side_effect')
 
+# §12：客户端授权、模型策略与统一入口。
+FEATURES = ('clients', 'model_settings', 'node_models', 'contract_draft', 'baselines')
+SCOPES = ('read', 'tasks', 'settings', 'devices', 'maintain')
+ROLES = {'owner': SCOPES, 'operator': ('read', 'tasks'), 'viewer': ('read',)}
+CLIENT_KINDS = ('desktop', 'cli', 'agent')
+# 升级前的 Codex 适配器只接受这一组。只用于三处兼容推导：没有上报模型目录的旧节点、
+# 没有冻结策略的旧根工作包、已有部署的一次性设置迁移；新部署的默认值与许可范围来自设置。
+LEGACY_CODEX = {'model': 'gpt-6-astra', 'effort': 'xhigh', 'efforts': ('high', 'xhigh', 'max')}
+
 DEFAULTS = {
     'heartbeat_s': 5,
     'suspect_after_s': 30,
@@ -91,6 +100,22 @@ def check_node_id(value):
 def check_sha256(value, name='sha256'):
     if not isinstance(value, str) or not _HEX64.fullmatch(value):
         raise ValueError(name + ' 必须是 64 位小写十六进制')
+    return value
+
+
+_MODEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}')
+_EFFORT = re.compile(r'[a-z][a-z0-9_-]{0,31}')
+
+
+def check_model(value):
+    if not isinstance(value, str) or not _MODEL.fullmatch(value):
+        raise ValueError('model 必须以字母或数字开头，1–96 位，只含字母、数字和 . _ : / -')
+    return value
+
+
+def check_effort(value):
+    if not isinstance(value, str) or not _EFFORT.fullmatch(value):
+        raise ValueError('effort 必须以小写字母开头，1–32 位，只含小写字母、数字、下划线和连字符')
     return value
 
 

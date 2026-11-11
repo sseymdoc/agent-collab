@@ -130,7 +130,10 @@ class ClaudeTests(unittest.TestCase):
         self.assertFalse(schema['additionalProperties'])
         self.assertEqual(set(schema['required']), {'title', 'goal', 'acceptance', 'instructions', 'effort'})
         self.assertEqual(schema['properties']['acceptance']['minItems'], 1)
-        self.assertEqual(schema['properties']['effort']['enum'], ['high', 'xhigh', 'max'])
+        # effort 可为 null（沿用根冻结值）；许可范围由 controller 按冻结策略检查，schema 不带枚举。
+        self.assertEqual(schema['properties']['effort'], {'type': ['string', 'null']})
+        legacy = d.LEGACY_DECISION_SCHEMA['properties']['follow_up']['anyOf'][1]
+        self.assertEqual(legacy['properties']['effort'], {'type': 'string', 'enum': ['high', 'xhigh', 'max']})
         for field in schema['required']:
             value = repair_request()
             del value[field]
@@ -141,11 +144,24 @@ class ClaudeTests(unittest.TestCase):
 
     def test_legacy_contract_extra_fields_and_invalid_acceptance_or_effort_rejected(self):
         for follow in ({'title': 'legacy', 'contract': contract()}, repair_request(contract=contract()),
-                       repair_request(acceptance=[]), repair_request(acceptance=[1]), repair_request(effort='low')):
+                       repair_request(acceptance=[]), repair_request(acceptance=[1]), repair_request(effort='LOW!'), repair_request(effort=5)):
             with self.subTest(follow=follow):
                 context = self.run_adapter(json.dumps({'structured_output': decision({'checkpoint_id': uid()}, 'rework', follow)}))
                 self.assertEqual(context.result[:2], ('failed', 'code_failure'))
                 self.assertFalse((self.temp / 'decision.json').exists())
+
+    def test_null_or_other_effort_is_accepted_and_legacy_schema_keeps_its_enum(self):
+        for effort in (None, 'low', 'ultra'):
+            with self.subTest(effort=effort):
+                context = self.run_adapter(json.dumps({'structured_output': decision({'checkpoint_id': uid()}, 'rework', repair_request(effort=effort))}))
+                self.assertEqual(context.result[:1], ('succeeded',))
+                (self.temp / 'decision.json').unlink()
+        # 升级前的 controller 下发旧 schema：节点按旧规则校验，null 与范围外的值都被拒绝。
+        (self.temp / 'decision-schema.json').write_bytes(p.canonical_json(d.LEGACY_DECISION_SCHEMA))
+        for effort, ok in ((None, False), ('low', False), ('high', True)):
+            with self.subTest(legacy_effort=effort):
+                context = self.run_adapter(json.dumps({'structured_output': decision({'checkpoint_id': uid()}, 'rework', repair_request(effort=effort))}))
+                self.assertEqual(context.result[0], 'succeeded' if ok else 'failed')
 
     def test_valid_repair_output_written_without_contract_or_target_validation(self):
         for effort in ('high', 'xhigh', 'max'):
