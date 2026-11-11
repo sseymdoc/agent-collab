@@ -162,6 +162,25 @@ class CliTests(unittest.TestCase):
         artifacts.owner_only(path)
         self.assertEqual([n.casefold() for n in artifacts._principals(path)], [artifacts._current_user()[0].casefold()])
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
+    def test_atomic_credential_write_leaves_only_the_current_user_on_windows(self):
+        # 端到端：目录没有可继承 ACE 时，临时文件带着令牌默认 DACL 的显式 ACE（SYSTEM、Administrators 等）创建；
+        # 经 atomic_write 写入并改名后，最终文件的完整 DACL 只允许当前用户。
+        import subprocess
+        from agent_collab import artifacts
+        name, sid = artifacts._current_user()
+        folder = self.temp / 'no-inherit'
+        folder.mkdir()
+        subprocess.run([artifacts._system_tool('icacls.exe'), str(folder), '/inheritance:r', '/grant:r', '*%s:F' % sid], capture_output=True, check=True)
+        probe = folder / 'probe'
+        probe.write_bytes(b'')
+        self.assertTrue(any(n.casefold() != name.casefold() for n in artifacts._principals(probe)))  # 前提成立：新文件确实带着其他主体
+        path = folder / 'cred.json'
+        artifacts.atomic_write(path, b'{"token": "x"}', prepare=cli.owner_only)
+        self.assertEqual([n.casefold() for n in artifacts._principals(path)], [name.casefold()])
+        self.assertEqual(path.read_bytes(), b'{"token": "x"}')
+        self.assertEqual([x.name for x in folder.iterdir() if x.name.endswith('.tmp')], [])
+
     def test_wait_keeps_waiting_through_a_controller_restart(self):
         done = dict(cli.summarize(FakeConn({'/jobs/j1/events?limit=1000': {'events': []}}), dict(job('completed'), delivery_version=1)),
                     settled=True)
