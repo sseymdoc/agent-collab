@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from agent_collab import artifacts, protocol as p
-from agent_collab.adapters.commands import resolve_commands, probe_auth
+from agent_collab.adapters.commands import resolve_commands, probe_auth, probe_auth_detail
 from agent_collab.client import ConnectionFailure
 from agent_collab.adapters.codex import build_argv
 from agent_collab.node_agent import Agent, AgentLock, bounded_report, detect, doctor, save
@@ -102,12 +102,47 @@ class ResolutionTests(unittest.TestCase):
             ('claude', 0, '[]', '', 'unknown'),
             ('claude', 0, 'bad JSON', '', 'unknown')):
             runner = Mock(return_value=subprocess.CompletedProcess([], code, stdout, stderr))
-            self.assertEqual(probe_auth(name, command, runner), expected)
+            self.assertEqual(probe_auth(name, command, runner, 'Linux'), expected)
             self.assertEqual(runner.call_args[1]['timeout'], 20)
             self.assertEqual(runner.call_args[1]['env'], self.env)
             self.assertEqual(runner.call_args[0][0][:2], command['argv'])
         runner = Mock(side_effect=subprocess.TimeoutExpired('fixture', 20))
-        self.assertEqual(probe_auth('codex', command, runner), 'unknown')
+        self.assertEqual(probe_auth('codex', command, runner, 'Linux'), 'unknown')
+
+    def test_unreadable_credential_store_is_not_reported_as_expired(self):
+        # Mac 的 SSH 会话实测：claude auth status 报 loggedIn=false、authMethod=none，security show-keychain-info exit 36。
+        command = dict(argv=['/fixture'], env=self.env)
+        def runner(keychain_code, logged_in='false'):
+            def run(argv, **kwargs):
+                self.assertEqual((kwargs['timeout'], kwargs['env']), (20, self.env))
+                if argv[0] == '/usr/bin/security':
+                    if keychain_code is None:
+                        raise subprocess.TimeoutExpired(argv, 20)
+                    return subprocess.CompletedProcess(argv, keychain_code, '', 'User interaction is not allowed.')
+                return subprocess.CompletedProcess(argv, 1, '{"loggedIn":%s,"authMethod":"none"}' % logged_in, '')
+            return Mock(side_effect=run)
+        for system, keychain_code, expected in (
+                ('Darwin', 36, ('unknown', 'credential_store_unreadable')),    # 当前上下文读不到认证材料
+                ('Darwin', None, ('unknown', 'credential_store_unreadable')),  # 钥匙串检查无响应
+                ('Darwin', 0, ('expired', 'not_logged_in')),                   # 钥匙串可读而 CLI 明确未登录
+                ('Windows', 36, ('expired', 'not_logged_in')),                 # 凭据是文件的平台不做钥匙串判断
+                ('Linux', 36, ('expired', 'not_logged_in'))):
+            run = runner(keychain_code)
+            self.assertEqual(probe_auth_detail('claude', command, run, system), expected)
+            self.assertEqual(probe_auth('claude', command, run, system), expected[0])
+            self.assertEqual(any(call[0][0][0] == '/usr/bin/security' for call in run.call_args_list), system == 'Darwin')
+        # 钥匙串检查可能刚解锁了被锁定的钥匙串：以重探结果为准。
+        answers = iter(['false', 'true'])
+        def unlocked(argv, **kwargs):
+            if argv[0] == '/usr/bin/security':
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            return subprocess.CompletedProcess(argv, 0, '{"loggedIn":%s}' % next(answers), '')
+        self.assertEqual(probe_auth_detail('claude', command, Mock(side_effect=unlocked), 'Darwin'), ('ok', 'logged_in'))
+        # 已登录或 codex 时不碰钥匙串。
+        run = runner(36, 'true')
+        self.assertEqual(probe_auth_detail('claude', command, run, 'Darwin'), ('unknown', 'probe_inconclusive'))
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(probe_auth_detail('codex', dict(argv=None, env=self.env), run, 'Darwin'), ('unknown', 'command_missing'))
 
     def test_release_identity_reads_only_requested_code_root_and_falls_back(self):
         self.assertEqual(release_info(self.temp), {'version': VERSION, 'git_commit': None})
@@ -249,7 +284,12 @@ class RuntimeRC5Tests(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         self.assertEqual(self.fake.last_heartbeat['auth_health'], {'codex': 'ok', 'claude': 'ok'})
         status = json.loads((self.data / 'status.json').read_text())
-        self.assertEqual(set(status), {'version', 'git_commit', 'pid', 'version_dir', 'last_heartbeat_ok_at'})
+        self.assertEqual(set(status), {'version', 'git_commit', 'pid', 'version_dir', 'last_heartbeat_ok_at',
+                                       'auth_health', 'auth_checked_at'})
+        self.assertEqual(status['auth_health'], {'codex': 'ok', 'claude': 'ok'})
+        # 状态文件写于最后一次心跳，早于其后的那次探测。
+        self.assertLessEqual(status['auth_checked_at'], agent.auth_checked_at)
+        self.assertTrue(status['auth_checked_at'].endswith('Z'))
         self.assertEqual(status['version'], 'rc5-fixture')
         self.assertEqual(status['git_commit'], 'commit-fixture')
         self.assertEqual(status['pid'], os.getpid())

@@ -38,8 +38,11 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(argv, ['/custom/claude', '-p', '--model', PROFILE['model'], '--effort', PROFILE['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(d.DECISION_SCHEMA).decode(),
             '--permission-mode', 'dontAsk', '--tools', '', '--session-id', session,
-            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode'])
+            '--strict-mcp-config', '--setting-sources', '', '--safe-mode'])
         self.assertNotIn('--bare', argv)
+        # 自动记忆不受来源列表控制：适配器环境里显式关闭，且不被继承环境覆盖。
+        adapter = ClaudeAdapter(None, '/custom/claude', env={'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '0', 'KEEP': 'x'})
+        self.assertEqual(adapter.env, {'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1', 'KEEP': 'x'})
         for value in ({}, {'model': 'x'}, {'model': 'x', 'effort': ''}):
             with self.assertRaises(ValueError):
                 build_argv('claude', value, d.DECISION_SCHEMA, session)
@@ -62,7 +65,7 @@ class ClaudeTests(unittest.TestCase):
                 context.finish.assert_called_once()
                 settings.rmdir() if kind == 'directory' else settings.unlink()
 
-    def run_adapter(self, stdout, stderr='', code=0):
+    def run_adapter(self, stdout, stderr='', code=0, store_readable=lambda: True):
         case = self
         class Context:
             work = case.temp
@@ -94,7 +97,7 @@ class ClaudeTests(unittest.TestCase):
             def stop(self):
                 return True
         context = Context()
-        adapter = ClaudeAdapter(context, '/custom/claude', process_factory=FakeProcess)
+        adapter = ClaudeAdapter(context, '/custom/claude', process_factory=FakeProcess, store_readable=store_readable)
         adapter.tick()
         context.report = adapter.report()
         return context
@@ -170,6 +173,12 @@ class ClaudeTests(unittest.TestCase):
                 context = self.run_adapter(stdout, stderr, code)
                 self.assertEqual(context.result[:2], ('failed', 'auth_expired'))
                 self.assertFalse((self.temp / 'decision.json').exists())
+        # 本进程读不到凭据存储时不报 auth_expired，免得 controller 把共享账户的其他节点一并标成过期。
+        context = self.run_adapter('', 'Not logged in', 1, store_readable=lambda: False)
+        self.assertEqual(context.result[:2], ('failed', 'capability_missing'))
+        # 其他失败不检查凭据存储。
+        context = self.run_adapter('', 'boom', 1, store_readable=lambda: self.fail('store checked'))
+        self.assertNotEqual(context.result[1], 'capability_missing')
 
     def test_detect_uses_configured_executable_and_missing_stays_null(self):
         # 隔离 PATH/HOME：宿主上真实安装的 codex/claude 不能影响结果。

@@ -1,4 +1,4 @@
-# 本地发行包与安装运维（WP3）
+# 本地发行包与安装运维
 
 Python 3.9+、标准库、系统自带工具；安装器不下载 Python、依赖、模型工具或发行包，不提供发布 URL。
 使用可信的本地源码或已核对来源的本地发行包。manifest 校验能发现损坏/篡改文件，**不提供签名或发行者身份认证**。
@@ -95,8 +95,10 @@ Windows 使用当前交互用户 SID、InteractiveToken、LeastPrivilege、“�
 不索取账户密码。登出后没有交互令牌，不能保证任务继续运行。worker 优先用 `--python` 同目录的 pythonw.exe，
 不存在时沿用指定解释器（通常为 python.exe）。任务有两个触发器：登录触发器在登录时立即启动；
 时间触发器以过去时刻为起点、每 1 分钟无限重复（无 Duration，StopAtDurationEnd=false），拉起已退出的进程。
-MultipleInstancesPolicy=IgnoreNew 防止重叠，已有实例运行时重复触发被忽略。实测依据：进程被强制结束后
-RestartOnFailure（保留，间隔 1 分钟、最多 3 次）不会重启它；挂在登录触发器上的重复要到下一次登录才生效，
+MultipleInstancesPolicy=IgnoreNew 防止重叠，已有实例运行时重复触发被忽略。恢复依赖这个一分钟的触发周期，
+不是固定的恢复时限：一次实测中进程被强制结束后约 12 秒被拉起，实际间隔取决于退出时刻落在周期的哪个位置和任务计划程序的调度。
+采用时间触发器的依据是同一台机器上的实测：原任务定义里的 RestartOnFailure（保留，间隔 1 分钟、最多 3 次）
+没有覆盖进程被强制结束这种退出；挂在登录触发器上的重复要到下一次登录才生效，
 而安装和升级都是在会话中途重新注册任务。安装器停止任务前先禁用它，启动时重新启用，避免触发器在切换版本期间拉起进程。
 安装器在停止与启动之间被强行终止时，任务停留在禁用状态、不会自行恢复：按“Doctor、drain、升级、回退”一节核对安装状态后运行 `service start`。
 agent.lock 在 Windows 使用非阻塞字节锁、POSIX 使用 flock，第二个同数据目录进程立即失败。
@@ -219,7 +221,8 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 SSH 只用于安装、启动、诊断和恢复。任务的领取、续租、事件与工件上传都走 worker 自己的出站 HTTPS 连接：
 经 SSH 发出 `service start` 后可以断开，worker 由计划任务或 LaunchAgent 托管并继续运行。任务结果从 controller 查询，
 worker 是否在运行、心跳是否新鲜从 `service status` 查询。不要用 `Start-Job`、`nohup` 或 `ssh host claude ...` 代替受管服务：
-直接经 SSH 打开的模型会话没有检查点，也不会被接管。固定的 `service` 命令是运维约定，SSH 本身不限制命令。
+直接经 SSH 打开的模型会话没有检查点，也不会被接管。固定的 `service` 命令是运维约定，SSH 本身不限制命令：
+入口限制的是来源地址、账户和公钥，不是可执行的命令，不能当作命令白名单或最小权限入口。
 
 Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1` 在管理员 PowerShell 中运行，
 只接受公钥认证、一个账户和列出的来源地址：
@@ -282,7 +285,7 @@ PREFIX="$HOME/.local/share/agent-collab"
 Windows 对应入口为 `& "$Prefix\bin\agent-collab.ps1" doctor ...` / `install ...`，参数相同。
 controller-only 升级不需要远端管理员令牌；离线安装的上述 install/drain/rollback 命令继续加 `--no-service`。
 远端 worker 的 drain API 只接受管理员授权；**节点令牌没有 drain 权限**。本版没有委托式维护凭据接口，
-管理员令牌需由有权限的运维通过已有安全渠道在执行机器准备，或由主控扩展协议后再接入。安装器不会自行复制它。
+管理员令牌需由有权限的运维通过已有安全渠道在执行机器准备；委托式凭据要先扩展协议才能接入。安装器不会自行复制它。
 
 排空使用当前 node version + 新 request_id，等待 `active_attempts=0`，缺失字段不视为空闲。
 drain 不强杀活动 attempt；超时或网络错误在停服务之前中止。升级完成会恢复原 drain 值。
@@ -310,8 +313,8 @@ worker 的 status.json 必须来自新版本目录、匹配 version/git_commit�
 管理员令牌不必在 worker 磁盘落盘：POSIX 可用 `--admin-token-file /dev/stdin` 经加密通道传入。
 本地备份不是实例外备份，运维仍需安排实例外存储。
 
-当前 WP1 数据库没有 versioned migration：`PRAGMA user_version=0`。本版 release 声明支持 0，
-并对版本 0 比较 sqlite_master schema 指纹；未来 DDL 改动不能继续沿用 0。主控需让 controller 的迁移代码维护
+当前 controller 数据库没有 versioned migration：`PRAGMA user_version=0`。本版 release 声明支持 0，
+并对版本 0 比较 sqlite_master schema 指纹；未来 DDL 改动不能继续沿用 0，须由 controller 的迁移代码维护
 `user_version`，同时更新 `installer/release-schema.json` 的最低/最高支持版本；安装器不会伪造 schema 迁移。
 当前 schema 超出目标范围，或版本 0 指纹不同，回退拒绝执行；自动失败回退也遵守相同规则。
 

@@ -6,6 +6,7 @@ import uuid
 from .. import domain as d
 from .. import protocol as p
 from ..artifacts import atomic_write
+from .commands import credential_store_readable
 from .codex import OwnedProcess, classify_failure as classify_process_failure, tail
 
 
@@ -13,6 +14,10 @@ def classify_failure(text, returncode=None, abnormal=False):
     if any(phrase in text.lower() for phrase in ('not logged in', 'invalid api key', 'please run /login', 'oauth token')):
         return 'auth_expired'
     return classify_process_failure(text, returncode, abnormal)
+
+
+# 自动记忆不受 --setting-sources 控制（rc9 参数实测会带入工作目录对应项目的 MEMORY.md）；--safe-mode 已关闭它，这里再显式关一次。
+MANAGED_ENV = {'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
 
 
 def build_argv(command, params, schema, session_id):
@@ -24,15 +29,17 @@ def build_argv(command, params, schema, session_id):
     return command + ['-p', '--model', params['model'], '--effort', params['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(schema).decode(),
             '--permission-mode', 'dontAsk', '--tools', '', '--session-id', p.check_uuid(session_id),
-            # --setting-sources local 仍会读取工作目录及各级上级目录的 CLAUDE.local.md；--safe-mode 关闭全部记忆文件与定制。
-            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode']
+            # 受管回合不需要任何 user/project/local 设置：来源列表为空（local 仍会读取各级 CLAUDE.local.md 与本地设置文件）。
+            # --safe-mode 再关闭记忆文件、插件、hooks 等定制；订阅登录、模型选择与管理员下发的托管策略不受影响。
+            '--strict-mcp-config', '--setting-sources', '', '--safe-mode']
 
 
 class ClaudeAdapter:
-    def __init__(self, context, command='claude', process_factory=OwnedProcess, env=None):
+    def __init__(self, context, command='claude', process_factory=OwnedProcess, env=None, store_readable=None):
         self.context, self.command, self.process_factory = context, command, process_factory
         self.process = None
-        self.env = dict(os.environ if env is None else env)
+        self.env = dict(os.environ if env is None else env, **MANAGED_ENV)
+        self.store_readable = store_readable or (lambda: credential_store_readable(dict(env=self.env)))
         self.done = False
         self.session_id = str(uuid.uuid4())
         self.decision = None
@@ -98,8 +105,12 @@ class ClaudeAdapter:
             decision = d.validate_decision_schema(result.get('structured_output'))
         except (ValueError, TypeError, KeyError):
             self.notes = 'Claude failed or returned an invalid structured decision'
-            self.context.finish('failed', classify_failure(stderr + stdout, code, not stopped),
-                                self.notes)
+            failure = classify_failure(stderr + stdout, code, not stopped)
+            if failure == 'auth_expired' and not self.store_readable():
+                # 本进程读不到凭据存储（macOS 钥匙串需要图形登录会话）不说明账户过期；
+                # 报 auth_expired 会让 controller 把共享同一账户的节点都标成过期，这里只记为本节点能力缺失。
+                failure, self.notes = 'capability_missing', 'Claude credential store is unreadable in this worker process'
+            self.context.finish('failed', failure, self.notes)
         else:
             self.decision, self.notes = decision['decision'], decision['notes']
             atomic_write(self.context.work / 'decision.json', p.canonical_json(decision))

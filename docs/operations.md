@@ -19,6 +19,33 @@
 | CLI 管理调用 | `"$PREFIX/bin/agent-collab" api GET /overview --url <CONTROLLER> --token-file <DATA>/admin.token`（证书始终校验；非 loopback 必须 https）。Linux 受管安装中令牌文件仅 `agent-collab` 可读：在 controller 主机上以 `runuser -u agent-collab --` 执行，或改用已安全交给执行用户、仅其可读的令牌副本 |
 | doctor | `"$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role controller` |
 
+## 提交任务与平台约束
+
+任务经 controller 的 `POST /jobs` 提交，`agent-collab submit <任务.json>` 与 `agent-collab api POST /jobs --data <JSON|@文件>` 是同一个接口。
+提交方不需要是节点：任何能以管理令牌访问 controller 的机器都可以提交，由 controller 按契约的 `requirements` 选择节点。
+要把任务限定在某个平台或硬件上，写 `requirements`，不要绕过 controller 直接登录目标机器启动模型：
+
+```json
+{"title": "只在 Windows 节点执行",
+ "contract": {"goal": "…", "harness": "stub", "harness_params": {"steps": [{"run": ["{python}", "-c", "print('ok')"]}]},
+              "inputs_manifest": {"version": 1, "base": null, "files": [], "deleted": []},
+              "requirements": {"os": ["windows"], "arch": [], "tools": [], "gpu": null, "labels": []}}}
+```
+
+`recovery.auto` 缺省为 true，这时契约必须带 `inputs_manifest`（没有输入文件就写上面的空基线），且清单里的 blob 都已上传，
+否则任务停在 `waiting_capability`，不会派给任何节点（`status_reason` 中会有 `protection_not_ready`，或在没有注册节点时只有 `no_registered_nodes` 与 `missing_blobs:…`）。清单完整而缺 blob 时补传 blob 即可解除；`missing_blobs` 也包括 blob 已存在但长度与清单 `size` 不符的情况：上传会校验哈希并替换已有文件，存储中的 blob 损坏或被截断时重新上传正确内容即可；若是清单的 `size` 写错（同一哈希的内容长度是确定的），重传无法解除，要取消任务、修正清单后重新提交；提交时没带 `inputs_manifest` 则无法补救（契约受理后不可修改），要取消该任务、补上清单后重新提交。`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
+`waiting_capability`，不会派到不满足条件的节点；等待计入 `budgets.deadline_s`（缺省 3600 秒），从首次提交起算，到期后任务转为
+`failed`（`budget_exhausted:deadline_s`）。需要等更久时调大该预算，或在失败后重新提交：期限按工作包（`work_package_id`）的首次创建时间计算，沿用旧的 `work_package_id` 不会重新计时，预算已耗尽时还会直接拒绝，所以重新提交时省略 `work_package_id`（新建工作包）；`request_id` 也要用新的，CLI 未提供时会自动生成。管理令牌只在 controller 主机上时，从其他机器提交有两种做法：
+经云厂商的远程执行通道在 controller 主机上以服务用户运行同一条命令（令牌不离开该主机），
+或使用已安全交给执行用户、仅其可读的令牌副本直接访问 `<CONTROLLER>`：
+
+```sh
+# 在 controller 主机上（或经远程执行通道），任务内容以 base64 传入，不落盘
+runuser -u agent-collab -- "$PREFIX/bin/agent-collab" api POST /jobs --data "$(echo <任务.json 的 base64> | base64 -d)" \
+  --url http://127.0.0.1:18669 --token-file <DATA>/admin.token
+runuser -u agent-collab -- "$PREFIX/bin/agent-collab" api GET /jobs/<job_id> --url http://127.0.0.1:18669 --token-file <DATA>/admin.token
+```
+
 ## 节点配对
 
 在 controller 主机以服务用户生成一次性配对码（10 分钟有效），不要以 root 直接写数据库：
@@ -82,7 +109,7 @@ $Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).conf
 "$PREFIX/bin/agent-collab" api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file <DATA>/admin.token
 ```
 
-`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点从确认检查点继续。
+`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点继续：有 durable 检查点时从最新的那个开始，没有时从 inputs 基线开始。合格指该节点在线（心跳新鲜，即服务在运行；macOS、Windows 的服务只在用户登录后运行，Linux 启用 linger 后无人登录也可在线）、所需 harness 的认证未被确认过期（`unknown` 不排除）、能取得恢复所需的检查点与输入，并具备契约 `requirements` 要求的平台、工具和硬件；只有某个平台或某块硬件能做的任务，等待符合条件的节点，不会换到别的平台上执行。任务本身也要允许自动恢复：`recovery.auto=false`、`side_effects=manual`、存在状态未知的副作用或预算耗尽时，任务进入 `waiting_reconcile` 或 `failed`，不会自动接管；接管迟迟没有发生时查看任务的 `status` 与 `status_reason`。
 
 ## 停用、启动与退役节点
 
@@ -168,7 +195,7 @@ systemctl disable --now agent-collab-backup.timer
 systemctl stop agent-collab-backup.service
 ```
 
-`Persistent=true` 会补触发停机期间错过的日历任务，不补造每个历史时点的备份。若改变 `--backups-dir`，controller 的默认状态展示将读不到它；本工作包选择固定默认路径，未扩展 controller 配置 schema。保持安装布局即可自动展示。
+`Persistent=true` 会补触发停机期间错过的日历任务，不补造每个历史时点的备份。若改变 `--backups-dir`，controller 的默认状态展示将读不到它：controller 只读取固定的默认路径，配置 schema 中没有对应选项。保持安装布局即可自动展示。
 
 ECS 回退定时机制（保留所有备份、状态、锁文件和 controller 数据）：
 
@@ -190,7 +217,7 @@ systemctl reset-failed agent-collab-backup.service || true
 
 ### Mac 实例外拉取 LaunchAgent
 
-在拥有已验证 Workbench 配置的 Mac 登录用户下执行。`CODE_DIR` 必须是本机已安装、包含本模块的代码绝对路径；示例默认用独立安装的 `current`，不要指向临时工作包 clone。`STATE_DIR` 是实例外持久目录，放在**内置盘**的用户目录下，实例 ID 用现场值替换。模板不含令牌，也不会复制 Workbench 登录资料；需确保该登录用户无需交互即可执行 Workbench。
+在拥有已验证 Workbench 配置的 Mac 登录用户下执行。`CODE_DIR` 必须是本机已安装、包含本模块的代码绝对路径；示例默认用独立安装的 `current`，不要指向临时的源码 clone。`STATE_DIR` 是实例外持久目录，放在**内置盘**的用户目录下，实例 ID 用现场值替换。模板不含令牌，也不会复制 Workbench 登录资料；需确保该登录用户无需交互即可执行 Workbench。
 
 不要把 `STATE_DIR` 放在外置卷：macOS 的隐私控制（TCC）会拒绝 LaunchAgent 里的 `/usr/bin/python3` 访问可移除卷（`PermissionError: Operation not permitted`），
 而同一命令在 SSH 会话里手动执行可能成功，这不说明后台任务也能访问。确需外置卷时由用户在“隐私与安全性”里为实际运行的程序授权，
@@ -238,7 +265,7 @@ tail -n 50 "$STATE_DIR/logs/backup-pull.err.log"
   --remote-backups-dir /var/lib/agent-collab/backups --keep-offsite 28
 ```
 
-LaunchAgent 依赖用户登录和 Workbench 当前可用；`StartInterval=21600` 不是未登录启动保证，不声称补齐休眠/离线期间每轮任务。日志只追加，可在停用时按实际容量归档；本工作包未增加日志轮转服务。Workbench exec 以 root 运行，但 list/confirm 命令均经 `runuser -u agent-collab`；download 读取的路径固定为严格验证目录内 `<id>/backup.tar`。exec 超时为 300 秒，download 为 3600 秒，超时记录失败并释放本地锁；远端 exec 超时后可能仍在完成短命令，确认重试保持幂等。Windows 主控可复跑单元测试，Linux/Mac 模板不能用于 Windows 服务注册。
+LaunchAgent 依赖用户登录和 Workbench 当前可用；`StartInterval=21600` 不是未登录启动保证，不声称补齐休眠/离线期间每轮任务。日志只追加，可在停用时按实际容量归档；没有日志轮转服务。Workbench exec 以 root 运行，但 list/confirm 命令均经 `runuser -u agent-collab`；download 读取的路径固定为严格验证目录内 `<id>/backup.tar`。exec 超时为 300 秒，download 为 3600 秒，超时记录失败并释放本地锁；远端 exec 超时后可能仍在完成短命令，确认重试保持幂等。Windows 上可以运行这些单元测试，但 Linux/Mac 模板不能用于 Windows 服务注册。
 
 停用与回退（保留 Mac 副本、状态与日志；恢复旧模板不自动启用）：
 

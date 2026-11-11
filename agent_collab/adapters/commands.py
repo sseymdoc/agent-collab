@@ -68,20 +68,53 @@ def resolve_commands(config=None, env=None, system=None, home=None, mac_dirs=Non
     return result
 
 
-def probe_auth(name, command, runner=None):
-    if not command['argv']:
-        return 'unknown'
+def credential_store_readable(command, runner=None, system=None):
+    """macOS 上 Claude 的订阅登录存在登录钥匙串里，只有图形登录会话能读。
+    SSH 会话实测：`security show-keychain-info` exit 36（User interaction is not allowed），
+    同时 `claude auth status` 报 loggedIn=false、authMethod=none。其他平台的凭据是文件，不做此判断。"""
+    if (system or platform.system()) != 'Darwin':
+        return True
     try:
-        result = (runner or subprocess.run)(command['argv'] + (['login', 'status'] if name == 'codex' else ['auth', 'status']),
+        # ponytail: 图形会话里钥匙串被手动锁定时，这条命令会弹一次解锁框（最多等 20 秒）；
+        # 只在 CLI 已报未登录时才走到这里。真成了干扰再换 SecKeychainGetStatus。
+        result = (runner or subprocess.run)(['/usr/bin/security', 'show-keychain-info'], env=command['env'],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def probe_auth_detail(name, command, runner=None, system=None):
+    """返回 (ok|expired|unknown, 原因)。expired 只用于有明确依据的未登录或失效；
+    当前进程读不到凭据存储时是 unknown + credential_store_unreadable，不据此推断凭据过期。"""
+    if not command['argv']:
+        return 'unknown', 'command_missing'
+    def status():
+        return (runner or subprocess.run)(command['argv'] + (['login', 'status'] if name == 'codex' else ['auth', 'status']),
             env=command['env'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    try:
+        result = status()
         if name == 'claude':
             logged_in = json.loads(result.stdout).get('loggedIn')
             if logged_in is False:
-                return 'expired'
-            return 'ok' if result.returncode == 0 and logged_in is True else 'unknown'
+                if not credential_store_readable(command, runner, system):
+                    return 'unknown', 'credential_store_unreadable'
+                if (system or platform.system()) == 'Darwin':
+                    # show-keychain-info 可能刚解锁了被手动锁定的钥匙串，先前的 loggedIn=false 已过时：以重探结果为准。
+                    result = status()
+                    logged_in = json.loads(result.stdout).get('loggedIn')
+                if logged_in is False:
+                    return 'expired', 'not_logged_in'
+            return ('ok', 'logged_in') if result.returncode == 0 and logged_in is True else ('unknown', 'probe_inconclusive')
         text = (result.stdout + '\n' + result.stderr).lower()
         if any(word in text for word in ('not logged in', 'not signed in', 'login required', 'token expired', 'auth expired')):
-            return 'expired'
-        return 'ok' if result.returncode == 0 and ('logged in' in text or 'authenticated' in text) else 'unknown'
+            return 'expired', 'not_logged_in'
+        if result.returncode == 0 and ('logged in' in text or 'authenticated' in text):
+            return 'ok', 'logged_in'
+        return 'unknown', 'probe_inconclusive'
     except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
-        return 'unknown'
+        return 'unknown', 'probe_failed'
+
+
+def probe_auth(name, command, runner=None, system=None):
+    return probe_auth_detail(name, command, runner, system)[0]
