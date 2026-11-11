@@ -28,11 +28,14 @@
 ```json
 {"title": "只在 Windows 节点执行",
  "contract": {"goal": "…", "harness": "stub", "harness_params": {"steps": [{"run": ["{python}", "-c", "print('ok')"]}]},
+              "inputs_manifest": {"version": 1, "base": null, "files": [], "deleted": []},
               "requirements": {"os": ["windows"], "arch": [], "tools": [], "gpu": null, "labels": []}}}
 ```
 
-`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
-`waiting_capability`，不会派到不满足条件的节点。管理令牌只在 controller 主机上时，从其他机器提交有两种做法：
+`recovery.auto` 缺省为 true，这时契约必须带 `inputs_manifest`（没有输入文件就写上面的空基线），且清单里的 blob 都已上传，
+否则任务停在 `waiting_capability`（原因含 `protection_not_ready`），不会派给任何节点。`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
+`waiting_capability`，不会派到不满足条件的节点；等待计入 `budgets.deadline_s`（缺省 3600 秒），从首次提交起算，到期后任务转为
+`failed`（`budget_exhausted:deadline_s`）。需要等更久时调大该预算，或在失败后重新提交。管理令牌只在 controller 主机上时，从其他机器提交有两种做法：
 经云厂商的远程执行通道在 controller 主机上以服务用户运行同一条命令（令牌不离开该主机），
 或使用已安全交给执行用户、仅其可读的令牌副本直接访问 `<CONTROLLER>`：
 
