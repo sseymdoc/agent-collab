@@ -149,6 +149,19 @@ class CliTests(unittest.TestCase):
         self.assertNotIn('(I)', listing)  # 继承来的 ACE 已去掉，只剩当前用户
         self.assertEqual(path.read_bytes(), b'{}')
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
+    def test_explicit_access_for_other_principals_is_removed_on_windows(self):
+        # 父目录没有可继承 ACE 时，新文件会带上显式 ACE；/inheritance:r 去不掉它们，要逐个移除再核对。
+        import subprocess
+        from agent_collab import artifacts
+        path = self.temp / 'explicit.txt'
+        path.write_bytes(b'')
+        for grant in (['/grant', '*S-1-5-32-545:R'], ['/deny', '*S-1-1-0:W']):  # Users 显式授权、Everyone 显式拒绝
+            subprocess.run([artifacts._system_tool('icacls.exe'), str(path)] + grant, capture_output=True, check=True)
+        self.assertGreater(len(artifacts._principals(path)), 1)
+        artifacts.owner_only(path)
+        self.assertEqual([n.casefold() for n in artifacts._principals(path)], [artifacts._current_user()[0].casefold()])
+
     def test_wait_keeps_waiting_through_a_controller_restart(self):
         done = dict(cli.summarize(FakeConn({'/jobs/j1/events?limit=1000': {'events': []}}), dict(job('completed'), delivery_version=1)),
                     settled=True)
@@ -168,7 +181,10 @@ class CliTests(unittest.TestCase):
 
             def log_message(self, *args):
                 pass
-        server = HTTPServer(('127.0.0.1', 0), Handler)
+        try:
+            server = HTTPServer(('127.0.0.1', 0), Handler)
+        except OSError as exc:
+            self.skipTest('loopback socket 不可用：%s' % exc)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)

@@ -124,17 +124,10 @@ def client_home():
 
 def owner_only(path):
     """Windows 不认 0o600：去掉继承的 ACL，只给当前用户完全控制，再写入凭据。失败就不写。"""
-    if os.name != 'nt':
-        return
-    import csv
-    import subprocess
+    from .artifacts import owner_only as restrict
     try:
-        whoami = subprocess.run(['whoami', '/user', '/fo', 'csv', '/nh'], capture_output=True, text=True, errors='replace', check=True)
-        sid = next(csv.reader(whoami.stdout.splitlines()))[1]
-        if not re.fullmatch(r'S-1-(?:[0-9]+-)+[0-9]+', sid):
-            raise ValueError(sid)
-        subprocess.run(['icacls', str(path), '/inheritance:r', '/grant:r', '*%s:F' % sid], capture_output=True, check=True)
-    except (OSError, ValueError, IndexError, StopIteration, subprocess.CalledProcessError):
+        restrict(path)
+    except OSError:
         raise SystemExit('无法把凭据文件限制为仅当前用户可访问，凭据没有保存；配对码已用掉，请重新签发后再配对')
 
 

@@ -61,7 +61,7 @@ class CliE2E(unittest.TestCase):
         # 设置：CLI 写入，另一客户端读到同一份；另一客户端再改，CLI 读到新版本。
         settings = self.cli('settings', 'set', '--codex-model', 'model-a', '--codex-effort', 'high', '--allow-any')
         self.assertEqual(self.raw('GET', '/settings/models', token=desk)[1]['settings'], settings)
-        status, changed = self.raw('PUT', '/settings/models', {'expected_revision': settings['revision'],
+        status, changed = self.raw('PUT', '/settings/models', {'request_id': str(uuid.uuid4()), 'expected_revision': settings['revision'],
                                                                'claude': {'default': {'model': 'c-model', 'effort': 'max'}}}, token=desk)
         self.assertEqual(status, 200)
         self.assertEqual(self.cli('settings', 'get')['settings'], changed)

@@ -18,7 +18,7 @@ import threading
 import uuid
 
 from . import protocol as p
-from .artifacts import DEFAULT_EXCLUDES, EMPTY, atomic_write, checked_manifest, integrate, materialize, snapshot
+from .artifacts import DEFAULT_EXCLUDES, EMPTY, atomic_write, checked_manifest, integrate, materialize, owner_only, snapshot
 from .client import APIError, Client, ConnectionFailure, validate_url
 from .adapters.codex import CodexAdapter, model_catalog, process_stamp, process_status
 from .adapters.claude import ClaudeAdapter
@@ -980,7 +980,7 @@ def pair(args, transport=None):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Protocol §2 explicitly requires this client-side bearer file. Controller
     # stores hashes; agent.json stores only a hash and never the credential.
-    atomic_write(directory / 'node.token', result['node_token'].encode())
+    atomic_write(directory / 'node.token', result['node_token'].encode(), prepare=owner_only)
     config = dict(controller=validate_url(args.controller), node_id=args.node_id,
                   controller_id=result['controller_id'], authority_generation=result['authority_generation'],
                   node_token_sha256=p.sha256_bytes(result['node_token'].encode()),

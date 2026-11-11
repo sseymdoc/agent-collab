@@ -43,9 +43,13 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
             <button className="link" disabled={busy} onClick={() => {
               if (!window.confirm(c.revoked_at ? 'controller 已撤销这条连接，忘记只删除本机保存的凭据。确定？' : '忘记这条连接会删除本机保存的凭据，并在 controller 上撤销它。确定？')) return
               void run(async () => {
-                const r = await invoke('connection_forget', { id: c.id, revoke: true })
-                if (!r.revoked) setErr('本机的连接与凭据已删除，但没能确认 controller 已撤销这个客户端（controller 不可达、拒绝了请求、应答身份不符或本机读不到凭据）。请在另一客户端的“设置 → 客户端”里确认并撤销它。')
-                await reload()
+                // 删除本机凭据失败时外壳会抛错，但记录可能已变为“已撤销，待清理”：无论成败都刷新列表。
+                try {
+                  const r = await invoke('connection_forget', { id: c.id, revoke: true })
+                  if (!r.revoked) setErr('本机的连接与凭据已删除，但没能确认 controller 已撤销这个客户端（controller 不可达、拒绝了请求、应答身份不符或本机读不到凭据）。请在另一客户端的“设置 → 客户端”里确认并撤销它。')
+                } finally {
+                  await reload()
+                }
               })
             }}>忘记</button>
           </td>

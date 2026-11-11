@@ -49,6 +49,7 @@ class ClientCase(Rounds, ControllerCase):
         return self.call('POST', '/clients/pair', {'code': code, 'name': name, 'kind': kind}, headers={})
 
     def put(self, token=None, status=200, **body):
+        body.setdefault('request_id', uid())
         return self.call('PUT', '/settings/models', body, token=token, status=status)
 
     def models(self):
@@ -130,7 +131,7 @@ class ClientAuthTests(ClientCase):
             ('PUT', '/blobs/' + p.sha256_bytes(b'x'), b'x', 'tasks'),
             ('POST', '/packages/' + wp + '/coordinator', lease, 'tasks'),
             ('DELETE', '/packages/' + wp + '/coordinator', None, 'tasks'),
-            ('PUT', '/settings/models', {'expected_revision': 0}, 'settings'),
+            ('PUT', '/settings/models', {'request_id': uid(), 'expected_revision': 0}, 'settings'),
             ('POST', '/nodes/worker/drain', {'request_id': uid(), 'expected_version': 1, 'drain': True}, 'devices'),
             ('POST', '/dispatch', {'request_id': uid(), 'expected_version': 1, 'paused': True}, 'maintain'),
             ('GET', '/doctor', None, 'maintain'),
@@ -191,7 +192,7 @@ class ClientAuthTests(ClientCase):
         self.call('POST', '/nodes/register', worker.record, token=client, status=403)
         for path in ('/jobs', '/client', '/settings/models', '/clients'):
             self.call('GET', path, token=worker.token, status=403)
-        self.call('PUT', '/settings/models', {'expected_revision': 0}, token=worker.token, status=403)
+        self.call('PUT', '/settings/models', {'request_id': uid(), 'expected_revision': 0}, token=worker.token, status=403)
 
     def test_request_origin_is_recorded_once_and_stale_versions_do_not_overwrite(self):
         client = self.pair('owner', 'laptop')
@@ -307,6 +308,13 @@ class ModelSettingsTests(ClientCase):
         self.assertEqual([(h['revision'], h['actor']['name'], h['before']['codex'], h['after']['codex']) for h in view['history']],
                          [(1, 'one', d.EMPTY_SETTINGS['codex'], codex), (2, 'two', codex, codex)])
         self.assertEqual(len([e for e in self.call('GET', '/events')['events'] if e['type'] == 'settings.updated']), 2)
+        # 应答丢失后原样重放：返回第一次的结果，不当作版本冲突，也不再递增 revision；同一 request_id 换了内容则拒绝。
+        ident = uid()
+        third = self.put(one, request_id=ident, expected_revision=2, claude=EMPTY_CLAUDE)
+        self.assertEqual(self.put(one, request_id=ident, expected_revision=2, claude=EMPTY_CLAUDE), third)
+        self.assertEqual(self.models()['settings']['revision'], 3)
+        self.assertEqual(self.put(one, status=409, request_id=ident, expected_revision=3, claude=EMPTY_CLAUDE)['error']['code'], 'conflict')
+        self.call('PUT', '/settings/models', {'expected_revision': 3}, status=400)  # request_id 必填
 
     def test_existing_deployment_keeps_its_previous_fixed_combination_once(self):
         self.job()
@@ -447,7 +455,7 @@ class LegacyRootTests(Rounds, ControllerCase):
             root = self.app.store.get('root', job['work_package_id'])
             del root['model_policy']
             self.app.store.put('root', job['work_package_id'], root)
-        self.call('PUT', '/settings/models', {'expected_revision': 0, 'codex': {'default': {'model': B, 'effort': 'low'}, 'allowed': None}})
+        self.call('PUT', '/settings/models', {'request_id': uid(), 'expected_revision': 0, 'codex': {'default': {'model': B, 'effort': 'low'}, 'allowed': None}})
         self.finish_decision(mac, attempt, tc.decision(checkpoint, 'rework', tc.repair_request(effort=effort)))
         return self.current(job), [j for j in self.call('GET', '/jobs')['jobs']
                                    if j['work_package_id'] == job['work_package_id'] and j['job_id'] != job['job_id']]

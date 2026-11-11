@@ -27,7 +27,7 @@
 | `connection_close` | `{"epoch"}` | `{}` | 关闭这一代次的连接与事件流（包括尚在核对中的打开），不删除连接；代次不是当前值时返回 `stale_connection`，不影响当前连接 |
 | `connection_forget` | `{"id", "revoke"}` | `{"revoked"}` | `revoke` 为 true 时先调用 `DELETE /client`（失败不阻止本地删除，返回值如实给出）；先删除连接记录再删除凭据，凭据删除失败时恢复连接记录并返回 `secure_storage_unavailable`，若这次已确认撤销则恢复的记录带 `revoked_at`；对带 `revoked_at` 的连接再次忘记时不再撤销，`revoked` 返回 true |
 | `api_request` | `{"epoch", "method", "path", "body"?, "headers"?}` | `{"status", "body"}` | 请求 `<url>/api/v1<path>`；`path` 以 `/` 开头且不含 `..`；`headers` 只转发 `X-Coordinator-Token`；`body` 为 JSON 文本；响应体上限 16 MiB |
-| `stream_open` | `{"epoch", "cursor"}` | `{}` | 打开 `/events/stream?cursor=<cursor>`，经事件 `ac-sse` 转发；单帧保留的 `id`、`event`、`data` 与未成行的缓冲合计上限 16 MiB（重复出现的 `id`、`event` 只保留最后一个值，被覆盖的不占内存），超出时以 `closed`（`frame_too_large`）结束 |
+| `stream_open` | `{"epoch", "cursor"}` | `{}` | 打开 `/events/stream?cursor=<cursor>`，经事件 `ac-sse` 转发；单帧保留的 `id`、`event`、`data` 与未成行的缓冲合计上限 16 MiB（重复出现的 `id`、`event` 只保留最后一个值，被覆盖的不占内存；每收到一块网络数据后检查一次，所以内存峰值可能比上限多出一块数据），超出时以 `closed`（`frame_too_large`）结束 |
 | `stream_close` | `{"epoch"}` | `{}` | 关闭事件流 |
 | `blob_save` | `{"epoch", "sha256", "name"}` | `{"path", "bytes"}` 或 `{"cancelled": true}` | 弹出系统“另存为”对话框；下载到同目录临时文件，SHA-256 相符后改名到所选路径，不符则删除并报错 |
 

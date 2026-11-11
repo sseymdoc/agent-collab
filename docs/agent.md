@@ -50,7 +50,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 
 ## agent.json 与目录
 
-配对写入 `agent.json` 与 `node.token`，POSIX 均为 0600，已配对目录拒绝覆盖。
+配对写入 `agent.json` 与 `node.token`，POSIX 均为 0600；Windows 上 `node.token` 写入前先去掉继承的 ACL、只授予当前用户，做不到时配对失败、不留下凭据。已配对目录拒绝覆盖。
 配置字段：
 
 | 字段 | 用途 |

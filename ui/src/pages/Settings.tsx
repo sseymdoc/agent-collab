@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react'
-import { api, ApiError } from '../api'
+import { useEffect, useRef, useState } from 'react'
+import { api, ApiError, uuid } from '../api'
 import { can, session } from '../session'
 import { isDesktop } from '../transport'
 import { Action, Badge, EFFORT_RE, Json, MODEL_RE, ORIGIN, Section, applyTheme, errText, show, short, useData, when } from '../ui'
 
 const SCOPE: Record<string, string> = { read: '读取', tasks: '任务', settings: '设置', devices: '设备', maintain: '维护' }
 const ROLE: Record<string, string> = { owner: '拥有者（全部权限）', operator: '操作者（读取 + 任务）', viewer: '只读' }
+// 与 controller 的 protocol.ROLES 一致：角色只是常用 scope 组合的预设。
+const ROLE_SCOPES: Record<string, string[]> = { owner: Object.keys(SCOPE), operator: ['read', 'tasks'], viewer: ['read'] }
 const actor = (a: any) => a ? (a.name ?? ORIGIN[a.kind] ?? a.kind) : '未知'
 // 比较设置时不计键与 effort 列表的顺序：勾掉再勾回同一项算没改。
 const canon = (v: any): any => Array.isArray(v) ? v.map(canon).sort() : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canon(v[k])])) : v
@@ -40,6 +42,7 @@ function Models({ tick }: { tick: number }) {
   // 这样不会把别的客户端刚改的另一组盖回去。null 表示没有未保存的修改。
   const [form, setForm] = useState<{ codex?: any; claude?: any } | null>(null)
   const [base, setBase] = useState<number | null>(null)   // 编辑副本所基于的 revision
+  const pending = useRef<{ form: any; revision: number; id: string } | null>(null)
   const [msg, setMsg] = useState<[string, string] | null>(null)
   const [conflict, setConflict] = useState<any>(null)
   const settings = view.data?.settings
@@ -80,9 +83,12 @@ function Models({ tick }: { tick: number }) {
     .filter(([v, re]) => v != null && !(re as RegExp).test(v)).map(([, , name]) => name)
   const save = async () => {
     setMsg(null); setConflict(null)
-    const sent = form
+    const sent = form, revision = base ?? settings.revision
+    // 应答丢失后再点“保存”：内容与基准版本都没变就复用 request_id，controller 原样返回第一次的结果。
+    if (!pending.current || pending.current.form !== sent || pending.current.revision !== revision) pending.current = { form: sent, revision, id: uuid() }
     try {
-      const saved = await api.saveModels(base ?? settings.revision, sent?.codex, sent?.claude)
+      const saved = await api.saveModels(revision, sent?.codex, sent?.claude, pending.current.id)
+      pending.current = null
       // 保存期间又改了的话保留这些修改，基于刚保存出的版本继续编辑。
       setForm(f => f === sent ? null : f); setBase(saved?.revision ?? null); setMsg(['已保存', 'ok']); void view.reload()
     } catch (e) {
@@ -147,9 +153,13 @@ function Models({ tick }: { tick: number }) {
 
 function Clients({ tick }: { tick: number }) {
   const list = useData(() => api.clients(), [tick])
-  const [role, setRole] = useState('owner')
   const [issued, setIssued] = useState<any>(null)
   const me = session()?.identity.client_id
+  // 只能签发不超过本连接权限的配对码（controller 会再检查一次）：只列出本连接持有的 scope。
+  const held: string[] = session()?.identity.scopes ?? []
+  const roles = Object.keys(ROLE).filter(r => ROLE_SCOPES[r].every(s => held.includes(s)))
+  const [scopes, setScopes] = useState<string[]>(() => held.filter(s => ROLE_SCOPES[roles[0] ?? 'viewer'].includes(s)))
+  const preset = roles.find(r => ROLE_SCOPES[r].length === scopes.length && ROLE_SCOPES[r].every(s => scopes.includes(s))) ?? ''
   return <Section title="客户端" extra={<span className="muted">桌面端、命令行与自动化各用自己的凭据；撤销一个不影响其他客户端和设备</span>}>
     {list.error && <p className="err">{list.error}</p>}
     <table><thead><tr><th>名称</th><th>类型</th><th>权限</th><th>配对时间</th><th>状态</th><th></th></tr></thead>
@@ -160,8 +170,11 @@ function Clients({ tick }: { tick: number }) {
         <td>{!c.revoked_at && <Action label="撤销" danger confirm={c.client_id === me ? '撤销本连接后，这个窗口会立刻断开，需要重新配对才能再连接。确定？' : '撤销后该客户端立刻无法访问，已打开的事件流会被关闭。确定？'}
           run={() => api.revokeClient(c.client_id, c.version).then(list.reload)} />}</td></tr>)}</tbody></table>
     <div className="actions">
-      <select aria-label="新客户端的权限" value={role} onChange={e => setRole(e.target.value)}>{Object.entries(ROLE).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select>
-      <Action label="生成配对码" run={() => api.issueCode(role).then(setIssued)} />
+      <select aria-label="新客户端的权限预设" value={preset} onChange={e => e.target.value && setScopes(ROLE_SCOPES[e.target.value])}>
+        <option value="">自定义</option>{roles.map(k => <option key={k} value={k}>{ROLE[k]}</option>)}</select>
+      {held.map(s => <label key={s} className="row inline"><input type="checkbox" checked={scopes.includes(s)}
+        onChange={e => setScopes(v => e.target.checked ? held.filter(x => x === s || v.includes(x)) : v.filter(x => x !== s))} /> {SCOPE[s] ?? s}</label>)}
+      <Action label="生成配对码" disabled={!scopes.length} run={() => api.issueCode(scopes).then(setIssued)} />
     </div>
     {issued && <p className="notice">配对码（只显示这一次，{when(issued.expires_at)}过期，只能用一次）：<code className="code">{issued.code}</code>
       <br /><small className="muted">权限：{issued.scopes.map((s: string) => SCOPE[s] ?? s).join('、')}。在另一台设备的桌面端“配对新的 controller”里输入，或用于 <code>agent-collab client pair</code>。</small>

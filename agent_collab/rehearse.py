@@ -14,7 +14,6 @@ import sqlite3
 import sys
 
 from . import domain as d, protocol as p
-from .blobstore import BlobStore
 from .controller import App, database_references, file_hash, restore
 from .preflight import _validate_output
 
@@ -48,8 +47,10 @@ def _inputs(backup_dir):
     try:
         manifest = json.loads(paths[0].read_text(encoding='utf-8'))
         paths.append(backup / manifest.get('database', 'controller.db'))
-        blobs = BlobStore(backup)
-        paths += [blobs.path(entry['sha256']) for entry in manifest.get('blobs', [])]
+        # 直接算路径，不构造 BlobStore：它会创建 blobs/ 目录，而枚举输入不能改动备份集。
+        for entry in manifest.get('blobs', []):
+            digest = p.check_sha256(entry['sha256'])
+            paths.append(backup / 'blobs' / digest[:2] / digest[2:4] / digest)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass  # 清单读不出来时预演本身会失败；这里只保护能确定的文件
     return [str(path.resolve()) for path in paths if path.exists()]

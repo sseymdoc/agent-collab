@@ -20,6 +20,15 @@ def digest(root):
 
 
 class RehearseTests(ControllerCase):
+    def test_listing_inputs_does_not_create_a_blob_directory(self):
+        # 没有 blob 的备份集可以不带 blobs/；枚举预演输入（在输出路径校验之前）不能改动备份集。
+        backup_dir = self.temp / 'bare-backup'
+        backup_dir.mkdir()
+        (backup_dir / 'backup-manifest.json').write_text(json.dumps({'database': 'controller.db', 'blobs': []}), encoding='utf-8')
+        (backup_dir / 'controller.db').write_bytes(b'')
+        rehearse._inputs(backup_dir)
+        self.assertEqual(sorted(x.name for x in backup_dir.iterdir()), ['backup-manifest.json', 'controller.db'])
+
     def old_deployment(self):
         """升级前的数据库：有节点、已结束与执行中的任务，没有模型设置记录，根工作包没有冻结策略。"""
         worker = self.node('worker')

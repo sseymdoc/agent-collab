@@ -28,7 +28,7 @@ from . import domain as d
 from .release import release_info
 from . import protocol as p
 from .blobstore import BlobStore
-from .artifacts import DEFAULT_EXCLUDES, workspace_excluded
+from .artifacts import DEFAULT_EXCLUDES, owner_only, workspace_excluded
 from .store import Store
 
 
@@ -144,6 +144,13 @@ class App:
         except FileExistsError:
             pass
         else:
+            try:
+                owner_only(token_file)  # Windows 不认 0o600：写入令牌前先去掉继承的 ACL
+            except OSError:
+                os.close(fd)
+                token_file.unlink()
+                self.store.close()  # 构造失败：不留下打开的数据库
+                raise
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(secrets.token_urlsafe(32) + '\n')
                 f.flush()
@@ -1404,7 +1411,8 @@ class App:
             if method == 'GET':
                 return self._model_settings_view()
             if method == 'PUT':
-                return self._put_model_settings(data, identity)
+                # 应答丢失后原样重放返回第一次的结果，而不是 version_mismatch（protocol §5、§12.3）。
+                return self.idempotent(route, data, lambda: self._put_model_settings(data, identity))
         if route == '/templates' and method == 'GET':
             return response({'templates': list(d.TEMPLATES)})
         if route == '/contracts/draft' and method == 'POST':

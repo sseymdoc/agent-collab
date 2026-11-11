@@ -121,7 +121,8 @@ export const api = {
   // 模型设置：保存时带读到的 revision，别人先改过则得到 version_mismatch 与当前值。
   models: () => call('GET', '/settings/models'),
   // 只带要改的那一组；没给的那组 controller 保持原值。
-  saveModels: (revision: number, codex?: J, claude?: J) => call('PUT', '/settings/models', { expected_revision: revision, codex, claude }),
+  saveModels: (revision: number, codex: J | undefined, claude: J | undefined, requestId: string) =>
+    call('PUT', '/settings/models', { request_id: requestId, expected_revision: revision, codex, claude }),
   templates: () => call('GET', '/templates'),
   baselines: () => call('GET', '/baselines'),
   draft: (body: J) => call('POST', '/contracts/draft', body),
@@ -129,7 +130,7 @@ export const api = {
   submit: (title: string, contract: J, revision: number) => call('POST', '/jobs', { request_id: uuid(), title, contract, expected_settings_revision: revision }),
   clients: () => call('GET', '/clients'),
   revokeClient: (id: string, v: number) => call('POST', '/clients/' + id + '/revoke', { request_id: uuid(), expected_version: v }),
-  issueCode: (role: string) => call('POST', '/clients/codes', { request_id: uuid(), role, ttl_s: 600 }),
+  issueCode: (scopes: string[]) => call('POST', '/clients/codes', { request_id: uuid(), scopes, ttl_s: 600 }),
   // 变更：每次都带新的幂等键与当前记录版本，陈旧页面得到 version_mismatch。
   cancel: (id: string, v: number) => call('POST', '/jobs/' + id + '/cancel', { request_id: uuid(), expected_version: v }),
   retry: (id: string, wp: string, v: number, reason: string, exclude: string[]) =>

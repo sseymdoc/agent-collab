@@ -407,7 +407,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - `catalog.nodes.<node_id>.<harness>` = `{"status": "ok|unknown|legacy", "source", "fetched_at", "cli_version", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}`，见 12.5。
   - `selectable.codex` = `[{"model", "efforts": [...], "nodes": [node_id...]}]`：部署策略与各节点目录（status 为 ok 或 legacy）的交集；`selectable.unknown_nodes` 列出目录未知的节点。目录条目来自节点上的 CLI，不表示该账号已成功调用过这个模型。
   - `history`：最近 20 次修改 `{"revision", "at", "actor", "before", "after"}`。
-- `PUT /settings/models`（settings）`{"expected_revision", "codex"?, "claude"?}` → 更新后的 settings；`expected_revision` 与当前不同返回 409 `version_mismatch`，`details.current` 为当前 settings。写 `settings.updated` 事件。
+- `PUT /settings/models`（settings）`{"request_id", "expected_revision", "codex"?, "claude"?}` → 更新后的 settings；`request_id` 必填，相同内容重放返回第一次的应答（不再递增 revision），同一 `request_id` 换了内容返回 409 `conflict`；`expected_revision` 与当前不同返回 409 `version_mismatch`，`details.current` 为当前 settings。写 `settings.updated` 事件。
 
 **12.4 受理时解析与冻结**
 

@@ -1,6 +1,10 @@
 """Use the owning controller in process; no sockets or duplicated controller logic."""
 import argparse
 import json
+import os
+import subprocess
+import unittest
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from agent_collab.node_agent import Agent, pair
@@ -54,6 +58,20 @@ class RestartControllerTests(ControllerCase):
             if condition():
                 return
         self.fail('controller/agent condition not reached')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
+    def test_node_and_admin_tokens_have_no_inherited_access_on_windows(self):
+        for path in (self.agent_dir / 'node.token', self.temp / 'data' / 'admin.token'):
+            listing = subprocess.run(['icacls', str(path)], capture_output=True, text=True, errors='replace').stdout
+            self.assertNotIn('(I)', listing, path)  # 继承来的 ACE 已去掉，只剩当前用户
+
+    def test_admin_token_is_not_left_behind_when_it_cannot_be_restricted(self):
+        from agent_collab.controller import App
+        data = self.temp / 'restricted'
+        with patch('agent_collab.controller.owner_only', side_effect=OSError('icacls failed')):
+            with self.assertRaises(OSError):
+                App(data, clock=self.clock)
+        self.assertFalse((data / 'admin.token').exists())
 
     def test_restart_after_complete_commit_publishes_once_without_new_attempt(self):
         job = self.job(contract(harness_params={'steps': [{'write': {'path': 'result', 'content': 'one'}}]},
