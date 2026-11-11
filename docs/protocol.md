@@ -1,6 +1,6 @@
 # agent-collab 协议契约 v1
 
-状态：首版契约，由 Claude 主控维护。controller（WP1）与 node agent（WP2）都按本文实现；发现矛盾或缺口时在报告中提出，不各自改写语义。共享常量、manifest 规范化与路径校验在 `agent_collab/protocol.py`，worker 不修改该文件。
+状态：首版契约。controller 与 node agent 都按本文实现，不各自改写语义；发现矛盾或缺口时先更正本文，再改实现与测试。共享常量、manifest 规范化与路径校验在 `agent_collab/protocol.py`，由两端共用。
 
 约定：JSON UTF-8；时间为 UTC ISO-8601（`2026-11-09T03:48:38.123Z`）；ID 为小写 UUID v4，`node_id` 为 `[a-z0-9][a-z0-9-]{0,62}`；所有路径前缀 `/api/v1`。时间参数默认值见 `protocol.DEFAULTS`，均为候选值，不是实测保证。
 
@@ -66,7 +66,7 @@
 - `recovery.auto=true` 要求 `inputs_manifest` 非空，且所有 blob 已存在于 controller，才能把 `protection` 置为 `protected`；否则为 `preparing`，**不得派单**，`status_reason` 列出缺失 blob。`recovery.auto=false` 时 `protection=unprotected`，可直接派单，但不会自动恢复。
 - `side_effects=manual` 时永不自动恢复；`idempotent` 需要 `attempt.side_effect` 事件中的逻辑操作 ID（§7）。
 
-**contract.workspace（WP5）**：可选 `{"exclude": [glob, ...]}`；省略 workspace 或 exclude 时使用
+**contract.workspace**：可选 `{"exclude": [glob, ...]}`；省略 workspace 或 exclude 时使用
 `["__pycache__/**", "*.pyc", ".pytest_cache/**", ".DS_Store"]`，显式空列表关闭排除，自定义列表替换默认列表。
 只接受 POSIX 相对 glob；空模式、绝对路径、盘符、反斜杠、控制字符，以及空、`.`、`..` 路径段在受理时返回 400。
 匹配区分大小写，可从任意目录深度开始；`*`、`?`、`[...]` 匹配单个路径段，独立的 `**` 匹配零个或多个路径段。
@@ -87,7 +87,7 @@ agent 回写时同样忽略匹配路径，避免把快照省略误当成对目�
 ```
 
 - `epoch` 在同一 job 内严格递增；只有 `job.current_epoch` 的 attempt 拥有执行权与发布权。
-- 新 attempt 必须在节点上使用独立工作区 `<agent_data>/attempts/<attempt_id>/work`。
+- 新 attempt 必须在节点上使用独立工作区 `<agent_data>/attempts/<attempt_id>/work`（配置 `workspace_root` 时见 §11.4）。
 - `observed` 只填执行端日志中实际读到的值；读不到时为 `null`，不用请求参数冒充。
 
 **node**
@@ -170,7 +170,7 @@ agent 回写时同样忽略匹配路径，避免把快照省略误当成对目�
 7. **authority_generation**：controller 元数据中的整数。恢复旧数据库备份时必须递增；此前签发的租约与 assignment 全部失效（返回 `fenced`，`details.reason="stale_generation"`）。心跳携带旧 generation 时返回 `reconcile_required=true`，节点先上报本地 attempt 状态，controller 对账后才发新租约。普通进程重启**不**递增 generation。
 8. **控制服务重启**：启动时把所有活动租约的到期时间延长到 `max(原到期, now + lease_ttl_s)`，写 `controller.started` 事件，不重新派发已有 attempt。
 
-**complete.report（WP5）**：agent 在每次 complete 中提供 JSON 对象，经 `agent.clean` 移除已知节点/租约令牌，
+**complete.report**：agent 在每次 complete 中提供 JSON 对象，经 `agent.clean` 移除已知节点/租约令牌，
 以 canonical JSON 的 UTF-8 字节计不超过 65536 bytes。controller 原样保存 report（包括 usage 的 token 计数字段）；
 显式非对象（null 除外）返回 400，超过上限返回 413；为兼容旧调用方，省略 report 字段或显式 `report=null` 仍允许。历史 report=null 不改写。
 
@@ -209,7 +209,7 @@ agent 回写时同样忽略匹配路径，避免把快照省略误当成对目�
 
 所有变更请求带 `request_id`（幂等键）与 `expected_version`（过期返回 409 `version_mismatch`，附当前记录）。幂等记录按 `(端点, request_id)` 保存请求哈希与响应：相同内容重放原响应，不同内容 409。重复点击不会重复派单。
 
-**drain.migrate（WP5）**：migrate 缺省 false，保持仅停止新领取的行为；drain=false 时忽略 migrate。
+**drain.migrate**：migrate 缺省 false，保持仅停止新领取的行为；drain=false 时忽略 migrate。
 drain=true 且 migrate=true 时，逐个检查节点的活动 attempt：job 必须 protected、side_effects=none、具有 durable/verified
 检查点或 inputs 基线、迁移/attempt/deadline 预算未耗尽、无取消或未对账副作用，且其他节点有符合要求的空闲容量。
 沿用 retry 的协调租约门禁（需要时携带 X-Coordinator-Token）、调度能力/共享主机/额度/profile 规则。
@@ -278,7 +278,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 从检查点恢复时，stub 依据 `start.summary.completed`（已完成步骤序号）跳过已完成的步骤，用于证明“从最近确认检查点继续”。
 
-## 10. 协调权与受管协调者（阶段 C，定稿）
+## 10. 协调权与受管协调者
 
 确定性调度只恢复已受理的工作包；需求解释、验收判断、修复派单等语义决策由协调者完成。协调者分两类：`interactive`（用户当前 Claude 或控制台用户）与 `managed`（在幸存节点按事件启动的真实 Claude 回合）。
 
@@ -297,10 +297,10 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 **受管协调者**：
 
 - 配置 `managed_coordinator: {"enabled": bool, "profile_id": str}` 与 `standby_profiles: {id: {"harness": "claude", "model", "effort", "node_ids": []}}`，由用户事先填写。显式 `enabled=false` 时 status 为 `disabled`；缺失配置或必填字段、model/effort 为空、node_ids 为空或非法时为 `profile_missing`，不创建协调 job。完整启用配置为 `ready`，只表示配置完整，不代表 CLI 或认证已实测可用。不猜测模型或强度，也不回退到其他档位。
-- 触发：job 进入 `completed`、`waiting_reconcile`，或收到 `rework` 验收，且该根工作包没有有效的 interactive 租约。controller 在该状态/验收事务内创建协调 job（`harness="claude"`，contract 内 `coordinates: {"job_id", "work_package_id"}`，`recovery.auto=false`，`requirements.tools=["claude"]`，节点限于 profile 的 `node_ids`）。以目标 `job_id + 触发类型 + job.version` 持久去重；不同触发可排队，领取时再次检查目标根没有有效租约。协调 job 使用独立 job/root 和执行预算，不计入目标根修复预算，publish 为 manual；客户端不能自行提交 claude/coordinates 契约。协调 job 自身的完成或失联不触发下一轮；本轮应用的 rework 验收和 follow_up 属于同一决策，不递归触发本轮自身的验收。
+- 触发：job 进入 `completed`、`waiting_reconcile`，或收到 `rework` 验收，且该根工作包没有有效的 interactive 租约。controller 在该状态/验收事务内创建协调 job（`harness="claude"`，contract 内 `coordinates: {"job_id", "work_package_id"}`，`recovery.auto=false`，`requirements.tools=["claude"]`，节点限于 profile 的 `node_ids`）。按 §11.8 的去重键持久去重；不同触发可排队，领取时再次检查目标根没有有效租约。协调 job 使用独立 job/root 和执行预算，不计入目标根修复预算，publish 为 manual；客户端不能自行提交 claude/coordinates 契约。协调 job 自身的完成或失联不触发新的协调回合；协调回合应用的 rework 验收和 follow_up 属于同一决策，该验收不会再触发协调。
 - 协调 attempt 领取时自动获得目标根的 managed 租约（holder_ref 为协调 attempt_id），随正常 attempt 心跳续租，完成、失败、取消确认、失联或显式 retry 撤销时释放。已被接管时旧 attempt 不得释放新持有者的租约，也不得应用决策。取消请求发出后，在确认/失联前仍保留租约。
 - inputs_manifest 含 controller 生成的 `context.json`（目标 job 契约与状态、最新 attempt report、最新 durable checkpoint 相对 inputs 的 diff、验收记录）和 `decision-schema.json`；文件及 manifest 均通过 blob 提供。model/effort 与 node_ids 在触发时从配置取得快照。只响应新事件，不因配置启用或 interactive 租约过期而补发历史触发；不使用模型轮询心跳。
-- **context.json 文本证据（WP5）**：在既有字段之外增加 `files:[{"path","content"}]` 和 `files_omitted:[{"path","reason"}]`。
+- **context.json 文本证据**：除上述字段外，还包含 `files:[{"path","content"}]` 和 `files_omitted:[{"path","reason"}]`。
   选择目标 job 最新的 durable/verified final 检查点，无 final 则选最新 durable/verified 检查点（按受理顺序，uploading 不参与）。
   files 按路径排序，仅包含可严格 UTF-8 解码的完整文件内容；单文件 ≤32768 bytes，累计 ≤262144 bytes，均按原文件字节计，非 JSON 转义后的字节。
   依次按 workspace 排除、单文件上限、UTF-8 解码、总预算判定，省略原因分别为 excluded、too_large、binary、budget；省略列表也按路径排序。
@@ -311,9 +311,9 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - controller 在同一事务内确认 managed 租约仍属于该 attempt、目标 epoch/状态/检查点/验收/取消状态未改变且没有后续同根修订，然后应用决策；节点自动发布引起的 delivery/version 更新不使输入失效。合法 accept/rework 的验收先记录并绑定 checkpoint manifest，写 coordinator.decision_applied；follow_up 在独立保存点处理。修复请求形状错误、派生契约无效或派单失败时，仅回滚修复产生的状态/计数，写 `coordinator.follow_up_rejected`（含 reason）；超预算或根副作用未知写 `coordinator.escalated`。这些情况保留验收，协调 attempt 仍为 succeeded、协调 job 为 completed，完成请求重放不重复验收/派单。合法 rework 从 waiting_reconcile 创建修复前，将旧目标标为 failed(managed_rework)；创建失败时该状态变更也回滚，目标保留 waiting_reconcile 和已记录验收。follow_up=null 仅记录验收。显式 escalate 仍只记录事件、保持目标状态等待人工。验收自身非法或持有权/目标版本/检查点失效时，整次应用拒绝，写 `coordinator.decision_rejected`，不改变目标 job 和验收。
 - 节点 claude 适配器使用用户本机已安装的官方 Claude Code 与其官方登录：`claude -p --model <profile.model> --effort <profile.effort> --output-format json --json-schema <内联 JSON> --permission-mode dontAsk --tools "" --session-id <新 uuid> --strict-mcp-config --setting-sources "" --safe-mode`，环境变量 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`（禁用全部内置工具；不加载 MCP 服务，不加载 user、project、local 任何来源的设置、插件、hooks 和各级目录的 CLAUDE.md、CLAUDE.local.md，不加载自动记忆；Claude Code 自身的系统提示、官方登录与管理员下发的托管策略照常）。协调工作区里出现 `.claude` 时适配器不启动 Claude，以 `code_failure` 结束。prompt 经 stdin，内嵌 context.json 全文并要求仅返回结构化决策；follow_up 只需给修复目标、验收项、给 Codex 的修改说明及 effort，系统从被验收检查点自动生成完整契约。仅接受 stdout JSON 的 structured_output，通过 schema 后由 agent 写 decision.json 并建立 final checkpoint，不在 adapter 内生成或校验修复契约。含旧 contract 字段或缺字段的 follow_up 会在 adapter 端失败且不写 decision.json；若错误 follow_up 已通过其他客户端到达 controller，其合法验收仍可部分应用。不把自由文本 result 当作决策。Claude 不获写文件或执行命令权限；这是 Claude Code 的命令行限制，不是操作系统级隔离。没有工具时 Claude 只能依据 prompt 内嵌的 context：提示词要求只依据提供的证据判断，不得声称做过或看到未出现在 context 中的检查，证据不足或没有检查点时决策为 `escalate`。认证失败分类 auth_expired。路径来自 agent.json 的 claude_command（默认 claude），detect 只在找到可执行文件后探测版本。适配器不读取、复制或代理 Claude.ai OAuth 凭据，不改变计费路径；每轮新建会话，不 resume 原生会话。
 
-## 11. rc5 增补（主控定稿；向后兼容，旧字段语义不变）
+## 11. 执行环境、执行证据、协调策略与回写（rc5 起；向后兼容，旧字段语义不变）
 
-**11.1 命令解析（agent）**：agent.json 新增可选键 `codex_command`（已有，rc5 起 detect 也使用）、`claude_command`、`workspace_root`、`disabled_harnesses`、`codex_windows_sandbox`、`auth_probe_s`。
+**11.1 命令解析（agent）**：agent.json 可选键 `codex_command`（执行与 detect 共用）、`claude_command`、`workspace_root`、`disabled_harnesses`、`codex_windows_sandbox`、`auth_probe_s`。
 - `*_command` 可为绝对路径字符串或 argv 列表（首元素为绝对路径）；未配置时按顺序查找：服务进程 PATH，然后 `~/.local/bin`；macOS 再查 `/opt/homebrew/bin`、`/usr/local/bin`。Windows 不排除 `.exe/.cmd` 之外的 PATHEXT 规则，仍排除 WindowsApps 应用执行别名。
 - 解析出的绝对 argv 只计算一次，供 detect、doctor、auth 探测和 adapter 执行共用；探测与执行使用同一环境：服务环境，PATH 前置“解析出的可执行文件所在目录”。不读取 shell rc、不依赖交互终端。
 - `capabilities.harness_paths: {"codex": "<abs>"|null, "claude": "<abs>"|null}`；`capabilities.tools.codex/claude` 与 `harness.codex/claude` 取自同一解析结果（版本字符串，失败为 null）。
@@ -321,11 +321,11 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 **11.2 认证探测（agent，不调用模型）**：启动时及每 `auth_probe_s`（缺省 900）秒运行 `codex login status`、`claude auth status`（解析 JSON `loggedIn`），超时 20 秒。结果映射为 `auth_health[h] = ok|expired|unknown`（明确未登录为 expired，命令失败或超时为 unknown），随心跳上报。macOS 上 `claude auth status` 报未登录而当前进程读不到登录钥匙串时（如 SSH 会话），记为 unknown，不判定为 expired。输出只取状态，不记录账户标识或凭据。controller 合并规则不变（§3）。
 
-**11.3 版本身份（agent 与 controller 共用）**：运行包版本从运行代码所在版本目录的 `release-manifest.json` 读取 `version` 与 `git_commit`，读不到时回退包内常量且 git_commit 为 null。node 的 `agent_version` 为该版本；`capabilities.agent = {"version", "git_commit"}`；attempt.runtime 增加 `agent_commit`。
+**11.3 版本身份（agent 与 controller 共用）**：运行包版本从运行代码所在版本目录的 `release-manifest.json` 读取 `version` 与 `git_commit`，读不到时回退包内常量且 git_commit 为 null。node 的 `agent_version` 为该版本；`capabilities.agent = {"version", "git_commit"}`；attempt.runtime 含 `agent_commit`。
 
-**11.4 工作区位置**：配置 `workspace_root` 时，attempt 工作区为 `<workspace_root>/<attempt_id>`（不再位于 `<agent_data>/attempts/<id>/work`），元数据、令牌、输出仍在 agent 数据目录。Windows 上若工作区位于用户配置文件目录（`%USERPROFILE%` 之下）且 codex 可用，doctor 报告 `workspace_in_profile` 警告：Codex Windows 沙箱身份无权列出用户目录，PowerShell 起始位置会退回驱动器根。
+**11.4 工作区位置**：配置 `workspace_root` 时，attempt 工作区为 `<workspace_root>/<attempt_id>`（而不是 §3 的 `<agent_data>/attempts/<id>/work`），元数据、令牌、输出仍在 agent 数据目录。Windows 上若工作区位于用户配置文件目录（`%USERPROFILE%` 之下）且 codex 可用，doctor 报告 `workspace_in_profile` 警告：Codex Windows 沙箱身份无权列出用户目录，PowerShell 起始位置会退回驱动器根。
 
-**11.5 Codex 执行参数**：在既有 argv 上增加 `--ignore-user-config`（不加载用户 config.toml 中的 MCP 服务、插件、notify 钩子与默认档位；认证仍用 CODEX_HOME，不复制凭据），Windows 上再加 `-c windows.sandbox="<codex_windows_sandbox，缺省 elevated>"`。model、effort、sandbox 与 sandbox_workspace_write.* 继续显式传入。
+**11.5 Codex 执行参数**：argv 包含 `--ignore-user-config`（不加载用户 config.toml 中的 MCP 服务、插件、notify 钩子与默认档位；认证仍用 CODEX_HOME，不复制凭据），Windows 上再加 `-c windows.sandbox="<codex_windows_sandbox，缺省 elevated>"`。model、effort、sandbox 与 sandbox_workspace_write.* 也都显式传入。
 
 **11.6 契约检查与执行证据**：contract 可选 `checks: [{"name", "run": [argv...], "timeout_s": 600}]`（≤16 项；name 唯一，匹配 `[A-Za-z0-9_.-]{1,64}`；run 为非空字符串数组，`{python}` 占位同 §9；timeout_s 为 1–3600 的数字）。参与 request_hash；修复契约继承目标的 checks。
 - agent 在 harness 成功结束后（stub 全部步骤完成、codex turn completed 且退出码 0），在工作区内按序运行每项检查（无 shell、stdin 为空、服务环境），之后才建立 final 检查点。检查失败不改变 attempt outcome。
@@ -333,16 +333,16 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 **11.7 验收证据门禁（controller）**：contract.checks 非空时，任何来源（受管协调者、管理员、UI 会话）的 `passed` 验收，都要求产生被验收检查点的 attempt 的 `report.checks.manifest_sha256` 等于该检查点 manifest 哈希，且每项必需检查都存在、`exit_code == 0`、`timed_out == false`。不满足时验收记录仍保存，但 `status` 改为 `unverified`，并附 `requested_status: "passed"` 与 `evidence_gaps: [{"check", "reason": "missing|failed|timed_out|manifest_mismatch|no_report"}]`；写 `job.evidence_gap` 事件。满足时验收记录附 `evidence: {"attempt_id", "manifest_sha256", "checks": [name...]}`。job.acceptance 透出 `requested_status`、`evidence_gaps`。`publish.requires_acceptance` 仍只认 passed。
 
-**11.8 任务级协调策略（controller）**：contract 可选 `coordination: {"policy": "always|on_failure|none"}`，缺省 always（即 §10 现有行为）。on_failure 只在目标进入 `waiting_reconcile`、`failed`、`waiting_capability`，或以 completed 结束但交付 attempt 带 `recovered_from_attempt`（发生过接管）时触发；none 从不触发受管协调。修复契约继承目标的 coordination。
-- 触发去重键改为 `目标 job_id + 触发类型 + durable_checkpoint_id + acceptance.status`；同一目标已有未结束的协调 job 时不再创建新的。取消请求或根预算耗尽后不派生修复（已有 budget_reason 与 cancel 检查须覆盖受管修复路径）。
+**11.8 任务级协调策略（controller）**：contract 可选 `coordination: {"policy": "always|on_failure|none"}`，缺省 always（即 §10 所述的触发行为）。on_failure 只在目标进入 `waiting_reconcile`、`failed`、`waiting_capability`，或以 completed 结束但交付 attempt 带 `recovered_from_attempt`（发生过接管）时触发；none 从不触发受管协调。修复契约继承目标的 coordination。
+- 触发去重键为 `目标 job_id + 触发类型 + durable_checkpoint_id + acceptance.status`；同一目标已有未结束的协调 job 时不再创建新的。取消请求或根预算耗尽后不派生修复（已有 budget_reason 与 cancel 检查须覆盖受管修复路径）。
 
-**11.9 能力证据（controller）**：node 记录增加 `capability_evidence: {"<harness>": {"status": "ok|degraded|unproven", "bound": {"agent_version", "harness_version", "harness_path"}, "last_success": {"attempt_id", "at"}|null, "last_failure": {"attempt_id", "at", "reason"}|null}}`。
+**11.9 能力证据（controller）**：node 记录包含 `capability_evidence: {"<harness>": {"status": "ok|degraded|unproven", "bound": {"agent_version", "harness_version", "harness_path"}, "last_success": {"attempt_id", "at"}|null, "last_failure": {"attempt_id", "at", "reason"}|null}}`。
 - 每个 attempt（含 stub 与协调 job）结束时更新该 attempt 所用 harness：succeeded 且（无 checks 或检查全过）记为 success；succeeded 但检查失败/缺失记为 failure(`checks_failed`)；其他失败记为 failure(failure_class)，`user_cancel`、`node_lost` 不计。
 - bound 与节点当前上报值不同则视为 `unproven`（旧证据不沿用）；否则最新一条为 success 时 `ok`，为 failure 时 `degraded`。仅用于展示与解释，不改变调度过滤（撤销能力用 11.1 的 disabled_harnesses）。
 
-**11.10 源目录回写与执行节点解耦**：contract.integration.target_node_id 非空时，回写不再要求由执行节点完成。
+**11.10 源目录回写与执行节点解耦**：contract.integration.target_node_id 非空时，回写由该目标节点完成，不要求它是执行节点。
 - 交付发布成功后，controller 为该根工作包登记待回写项（每个根工作包同一目标只保留最新一项，旧的待办被新交付替代）：`{"job_id", "checkpoint_id", "manifest_sha256", "base_manifest_sha256", "target_path", "exclude"}`；base 取同根同目标最近一次 `integrated` 的 manifest，没有则取根 job 的 inputs_manifest。job.integration_status 置 `integration_pending`。
-- 心跳响应增加 `integrations: [...]`，只发给 target_node_id 对应节点；节点用既有 `integrate()` 回写（只检查本次改动路径、先备份、冲突不覆盖），在本地数据目录 `integrations/<job_id>/<checkpoint_id>/` 持久化进度，结果经既有 `POST /jobs/{id}/integration` 上报。已开始但结果未知的回写不重复执行，上报 `conflict` 并要求人工复核。
+- 心跳响应包含 `integrations: [...]`，只发给 target_node_id 对应节点；节点用既有 `integrate()` 回写（只检查本次改动路径、先备份、冲突不覆盖），在本地数据目录 `integrations/<job_id>/<checkpoint_id>/` 持久化进度，结果经既有 `POST /jobs/{id}/integration` 上报。已开始但结果未知的回写不重复执行，上报 `conflict` 并要求人工复核。
 - 目标节点离线时 job 仍为 completed、交付与工件保存在 controller，integration_status 保持 `integration_pending`；节点恢复后按上述基线检查再回写。
 
 **11.11 Claude 协调说明语言**：claude 适配器提示词要求 method、result、notes、follow_up 的 title/goal/acceptance/instructions 使用简体中文；结构化枚举值与字段名不变。

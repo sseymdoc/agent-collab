@@ -195,7 +195,7 @@ systemctl disable --now agent-collab-backup.timer
 systemctl stop agent-collab-backup.service
 ```
 
-`Persistent=true` 会补触发停机期间错过的日历任务，不补造每个历史时点的备份。若改变 `--backups-dir`，controller 的默认状态展示将读不到它；本工作包选择固定默认路径，未扩展 controller 配置 schema。保持安装布局即可自动展示。
+`Persistent=true` 会补触发停机期间错过的日历任务，不补造每个历史时点的备份。若改变 `--backups-dir`，controller 的默认状态展示将读不到它：controller 只读取固定的默认路径，配置 schema 中没有对应选项。保持安装布局即可自动展示。
 
 ECS 回退定时机制（保留所有备份、状态、锁文件和 controller 数据）：
 
@@ -217,7 +217,7 @@ systemctl reset-failed agent-collab-backup.service || true
 
 ### Mac 实例外拉取 LaunchAgent
 
-在拥有已验证 Workbench 配置的 Mac 登录用户下执行。`CODE_DIR` 必须是本机已安装、包含本模块的代码绝对路径；示例默认用独立安装的 `current`，不要指向临时工作包 clone。`STATE_DIR` 是实例外持久目录，放在**内置盘**的用户目录下，实例 ID 用现场值替换。模板不含令牌，也不会复制 Workbench 登录资料；需确保该登录用户无需交互即可执行 Workbench。
+在拥有已验证 Workbench 配置的 Mac 登录用户下执行。`CODE_DIR` 必须是本机已安装、包含本模块的代码绝对路径；示例默认用独立安装的 `current`，不要指向临时的源码 clone。`STATE_DIR` 是实例外持久目录，放在**内置盘**的用户目录下，实例 ID 用现场值替换。模板不含令牌，也不会复制 Workbench 登录资料；需确保该登录用户无需交互即可执行 Workbench。
 
 不要把 `STATE_DIR` 放在外置卷：macOS 的隐私控制（TCC）会拒绝 LaunchAgent 里的 `/usr/bin/python3` 访问可移除卷（`PermissionError: Operation not permitted`），
 而同一命令在 SSH 会话里手动执行可能成功，这不说明后台任务也能访问。确需外置卷时由用户在“隐私与安全性”里为实际运行的程序授权，
@@ -265,7 +265,7 @@ tail -n 50 "$STATE_DIR/logs/backup-pull.err.log"
   --remote-backups-dir /var/lib/agent-collab/backups --keep-offsite 28
 ```
 
-LaunchAgent 依赖用户登录和 Workbench 当前可用；`StartInterval=21600` 不是未登录启动保证，不声称补齐休眠/离线期间每轮任务。日志只追加，可在停用时按实际容量归档；本工作包未增加日志轮转服务。Workbench exec 以 root 运行，但 list/confirm 命令均经 `runuser -u agent-collab`；download 读取的路径固定为严格验证目录内 `<id>/backup.tar`。exec 超时为 300 秒，download 为 3600 秒，超时记录失败并释放本地锁；远端 exec 超时后可能仍在完成短命令，确认重试保持幂等。Windows 主控可复跑单元测试，Linux/Mac 模板不能用于 Windows 服务注册。
+LaunchAgent 依赖用户登录和 Workbench 当前可用；`StartInterval=21600` 不是未登录启动保证，不声称补齐休眠/离线期间每轮任务。日志只追加，可在停用时按实际容量归档；没有日志轮转服务。Workbench exec 以 root 运行，但 list/confirm 命令均经 `runuser -u agent-collab`；download 读取的路径固定为严格验证目录内 `<id>/backup.tar`。exec 超时为 300 秒，download 为 3600 秒，超时记录失败并释放本地锁；远端 exec 超时后可能仍在完成短命令，确认重试保持幂等。Windows 上可以运行这些单元测试，但 Linux/Mac 模板不能用于 Windows 服务注册。
 
 停用与回退（保留 Mac 副本、状态与日志；恢复旧模板不自动启用）：
 

@@ -1,4 +1,4 @@
-# Node agent（WP2）
+# Node agent
 
 Python 3.9+，仅标准库；主动连接控制端，不监听入站端口，不需要 SSH。
 协议来源为 `docs/protocol.md` 和 `agent_collab/protocol.py`。本文实现未运行真实模型。
@@ -46,7 +46,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 `--once` 前台执行一次领取，处理该任务到完成上报或隔离；没有任务时退出。
 正常终止可向后台 PID 发送 SIGTERM，agent 会停止其托管进程。
 单个数据目录由 OS 文件锁独占。后台模式不依赖发起 shell/SSH，但不提供开机自启或崩溃重启；
-installer、系统服务、长时间运行与整机重启验收属于后续工作包。
+安装器与系统服务见 [install.md](install.md)，长时间运行与整机重启不在本文验收范围内。
 
 ## agent.json 与目录
 
@@ -120,13 +120,13 @@ agent 使用 `node.token` 和 `attempts/<id>/lease.token` 保存发起认证所�
 控制端和元数据中的校验记录只保存 SHA-256，比较用 `hmac.compare_digest`。模型 provider 登录不复制。
 运行日志仅来自本机 harness；本产品不把它们自动上传为事件。
 
-WP5 在 complete.report 上传有限的执行证据：stub 每个已触及步骤的状态、run 退出码及两个各 ≤4 KiB 的输出尾部，
+agent 在 complete.report 中上传有限的执行证据：stub 每个已触及步骤的状态、run 退出码及两个各 ≤4 KiB 的输出尾部，
 检查点跳过的步骤标为 skipped_from_checkpoint；Codex 的 result.txt 尾部 ≤16 KiB、实际 session/usage/CLI error；
 Claude 的有效 decision 和 notes。未知值用 null，未执行步骤不伪造结果。报告先经 agent.clean 脱敏，再限制 canonical JSON
 总计 ≤64 KiB；发生局部/整体截断均标 truncated=true，整体过大时可能减少 steps 或清空过大的 usage/cli_error。
 报告随 complete outbox 保存，重启重放不重新读取输出。controller 原样保存报告，不把 usage 中的 token 计数当成凭据移除。
 
-rc5 在 harness 成功之后按顺序执行 contract.checks：无 shell、空 stdin、工作区 cwd、服务环境，
+harness 成功之后，agent 按顺序执行 contract.checks：无 shell、空 stdin、工作区 cwd、服务环境，
 `{python}` 替换为 agent 解释器。检查由主循环轮询，心跳与取消继续工作；超时停止整个进程组。
 失败/超时/无法启动均记为检查证据，不改变成功的 harness outcome；无法确认检查进程停止时则隔离工作区。
 信任边界：检查以节点服务身份运行，**不在** Codex 沙箱内，可联网并读取该账户可读的文件（含 node.token、
@@ -137,7 +137,7 @@ lease.token）。检查若导入模型刚写出的工作区代码（如 `{python
 成功但未配置检查时 results=[]。64 KiB 总限制优先压缩检查尾部；极端超大 argv 仍可能使检查证据被清空，
 此时 controller 应按缺证据处理，不能当作通过。检查原始本地输出与 harness 日志一样只保存在节点。
 
-## Claude 受管协调适配器（WP4）
+## Claude 受管协调适配器
 
 controller 生成 harness=claude 的协调契约，harness_params 明确给出 model/effort，并在 inputs_manifest 提供 context.json 和 decision-schema.json。节点在独立 attempt/work 中物化后调用：
 
@@ -228,7 +228,7 @@ contract.workspace.exclude 缺省为 `__pycache__/**`、`*.pyc`、`.pytest_cache
 本次结果相对 base 的 added/modified/deleted 路径；这些路径的哈希/缺失/已存在冲突返回 conflict 且不写目标。
 未被本次结果修改的基线文件不参与冲突判断，也不备份或覆盖，保留目标中的人工修改或删除。
 通过后先验证所有结果 blob，备份将覆盖/删除的原文件，再逐文件原子替换。
-rc5 由 controller 在目标节点的心跳响应中下发 integrations，执行节点不再在发布后直接回写。
+回写由 controller 在目标节点的心跳响应中下发 integrations，执行节点发布后不直接回写。
 目标节点不需要持有原 attempt：下载 base/result manifests 与 blobs，上报 integration_pending，持久化写入意图，
 执行回写并保存固定 request_id 回执，然后上报 integrated/conflict。丢失回执响应可跨重启重放，已完成项不再写入。
 协议条目不含 target_node_id，目标身份由经过认证的心跳路由保证；若条目额外带目标字段，非本节点会忽略。
@@ -244,10 +244,10 @@ rc4 已有回执/写入意图会导入同一进度路径，避免升级后再次
   租约文件不会被当成有效凭据。旧元数据没有进程记录时，只有不含 run 的 stub 能确认无子进程；
   其他情况保留 unknown，需人工核对。
 - §4 请求表没有列 authority_generation，但 fencing 规则要求该字段；agent 在 attempt 变更请求中
-  显式携带 assignment 的 generation。主控集成时需确认 WP1 接受这一字段。
+  显式携带 assignment 的 generation。controller 接受这一字段，值不等于当前 generation 时按 `stale_generation` fencing 处理。
 - rc5 节点需要配套 rc5 controller 接受能力/运行版本字段并在心跳提供 integrations；rc4 controller
   严格拒绝新增能力/runtime 字段。旧 App.handle 回归测试只通过测试专用桥移除这些字段；完整 rc5 报文另由桩验证，
-  这不代表两工作包已完成实际集成。
+  这些测试不代表 rc5 节点与 controller 已完成实际联调。
 - assignment 的 native_session_ref 没有原线程独占证明。Codex adapter 默认从文件检查点新建线程；
   argv 构造器支持稳定 launcher 的 resume 布局，但 agent 不自动 resume 未证明独占的线程。
 - 新建/续接 argv、WindowsJob、POSIX 进程组停止、进程创建时间查询、事件解析和 observed 读取移植自
@@ -260,8 +260,8 @@ rc4 已有回执/写入意图会导入同一进度路径，避免升级后再次
 - blob 与单次快照目前在内存中组装，没有分块传输或缓存 GC；适合受控小工作包。目录创建/删除本身
   不进入 manifest，仅跟踪文件。文件/目录形态切换可能保守报告冲突，跨平台非法文件名可能本地失败。
 - 子进程继承本机账户权限，stub run 不是操作系统沙箱；只应用于受信测试命令。Codex 使用固定沙箱参数。
-  本轮修订未运行真实 Codex、Windows Job Object、真实 TLS/网络、跨机恢复、全机断电或长期运行。
-  主控此前已执行的 HTTP 闭环与故障演练证据由主控维护，不以本轮进程内测试替代。
+  本文所述的 agent 测试未运行真实 Codex、Windows Job Object、真实 TLS/网络、跨机恢复、全机断电或长期运行。
+  HTTP 闭环与故障演练的证据单独记录（见 README 的验证情况），不以进程内测试替代。
 
 ## 测试与故障注入
 
@@ -270,10 +270,10 @@ rc4 已有回执/写入意图会导入同一进度路径，避免升级后再次
 ```
 
 `tests/fake_controller.py` 仅为进程内端点 fixture，不含生产调度逻辑。
-本轮测试临时目录均在仓库 `.dev/tmp` 内，结束清理；新增测试不需要 socket，不访问网络，不调用模型。
-Windows 专属测试在其他平台 skip；主控应在 Windows 复跑。
+测试临时目录均在仓库 `.dev/tmp` 内，结束清理；agent 的进程内测试不需要 socket，不访问网络，不调用模型。
+Windows 专属测试在其他平台跳过，需在 Windows 上运行才能覆盖。
 `test_agent_restart_controller.py` 使用真实 `App.handle` 做进程内重启集成验证；
-主控的 `test_e2e_local.py` 需要 loopback socket，在本 worker 沙箱不可用时跳过。
+端到端测试 `test_e2e_local.py` 需要 loopback socket，环境不允许打开 loopback socket（如受限沙箱）时跳过。
 
 **以下开关仅限隔离测试/演练，不得用于生产：**
 

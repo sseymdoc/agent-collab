@@ -1,4 +1,4 @@
-# 本地发行包与安装运维（WP3）
+# 本地发行包与安装运维
 
 Python 3.9+、标准库、系统自带工具；安装器不下载 Python、依赖、模型工具或发行包，不提供发布 URL。
 使用可信的本地源码或已核对来源的本地发行包。manifest 校验能发现损坏/篡改文件，**不提供签名或发行者身份认证**。
@@ -285,7 +285,7 @@ PREFIX="$HOME/.local/share/agent-collab"
 Windows 对应入口为 `& "$Prefix\bin\agent-collab.ps1" doctor ...` / `install ...`，参数相同。
 controller-only 升级不需要远端管理员令牌；离线安装的上述 install/drain/rollback 命令继续加 `--no-service`。
 远端 worker 的 drain API 只接受管理员授权；**节点令牌没有 drain 权限**。本版没有委托式维护凭据接口，
-管理员令牌需由有权限的运维通过已有安全渠道在执行机器准备，或由主控扩展协议后再接入。安装器不会自行复制它。
+管理员令牌需由有权限的运维通过已有安全渠道在执行机器准备；委托式凭据要先扩展协议才能接入。安装器不会自行复制它。
 
 排空使用当前 node version + 新 request_id，等待 `active_attempts=0`，缺失字段不视为空闲。
 drain 不强杀活动 attempt；超时或网络错误在停服务之前中止。升级完成会恢复原 drain 值。
@@ -313,8 +313,8 @@ worker 的 status.json 必须来自新版本目录、匹配 version/git_commit�
 管理员令牌不必在 worker 磁盘落盘：POSIX 可用 `--admin-token-file /dev/stdin` 经加密通道传入。
 本地备份不是实例外备份，运维仍需安排实例外存储。
 
-当前 WP1 数据库没有 versioned migration：`PRAGMA user_version=0`。本版 release 声明支持 0，
-并对版本 0 比较 sqlite_master schema 指纹；未来 DDL 改动不能继续沿用 0。主控需让 controller 的迁移代码维护
+当前 controller 数据库没有 versioned migration：`PRAGMA user_version=0`。本版 release 声明支持 0，
+并对版本 0 比较 sqlite_master schema 指纹；未来 DDL 改动不能继续沿用 0，须由 controller 的迁移代码维护
 `user_version`，同时更新 `installer/release-schema.json` 的最低/最高支持版本；安装器不会伪造 schema 迁移。
 当前 schema 超出目标范围，或版本 0 指纹不同，回退拒绝执行；自动失败回退也遵守相同规则。
 
