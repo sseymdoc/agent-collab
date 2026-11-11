@@ -122,6 +122,22 @@ def client_home():
     return Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'agent-collab'
 
 
+def owner_only(path):
+    """Windows 不认 0o600：去掉继承的 ACL，只给当前用户完全控制，再写入凭据。失败就不写。"""
+    if os.name != 'nt':
+        return
+    import csv
+    import subprocess
+    try:
+        whoami = subprocess.run(['whoami', '/user', '/fo', 'csv', '/nh'], capture_output=True, text=True, errors='replace', check=True)
+        sid = next(csv.reader(whoami.stdout.splitlines()))[1]
+        if not re.fullmatch(r'S-1-(?:[0-9]+-)+[0-9]+', sid):
+            raise ValueError(sid)
+        subprocess.run(['icacls', str(path), '/inheritance:r', '/grant:r', '*%s:F' % sid], capture_output=True, check=True)
+    except (OSError, ValueError, IndexError, StopIteration, subprocess.CalledProcessError):
+        raise SystemExit('无法把凭据文件限制为仅当前用户可访问，凭据没有保存；配对码已用掉，请重新签发后再配对')
+
+
 def profile_path(name):
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', name):
         raise SystemExit('profile 名只允许字母、数字、点、下划线和连字符')
@@ -232,9 +248,9 @@ def _client_command(argv):
         from .artifacts import atomic_write
         saved = {k: body[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id')}
         saved.update(url=a.url.rstrip('/'), ca_file=str(Path(a.ca_file).absolute()) if a.ca_file else None, token=body['client_token'])
-        # 自动化客户端的凭据放在当前用户的配置目录里，文件权限仅本人可读写（与节点凭据的保管方式相同）；
+        # 自动化客户端的凭据放在当前用户的配置目录里，文件权限仅本人可读写（POSIX 用 0600，Windows 去掉继承 ACL）；
         # 它可单独撤销、权限按配对码授予。凭据值不打印。
-        atomic_write(path, json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'))
+        atomic_write(path, json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'), prepare=owner_only)
         out(dict({k: saved[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id', 'url')},
                  profile=a.profile, credential_file=str(path)))
         return 0
@@ -354,8 +370,15 @@ def wait(conn, job_id, timeout, interval=2.0):
         time.sleep(interval)
 
 
+SNAPSHOT = object()  # stream 产出它表示游标已过期：调用方先刷新权威状态，再处理随后补读的事件
+
+
 def stream(conn, cursor):
-    """事件流：产出事件（或 None 表示心跳/重连）。断线从上次序号续读；游标过期时从 controller 给出的最小序号继续。"""
+    """事件流：产出事件（或 None 表示心跳/重连）。断线从上次序号续读。
+
+    游标早于 controller 保留的最早事件时（中间的事件已被清理），先产出 SNAPSHOT 让调用方刷新状态，
+    再补读仍保留的事件，最后从补读到的位置续接。
+    """
     while True:
         try:
             response = _open(conn.url, conn.token, 'GET', '/events/stream?cursor=%d' % cursor, None, conn.ca_file, conn.controller_id, timeout=60)
@@ -384,12 +407,16 @@ def stream(conn, cursor):
                     if kind == 'unauthorized':
                         fail('unauthorized', '凭据已被撤销')
                     if kind == 'snapshot_required':
+                        yield SNAPSHOT
                         # min_seq 是仍保留的第一条，而流按 seq > cursor 续读：先补读从它开始的一页，再从补读到的位置续接。
                         minimum = json.loads(data)['min_seq']
-                        backlog = conn.call('GET', '/events?after=%d&limit=1000' % (minimum - 1))['events']
+                        try:
+                            backlog = conn.call('GET', '/events?after=%d&limit=1000' % (minimum - 1))['events']
+                        except Unreachable:
+                            break  # 游标不变：重连后会再次收到 snapshot_required
                         for event in backlog:
                             yield event
-                        cursor = backlog[-1]['seq'] if backlog else minimum
+                        cursor = backlog[-1]['seq'] if backlog else minimum - 1
                         break
                     yield json.loads(data) if kind and data else None
                     kind = data = None
@@ -400,17 +427,39 @@ def stream(conn, cursor):
         yield None
 
 
+def retrying(deadline, call):
+    """controller 暂时不可达时每 2 秒重试，直到 deadline；到期仍不可达就抛出 Unreachable。"""
+    while True:
+        try:
+            return call()
+        except Unreachable:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+
+
 def follow(conn, job_id, timeout):
     """每行一个 JSON：该工作包相关的事件，停稳后最后一行是 {"summary": ...}。"""
-    job = conn.call('GET', '/jobs/' + job_id)
+    deadline = time.monotonic() + timeout
+    job = retrying(deadline, lambda: conn.call('GET', '/jobs/' + job_id))
     root, tracked, cursor = job['work_package_id'], {job_id}, 0
-    for event in conn.call('GET', '/jobs/%s/events?limit=1000' % job_id)['events']:
+    for event in retrying(deadline, lambda: conn.call('GET', '/jobs/%s/events?limit=1000' % job_id))['events']:
         print(json.dumps(event, ensure_ascii=False), flush=True)
         cursor = event['seq']
-    deadline, checked = time.monotonic() + timeout, 0.0
+    # 先取一次摘要：已停稳就直接结束；到期时 controller 恰好不可达，也有最近一次摘要可以输出。
+    last, checked = retrying(deadline, lambda: settled_state(conn, job_id)), time.monotonic()
+    if last['settled']:
+        return finish(last, line=True)
     for event in stream(conn, cursor):
         relevant = False
-        if event:
+        if event is SNAPSHOT:
+            # 游标过期期间的事件（可能含修复修订的 job.created）已被清理：先按权威状态补齐要跟的任务，再读补读的事件。
+            try:
+                tracked.update(j['job_id'] for j in retrying(deadline, lambda: conn.call('GET', '/jobs?limit=1000&work_package_id=' + root))['jobs'])
+            except Unreachable:
+                pass  # 已到期：下面的到期分支输出最近摘要
+            relevant = True
+        elif event:
             payload = event.get('payload') or {}
             if event['type'] == 'job.created' and root in (payload.get('work_package_id'),
                                                            ((payload.get('contract') or {}).get('coordinates') or {}).get('work_package_id')):
@@ -422,13 +471,19 @@ def follow(conn, job_id, timeout):
         if relevant or time.monotonic() - checked > 10:
             checked = time.monotonic()
             try:
-                summary = settled_state(conn, job_id)
+                last = settled_state(conn, job_id)
             except Unreachable:
-                summary = None  # 暂时不可达：事件流在重连，到期前继续等
-            if summary and summary['settled']:
-                return finish(summary, line=True)
+                pass  # 暂时不可达：事件流在重连，到期前继续等
+            else:
+                tracked.update(r['job_id'] for r in last['coordination'])
+                if last['settled']:
+                    return finish(last, line=True)
         if time.monotonic() >= deadline:
-            print(json.dumps({'summary': dict(settled_state(conn, job_id), timed_out=True)}, ensure_ascii=False), flush=True)
+            try:
+                last = settled_state(conn, job_id)
+            except Unreachable:
+                pass  # 到期时仍不可达：按超时结束，输出最近一次摘要
+            print(json.dumps({'summary': dict(last, timed_out=True)}, ensure_ascii=False), flush=True)
             return 4
 
 

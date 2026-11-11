@@ -290,6 +290,9 @@ struct Connection {
     kind: String,
     scopes: Vec<String>,
     paired_at: String,
+    /// 已在 controller 上确认撤销、但本机凭据还没删掉的连接（等待再次“忘记”来清理）。旧文件里没有这个字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -442,6 +445,7 @@ async fn connection_pair(app: AppHandle, shell: State<'_, Shell>, url: String, c
         kind: pairing.kind.unwrap_or_else(|| "desktop".into()),
         scopes: pairing.scopes,
         paired_at: now_iso(),
+        revoked_at: None,
     };
     // 从这里起手里有一份已签发的凭据：之后任何一步失败，都尽力用它自我撤销，不留下无人保管的凭据。
     let adopted = shell.adopt(&app, &conn, header.as_deref(), &token).await;
@@ -456,7 +460,12 @@ async fn connection_open(app: AppHandle, shell: State<'_, Shell>, id: String) ->
     // 打开即先关闭旧连接：核对新连接期间，旧代次的请求和事件流已经失效。
     let (conn, epoch) = {
         let mut inner = shell.lock();
-        (find(&app, &inner, &id)?, inner.bump())
+        let conn = find(&app, &inner, &id)?;
+        if conn.revoked_at.is_some() {
+            // 凭据已在 controller 上失效，打开只会得到 401；不动当前连接，提示用户完成清理。
+            return Err(err("unauthorized", "这条连接已在 controller 上撤销，请再次“忘记”以清理本机凭据"));
+        }
+        (conn, inner.bump())
     };
     let base = validate::base_url(&conn.url).map_err(invalid)?;
     let token = Token(credential(&conn, |entry| entry.get_password()).await?);
@@ -494,21 +503,22 @@ fn connection_close(shell: State<'_, Shell>, epoch: u64) -> Result<Value> {
 
 #[tauri::command]
 async fn connection_forget(app: AppHandle, shell: State<'_, Shell>, id: String, revoke: bool) -> Result<Value> {
-    let conn = {
+    let mut conn = {
         let mut inner = shell.lock();
         let conn = find(&app, &inner, &id)?;
         inner.close_if_active(&id);
         conn
     };
-    let mut revoked = false;
-    if revoke {
+    // 上次已确认撤销、只是本机凭据没删掉：这次不再撤销（凭据已失效，重试只会失败），如实报告已撤销。
+    let mut revoked = conn.revoked_at.is_some();
+    if revoke && !revoked {
         // 撤销失败（包括读不到凭据）不阻止本地删除，结果如实返回。
         if let (Ok(base), Ok(secret)) = (validate::base_url(&conn.url), credential(&conn, |entry| entry.get_password()).await) {
             revoked = shell.revoke(&base, Some(&conn.controller_id), &Token(secret)).await;
         }
     }
-    // 先删连接记录、再删凭据，凭据删不掉时把记录放回：任何一步失败，列表里留下的连接都还有凭据可用，
-    // 可以再次“忘记”。反过来的顺序会在保存失败时留下一条看得见、却打不开的连接。
+    // 先删连接记录、再删凭据，凭据删不掉时把记录放回：任何一步失败，列表里都留着这条连接，可以再次“忘记”。
+    // 反过来的顺序会在保存失败时留下一条看得见、却找不到凭据的连接。放回的记录若已撤销，带上 revoked_at。
     {
         let mut inner = shell.lock();
         let remaining: Vec<Connection> = load(&app, &inner)?.into_iter().filter(|c| c.id != id).collect();
@@ -521,6 +531,9 @@ async fn connection_forget(app: AppHandle, shell: State<'_, Shell>, id: String, 
     })
     .await;
     if deleted.is_err() {
+        if revoked && conn.revoked_at.is_none() {
+            conn.revoked_at = Some(now_iso());
+        }
         let inner = shell.lock();
         let _ = load(&app, &inner).and_then(|mut list| {
             if !list.iter().any(|c| c.id == conn.id) {
@@ -966,6 +979,20 @@ mod tests {
         // 响应没有 X-Controller-Id 也算不一致。
         let (mut inner, epoch) = connected();
         assert_eq!(code(inner.verify(epoch, None)), "controller_mismatch");
+    }
+
+    #[test]
+    fn revoked_at_is_optional_in_connections_json() {
+        let old = json!({ "connections": [{
+            "id": "c1", "name": "n", "url": "https://x", "controller_id": "ctl", "client_id": "c1",
+            "kind": "desktop", "scopes": [], "paired_at": "2026-01-01T00:00:00.000Z"
+        }]});
+        let mut conn = serde_json::from_value::<StoreFile>(old).unwrap().connections.remove(0);
+        assert!(conn.revoked_at.is_none());
+        assert!(serde_json::to_value(&conn).unwrap().get("revoked_at").is_none());
+        conn.revoked_at = Some("2026-11-11T00:00:00.000Z".into());
+        let back: Connection = serde_json::from_value(serde_json::to_value(&conn).unwrap()).unwrap();
+        assert_eq!(back.revoked_at.as_deref(), Some("2026-11-11T00:00:00.000Z"));
     }
 
     #[test]

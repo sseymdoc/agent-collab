@@ -14,6 +14,7 @@ import sqlite3
 import sys
 
 from . import domain as d, protocol as p
+from .blobstore import BlobStore
 from .controller import App, database_references, file_hash, restore
 from .preflight import _validate_output
 
@@ -29,10 +30,29 @@ def _of(records, kind):
 def _events(db, upto=None):
     """事件表（序号不大于 upto 的部分）的条数、最大序号与内容摘要：恢复只追加事件，原有的行必须逐条不变。"""
     digest, count, last = hashlib.sha256(), 0, None
-    for seq, data in db.execute('SELECT seq, data FROM events WHERE seq <= ? ORDER BY seq', (1 << 62 if upto is None else upto,)):
-        digest.update(b'%d\n' % seq + (data if isinstance(data, bytes) else data.encode('utf-8')) + b'\n')
-        count, last = count + 1, seq
+    rows = db.execute('SELECT seq, event_id, job_id, data FROM events WHERE seq <= ? ORDER BY seq', (1 << 62 if upto is None else upto,))
+    for row in rows:
+        # 归属列（event_id、job_id）与内容一起比较：只改归属、不改 data 也算历史被改动。
+        digest.update(json.dumps([v.decode('utf-8', 'replace') if isinstance(v, bytes) else v for v in row]).encode('utf-8') + b'\n')
+        count, last = count + 1, row[0]
     return count, last, digest.hexdigest()
+
+
+def _inputs(backup_dir):
+    """预演会读取的备份集文件（清单、数据库、blob），按跟随符号链接后的真实路径给出。
+
+    输出路径校验遍历目录时不跟随符号链接；备份集里的符号链接可能指向目录外的文件，单独列出才能防住它及其硬链接。
+    """
+    backup = Path(backup_dir)
+    paths = [backup / 'backup-manifest.json']
+    try:
+        manifest = json.loads(paths[0].read_text(encoding='utf-8'))
+        paths.append(backup / manifest.get('database', 'controller.db'))
+        blobs = BlobStore(backup)
+        paths += [blobs.path(entry['sha256']) for entry in manifest.get('blobs', [])]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass  # 清单读不出来时预演本身会失败；这里只保护能确定的文件
+    return [str(path.resolve()) for path in paths if path.exists()]
 
 
 def rehearse(backup_dir, work_dir, config=None):
@@ -138,7 +158,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         # 报告不能覆盖备份集（含硬链接别名）或输入的配置文件。
-        output = _validate_output(Path(args.out), [args.backup], [args.config] if args.config else []) if args.out else None
+        # 预演生成的副本数据目录（work/controller）同样不能被报告覆盖；work 下的其他位置可以。
+        protected = [args.backup, str(Path(args.work) / 'controller')]
+        inputs = _inputs(args.backup) + ([args.config] if args.config else [])
+        output = _validate_output(Path(args.out), protected, inputs) if args.out else None
         report = rehearse(args.backup, args.work, args.config)
     except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error) as exc:
         print(json.dumps(p.error_body('invalid', type(exc).__name__ + ': ' + str(exc)), ensure_ascii=False), file=sys.stderr)

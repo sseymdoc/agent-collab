@@ -20,7 +20,7 @@
 | doctor | `"$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role controller` |
 | 客户端配对码（桌面端、CLI、Agent） | 在 controller 主机上：`"$PREFIX/bin/agent-collab" controller client-code --data-dir <DATA> --role operator`；`--role` 可取 `owner`、`operator`、`viewer`，省略时为 `owner`（全部权限）；一次性，缺省 10 分钟有效 |
 | 桌面端 | 打开桌面端，在“配对新的 controller”里填地址与配对码；凭据保存在系统凭据存储，可在“设置 → 客户端”里撤销 |
-| CLI 客户端 | `"$PREFIX/bin/agent-collab" client pair --url <CONTROLLER> --code <配对码>`，之后的 `submit`、`job`、`settings` 等命令使用这份凭据；用法见 `docs/integration.md` |
+| CLI 客户端 | `"$PREFIX/bin/agent-collab" client pair --url <CONTROLLER> --code <配对码>`，之后的 `submit`、`job`、`settings get` 等命令使用这份凭据；`operator` 只有 `read` 与 `tasks`，修改模型设置（`settings set`）需要带 `settings` 权限的配对码（`--role owner`，或 `--scopes read,settings`）；用法见 `docs/integration.md` |
 
 ## 提交任务与平台约束
 

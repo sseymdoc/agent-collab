@@ -258,7 +258,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - 每条事件：`id: <seq>`、`event: <type>`、`data: <event JSON>`。
 - 每 `sse_ping_s` 秒发送注释行 `: ping`。
-- 游标早于已保留的最小 `seq` 时，先发送 `event: snapshot_required` 与 `data: {"min_seq"}`，客户端应先 `GET /events?after=<min_seq-1>` 补读仍保留的事件，再用补读到的最后序号重新连接（流按 `seq > cursor` 续读，直接用 `min_seq` 会漏掉第一条）。
+- 游标小于 `min_seq - 1`（即游标之后、已保留的第一条之前有事件已被裁剪）时，先发送 `event: snapshot_required` 与 `data: {"min_seq"}`，已被裁剪的事件无法补回，客户端依次：重新读取它依赖的权威状态（如 `GET /jobs/{id}`、`GET /overview`）；`GET /events?after=<min_seq-1>` 补读仍保留的事件；再用补读到的最后序号重新连接，补读为空时用 `min_seq - 1`（流按 `seq > cursor` 续读，直接用 `min_seq` 会漏掉第一条）；补读失败时保持原游标重连。
 - 浏览器的 `Last-Event-ID` 只是游标传递方式，持久性来自数据库事件表。
 - `App.handle` 的 SSE 响应是有限迭代器（测试可设置最大时长或在没有新事件时结束），HTTP 包装负责持续推送。
 

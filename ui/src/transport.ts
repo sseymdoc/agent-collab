@@ -52,7 +52,9 @@ function frames(onFrame: (f: { id: number | null; event: string | null; data: st
   }
 }
 
-export function openStream(cursor: number, on: (e: StreamEvent) => void): () => void {
+// 返回的关闭函数在关闭完成后 resolve：桌面端重连要等旧流的 stream_close 执行完再 stream_open，
+// 否则迟到的 stream_close 会把新流停掉，而且不会再有 closed 事件。
+export function openStream(cursor: number, on: (e: StreamEvent) => void): () => Promise<void> {
   if (isDesktop) {
     const mine = epoch
     let stopped = false
@@ -60,7 +62,7 @@ export function openStream(cursor: number, on: (e: StreamEvent) => void): () => 
       if (!stopped && e.payload?.epoch === mine) on(e.payload)
     })
     unlisten.then(() => { if (!stopped) invoke('stream_open', { epoch: mine, cursor }).catch((x: BridgeError) => on({ kind: 'closed', data: x?.code ?? 'error' })) })
-    return () => { stopped = true; void unlisten.then(f => f()); void invoke('stream_close', { epoch: mine }).catch(() => {}) }
+    return () => { stopped = true; void unlisten.then(f => f()); return invoke('stream_close', { epoch: mine }).then(() => {}, () => {}) }
   }
   // 浏览器用 fetch 读流而不是 EventSource：能区分 401，不需要逐个登记事件类型，重连策略与桌面端一致。
   const abort = new AbortController()
@@ -86,7 +88,7 @@ export function openStream(cursor: number, on: (e: StreamEvent) => void): () => 
       if (!abort.signal.aborted) on({ kind: 'closed', data: 'network' })
     }
   })()
-  return () => abort.abort()
+  return async () => abort.abort()
 }
 
 // 保存工件：桌面端由系统“另存为”对话框选位置，外壳校验哈希后落盘；浏览器走普通下载。

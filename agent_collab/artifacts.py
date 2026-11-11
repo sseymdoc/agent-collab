@@ -45,12 +45,19 @@ def workspace_excluded(path, patterns):
     return False
 
 
-def atomic_write(path, data, mode=0o600):
+def atomic_write(path, data, mode=0o600, prepare=None):
+    """prepare(临时文件路径)：在写入内容前调用，例如在 Windows 上先收紧 ACL；它抛出异常时不写入、不替换。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name('.' + path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        if prepare:
+            try:
+                prepare(temp)
+            except BaseException:
+                os.close(fd)
+                raise
         with os.fdopen(fd, 'wb') as stream:
             stream.write(data)
             stream.flush()

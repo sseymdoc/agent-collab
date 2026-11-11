@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { api, ApiError } from '../api'
-import { Json, MODEL_SOURCE, Section, errText, show, useData } from '../ui'
+import { EFFORT_RE, Json, MODEL_RE, MODEL_SOURCE, Section, errText, show, useData } from '../ui'
 
 // 新建任务：模板 + 自然语言目标 → controller 草拟出完整契约 → 确认后提交。
 // 契约由 controller 生成（POST /contracts/draft），界面不拼装也不改写它；CLI 与其他客户端走同一个端点。
@@ -55,6 +55,7 @@ export function NewJob({ onCreated }: { onCreated: (jobId: string) => void }) {
     } finally { setBusy(false) }
   }
   const p = draft?.preview, mp = draft?.model_policy
+  const badModel = usesModel && ((model && !MODEL_RE.test(model)) || (effort && !EFFORT_RE.test(effort)))
   return <Section title="新建任务" extra={<span className="muted">填写目标，选择模板；提交前会显示完整契约供你确认</span>}>
     {(templates.error || baselines.error) && <p className="err">{templates.error ?? baselines.error}</p>}
     <div className="form-grid">
@@ -82,19 +83,20 @@ export function NewJob({ onCreated }: { onCreated: (jobId: string) => void }) {
     </fieldset>
     <div className="form-grid">
       {usesModel && <label>模型（留空用工作区默认值 {def.model ? `${def.model} / ${def.effort}` : '——尚未设置'}）
-        <select value={model} onChange={e => { edit(setModel)(e.target.value); setEffort('') }}>
-          <option value="">工作区默认</option>{selectable.map(s => <option key={s.model} value={s.model}>{s.model}</option>)}</select></label>}
+        {/* 可选组合作为候选，也可以手工填写（设备目录未知时）；是否可用由 controller 受理时判定。 */}
+        <input list="newjob-models" value={model} placeholder="工作区默认" onChange={e => edit(setModel)(e.target.value.trim())} />
+        <datalist id="newjob-models">{selectable.map(s => <option key={s.model} value={s.model} />)}</datalist></label>}
       {usesModel && <label>推理强度（effort）
-        <select value={effort} onChange={e => edit(setEffort)(e.target.value)}>
-          <option value="">{model ? '工作区默认' : '工作区默认'}</option>
-          {(selectable.find(s => s.model === (model || def.model))?.efforts ?? []).map((x: string) => <option key={x} value={x}>{x}</option>)}</select></label>}
+        <input list="newjob-efforts" value={effort} placeholder="工作区默认" onChange={e => edit(setEffort)(e.target.value.trim())} />
+        <datalist id="newjob-efforts">{(selectable.find(s => s.model === (model || def.model))?.efforts ?? []).map((x: string) => <option key={x} value={x} />)}</datalist></label>}
       <label>执行平台<select value={os} onChange={e => edit(setOs)(e.target.value)}>
         <option value="">任意合格设备</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label>
     </div>
     {usesModel && !!models.data?.selectable?.unknown_nodes?.length && <p className="muted">设备 {models.data.selectable.unknown_nodes.join('、')} 的模型目录未知，可选项里不包含它们可能支持的组合。</p>}
+    {badModel && <p className="err">模型或 effort 格式不对：模型以字母或数字开头，可含 . _ : / -；effort 为小写字母开头，可含数字、_ 与 -。</p>}
     {err && <p className="err" role="alert">{err}</p>}
     <div className="actions">
-      <button disabled={busy || !goal.trim()} onClick={() => void run(async () => { const n = inputs.current; const d = await api.draft(body()); if (n === inputs.current) setDraft(d) })}>{draft ? '重新生成契约' : '生成契约'}</button>
+      <button disabled={busy || !goal.trim() || !!badModel} onClick={() => void run(async () => { const n = inputs.current; const d = await api.draft(body()); if (n === inputs.current) setDraft(d) })}>{draft ? '重新生成契约' : '生成契约'}</button>
     </div>
     {p && <div className="draft">
       <h3>将提交的契约</h3>

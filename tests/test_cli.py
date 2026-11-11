@@ -30,7 +30,12 @@ class FakeConn:
         self.routes = routes
 
     def call(self, method, path, data=None):
-        return self.routes[path]
+        value = self.routes[path]
+        if isinstance(value, list):  # 依次给出的应答；其中的异常表示这一次不可达
+            value = value.pop(0) if len(value) > 1 else value[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 class Response:
@@ -66,7 +71,9 @@ class CliTests(unittest.TestCase):
         opened = []
         responses = [cli.Unreachable(),
                      Response([b'event: snapshot_required\n', b'data: {"min_seq": 5}\n', b'\n']),
-                     Response([b'id: 7\n', b'event: x\n', b'data: {"seq": 7}\n', b'\n'])]
+                     Response([b'id: 7\n', b'event: x\n', b'data: {"seq": 7}\n', b'\n']),
+                     Response([b'event: snapshot_required\n', b'data: {"min_seq": 9}\n', b'\n']),
+                     Response([])]
 
         def fake_open(url, token, method, path, *args, **kwargs):
             opened.append(path)
@@ -74,13 +81,73 @@ class CliTests(unittest.TestCase):
             if isinstance(item, Exception):
                 raise item
             return item
-        conn = FakeConn({'/events?after=4&limit=1000': {'events': [{'seq': 5}, {'seq': 6}]}})
+        conn = FakeConn({'/events?after=4&limit=1000': {'events': [{'seq': 5}, {'seq': 6}]},
+                         '/events?after=8&limit=1000': {'events': []}})
+        conn.url = conn.token = conn.ca_file = conn.controller_id = None
+        with patch.object(cli, '_open', fake_open), patch.object(cli.time, 'sleep'):
+            events = cli.stream(conn, 3)
+            seen = [next(events) for _ in range(9)]
+            next(events)  # 再连一次，看续流用的游标
+        # 先产出 SNAPSHOT 让调用方刷新状态，再补读；第 5 条仍保留的事件没有丢。
+        self.assertEqual(seen, [None, cli.SNAPSHOT, {'seq': 5}, {'seq': 6}, None, {'seq': 7}, None, cli.SNAPSHOT, None])
+        # 补读为空（事件表已清空）时从 min_seq-1 续流，下一条序号为 min_seq 的新事件不会被跳过。
+        self.assertEqual(opened, ['/events/stream?cursor=%d' % c for c in (3, 3, 6, 7, 8)])
+
+    def follow(self, events, states, timeout=3600):
+        conn = FakeConn({'/jobs/j1': job('running'), '/jobs/j1/events?limit=1000': {'events': [{'seq': 1, 'type': 'job.created', 'job_id': 'j1'}]},
+                         '/jobs?limit=1000&work_package_id=wp': {'jobs': [{'job_id': 'j2'}, {'job_id': 'j1'}]}})
+        running = {'job_id': 'j1', 'outcome': 'running', 'settled': False, 'coordination': []}
+        states = [running if s == 'running' else s for s in states]
+        with patch.object(cli, 'stream', lambda conn, cursor: iter(events)), patch.object(cli, 'settled_state', side_effect=states), \
+                redirect_stdout(io.StringIO()) as printed:
+            code = cli.follow(conn, 'j1', timeout)
+        return code, [json.loads(line) for line in printed.getvalue().splitlines()]
+
+    def test_stream_keeps_its_cursor_until_the_backlog_is_read(self):
+        opened = []
+        snapshot = [b'event: snapshot_required\n', b'data: {"min_seq": 5}\n', b'\n']
+        responses = [Response(snapshot), Response(snapshot), Response([])]
+
+        def fake_open(url, token, method, path, *args, **kwargs):
+            opened.append(path)
+            return responses.pop(0)
+        conn = FakeConn({'/events?after=4&limit=1000': [cli.Unreachable(), {'events': [{'seq': 5}]}]})
         conn.url = conn.token = conn.ca_file = conn.controller_id = None
         with patch.object(cli, '_open', fake_open), patch.object(cli.time, 'sleep'):
             events = cli.stream(conn, 3)
             seen = [next(events) for _ in range(5)]
-        self.assertEqual(seen, [None, {'seq': 5}, {'seq': 6}, None, {'seq': 7}])  # 第 5 条仍保留的事件没有丢
-        self.assertEqual(opened, ['/events/stream?cursor=3'] * 2 + ['/events/stream?cursor=6'])
+            next(events)
+        self.assertEqual(seen, [cli.SNAPSHOT, None, cli.SNAPSHOT, {'seq': 5}, None])
+        self.assertEqual(opened, ['/events/stream?cursor=%d' % c for c in (3, 3, 5)])  # 补读失败时游标不动
+
+    def test_follow_retries_its_first_requests_while_the_controller_restarts(self):
+        done = {'job_id': 'j1', 'outcome': 'done', 'settled': True, 'coordination': []}
+        conn = FakeConn({'/jobs/j1': [cli.Unreachable(), job('running')],
+                         '/jobs/j1/events?limit=1000': [cli.Unreachable(), {'events': [{'seq': 1, 'type': 'job.created', 'job_id': 'j1'}]}]})
+        with patch.object(cli, 'settled_state', side_effect=[cli.Unreachable(), done]), patch.object(cli.time, 'sleep'), \
+                redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(cli.follow(conn, 'j1', 3600), 0)
+        self.assertEqual(json.loads(printed.getvalue().splitlines()[-1])['summary']['outcome'], 'done')
+
+    def test_follow_times_out_with_the_last_summary_while_the_controller_is_unreachable(self):
+        code, lines = self.follow([None], ['running', cli.Unreachable()], timeout=0)
+        self.assertEqual((code, lines[-1]['summary']['outcome'], lines[-1]['summary']['timed_out']), (4, 'running', True))
+
+    def test_follow_refreshes_tracked_revisions_after_snapshot_required(self):
+        # 修复修订 j2 的 job.created 已被清理：刷新快照后仍能认出它的事件。
+        done = {'job_id': 'j2', 'outcome': 'done', 'settled': True, 'coordination': []}
+        code, lines = self.follow([cli.SNAPSHOT, {'seq': 9, 'type': 'attempt.progress', 'job_id': 'j2'}], ['running', 'running', done])
+        self.assertEqual((code, [l.get('job_id') for l in lines[:-1]], lines[-1]['summary']['job_id']), (0, ['j1', 'j2'], 'j2'))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
+    def test_client_credential_file_has_no_inherited_access_on_windows(self):
+        import subprocess
+        from agent_collab.artifacts import atomic_write
+        path = self.temp / 'cred.json'
+        atomic_write(path, b'{}', prepare=cli.owner_only)
+        listing = subprocess.run(['icacls', str(path)], capture_output=True, text=True, errors='replace').stdout
+        self.assertNotIn('(I)', listing)  # 继承来的 ACE 已去掉，只剩当前用户
+        self.assertEqual(path.read_bytes(), b'{}')
 
     def test_wait_keeps_waiting_through_a_controller_restart(self):
         done = dict(cli.summarize(FakeConn({'/jobs/j1/events?limit=1000': {'events': []}}), dict(job('completed'), delivery_version=1)),

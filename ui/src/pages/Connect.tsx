@@ -35,12 +35,13 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
       <header><h2>已配对的 controller</h2></header>
       <table><thead><tr><th>名称</th><th>地址</th><th>controller</th><th>权限</th><th></th></tr></thead>
         <tbody>{list.map(c => <tr key={c.id}>
-          <td>{c.name}</td><td><code>{c.url}</code></td><td><code title={c.controller_id}>{short(c.controller_id)}</code></td>
+          <td>{c.name}{c.revoked_at ? <> <span className="badge muted" title={c.revoked_at}>已撤销，待清理</span></> : null}</td><td><code>{c.url}</code></td><td><code title={c.controller_id}>{short(c.controller_id)}</code></td>
           <td><small>{(c.scopes ?? []).join('、')}</small></td>
           <td className="actions">
-            <button disabled={busy} onClick={() => open(c)}>连接</button>
+            {/* controller 已确认撤销、本机凭据还没删：连不上了，只留“忘记”来清理。 */}
+            {!c.revoked_at && <button disabled={busy} onClick={() => open(c)}>连接</button>}
             <button className="link" disabled={busy} onClick={() => {
-              if (!window.confirm('忘记这条连接会删除本机保存的凭据，并在 controller 上撤销它。确定？')) return
+              if (!window.confirm(c.revoked_at ? 'controller 已撤销这条连接，忘记只删除本机保存的凭据。确定？' : '忘记这条连接会删除本机保存的凭据，并在 controller 上撤销它。确定？')) return
               void run(async () => {
                 const r = await invoke('connection_forget', { id: c.id, revoke: true })
                 if (!r.revoked) setErr('本机的连接与凭据已删除，但没能确认 controller 已撤销这个客户端（controller 不可达、拒绝了请求、应答身份不符或本机读不到凭据）。请在另一客户端的“设置 → 客户端”里确认并撤销它。')

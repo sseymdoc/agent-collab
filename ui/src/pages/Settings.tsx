@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api, ApiError } from '../api'
 import { can, session } from '../session'
 import { isDesktop } from '../transport'
-import { Action, Badge, Json, ORIGIN, Section, applyTheme, errText, show, short, useData, when } from '../ui'
+import { Action, Badge, EFFORT_RE, Json, MODEL_RE, ORIGIN, Section, applyTheme, errText, show, short, useData, when } from '../ui'
 
 const SCOPE: Record<string, string> = { read: '读取', tasks: '任务', settings: '设置', devices: '设备', maintain: '维护' }
 const ROLE: Record<string, string> = { owner: '拥有者（全部权限）', operator: '操作者（读取 + 任务）', viewer: '只读' }
@@ -74,11 +74,17 @@ function Models({ tick }: { tick: number }) {
   const firstEffort = (m: string) => { const es = [...(catalog.get(m) ?? [])].filter(e => ok(m, e)), d = defaults.get(m); return d && es.includes(d) ? d : es[0] ?? null }
   const efforts = [...(catalog.get(cur.codex.default.model) ?? [])].filter(e => ok(cur.codex.default.model, e))
   const stale = form && base !== settings.revision
+  // 手工填写的值先按字段格式校验；空值表示未设置。
+  const bad = [[cur.codex.default.model, MODEL_RE, '执行模型'], [cur.codex.default.effort, EFFORT_RE, '执行 effort'],
+    [cur.claude.default.model, MODEL_RE, '协调模型'], [cur.claude.default.effort, EFFORT_RE, '协调 effort']]
+    .filter(([v, re]) => v != null && !(re as RegExp).test(v)).map(([, , name]) => name)
   const save = async () => {
     setMsg(null); setConflict(null)
+    const sent = form
     try {
-      await api.saveModels(base ?? settings.revision, form?.codex, form?.claude)
-      setForm(null); setMsg(['已保存', 'ok']); void view.reload()
+      const saved = await api.saveModels(base ?? settings.revision, sent?.codex, sent?.claude)
+      // 保存期间又改了的话保留这些修改，基于刚保存出的版本继续编辑。
+      setForm(f => f === sent ? null : f); setBase(saved?.revision ?? null); setMsg(['已保存', 'ok']); void view.reload()
     } catch (e) {
       if (e instanceof ApiError && e.code === 'version_mismatch') { setConflict(e.details.current); void view.reload() }
       else setMsg([e instanceof ApiError && e.details?.reason === 'model_not_allowed' ? '默认值不在许可范围内，请先调整许可范围或默认值' : errText(e), 'err'])
@@ -94,10 +100,13 @@ function Models({ tick }: { tick: number }) {
     </div>}
     <h3>执行（Codex）</h3>
     <div className="form-grid">
-      <label>默认模型<select disabled={!editable} value={cur.codex.default.model ?? ''} onChange={e => set(v => { v.codex.default = e.target.value ? { model: e.target.value, effort: firstEffort(e.target.value) } : { model: null, effort: null } })}>
-        <option value="">未设置（提交任务时必须指定）</option>{models.map(m => <option key={m} value={m}>{m}</option>)}</select></label>
-      <label>默认推理强度（effort）<select disabled={!editable || !cur.codex.default.model} value={cur.codex.default.effort ?? ''} onChange={e => set(v => { v.codex.default.effort = e.target.value || null })}>
-        {!cur.codex.default.model && <option value="">—</option>}{efforts.map(x => <option key={x} value={x}>{x}</option>)}</select></label>
+      {/* 目录里的组合作为候选，也可以手工填写：设备还没上报目录时同样能设置默认值。 */}
+      <label>默认模型<input list="settings-codex-models" disabled={!editable} value={cur.codex.default.model ?? ''} placeholder="未设置（提交任务时必须指定）"
+        onChange={e => set(v => { const m = e.target.value.trim(); v.codex.default = m ? { model: m, effort: catalog.has(m) ? firstEffort(m) : v.codex.default.effort } : { model: null, effort: null } })} />
+        <datalist id="settings-codex-models">{models.map(m => <option key={m} value={m} />)}</datalist></label>
+      <label>默认推理强度（effort）<input list="settings-codex-efforts" disabled={!editable || !cur.codex.default.model} value={cur.codex.default.effort ?? ''}
+        onChange={e => set(v => { v.codex.default.effort = e.target.value.trim() || null })} />
+        <datalist id="settings-codex-efforts">{efforts.map(x => <option key={x} value={x} />)}</datalist></label>
     </div>
     <fieldset disabled={!editable}><legend>部署许可范围</legend>
       <label className="row"><input type="radio" checked={!allowed} onChange={() => set(v => { v.codex.allowed = null })} /> 不限制：设备目录里的任何模型与 effort 都可以用</label>
@@ -121,7 +130,8 @@ function Models({ tick }: { tick: number }) {
       <label>协调推理强度（effort）<input disabled={!editable || !cur.claude.default.model} value={cur.claude.default.effort ?? ''} onChange={e => set(v => { v.claude.default.effort = e.target.value.trim() || null })} /></label>
     </div>
     {editable ? <p className="actions">
-      <button className="primary" disabled={!form || (!!allowed && !Object.keys(allowed).length)} onClick={() => void save()}>保存</button>
+      <button className="primary" disabled={!form || !!bad.length || (!!allowed && !Object.keys(allowed).length)} onClick={() => void save()}>保存</button>
+      {!!bad.length && <small className="err">{bad.join('、')}格式不对：模型以字母或数字开头，可含 . _ : / -；effort 为小写字母开头，可含数字、_ 与 -。</small>}
       {form && <button onClick={() => { setForm(null); setMsg(null); setConflict(null) }}>撤销修改</button>}
       {msg && <small className={msg[1]}>{msg[0]}</small>}
     </p> : <p className="muted">这条连接没有“设置”权限，只能查看。</p>}

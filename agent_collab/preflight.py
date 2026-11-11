@@ -43,10 +43,11 @@ def _secret(path):
 class _Redactor:
     def __init__(self):
         self.values = set()
+        self.short = set()  # 环境块里的短值：不做全局替换，只用来判断自由文本行能否安全输出
 
     def remember(self, value, minimum=1):
-        if isinstance(value, str) and len(value) >= minimum and value != REDACTED:
-            self.values.add(value)
+        if isinstance(value, str) and value and value != REDACTED:
+            (self.values if len(value) >= minimum else self.short).add(value)
         elif isinstance(value, dict):
             for child in value.values():
                 self.remember(child, minimum)
@@ -63,7 +64,7 @@ class _Redactor:
                     result[key] = REDACTED
                 elif key.lower() in ('env', 'environment', 'environmentvariables'):
                     # 记住被遮蔽的值：逐行扫描同一文件时，这些值也不能以原文出现在引用里。
-                    # 环境块里多是 "1"、"true" 这类短值，它们不是凭据，按原文替换会把报告里的版本号等一并改坏。
+                    # 短值（"1"、"true"，也可能是短口令）若全局替换会改坏报告里的版本号等，单独记下，见 free_text。
                     self.remember(child, minimum=8)
                     result[key] = REDACTED
                 else:
@@ -96,6 +97,14 @@ class _Redactor:
         value = re.sub(r'(?i)(--(?:\w+-)*(?:%s)\s+).*' % _SENSITIVE_WORDS, r'\1' + REDACTED, value)
         if re.search(r'(?i)(?:^|\s)(?:export\s+|Environment(?:Variables)?\s*=)|\b[A-Z_][A-Z0-9_]*=', value):
             return REDACTED
+        return value
+
+    def free_text(self, value):
+        """从文件里原样取出的行（引用、服务命令）：含有环境块短值作为独立片段时整行遮蔽，无法只遮那一段而不误伤。"""
+        value = self.text(value)
+        for secret in self.short:
+            if re.search(r'(?<![\w.-])' + re.escape(secret) + r'(?![\w.-])', value):
+                return REDACTED
         return value
 
     def strings(self, value):
@@ -704,8 +713,13 @@ def inventory(controller_data_dir=None, node_data_dirs=(), install_roots=(), leg
     report['cutover_preconditions'] = [dict(id=ident, ok=ok, detail=detail) for ident, ok, detail in checks]
     report['plan'] = _plan(report)
     report = reader.redactor.strings(report)
+    # 放在全部来源读完之后：环境块可能出现在比引用行更晚读取的文件里。
+    for installation in report['installations']:
+        for service in installation['services']:
+            if isinstance(service.get('command'), str):
+                service['command'] = reader.redactor.free_text(service['command'])
     for reference in report['legacy']['references']:
-        reference['text'] = reference['text'][:200]
+        reference['text'] = reader.redactor.free_text(reference['text'])[:200]
     return report
 
 

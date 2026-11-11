@@ -167,8 +167,14 @@ class EventsTest(ControllerCase):
         self.assertTrue(stream.startswith(b'event: snapshot_required\n'))
         self.assertIn(b'"min_seq"', stream)
         self.assertEqual(len(self.call('GET', '/events')['events']), 1)
+        # 流按 seq > cursor 续读：游标为 min_seq-1 时没有漏掉任何保留的事件，直接续流，不要求快照。
+        kept = self.call('GET', '/events')
+        self.assertTrue(self.stream('?cursor=%d' % (kept['min_seq'] - 1)).startswith(('id: %d\n' % kept['min_seq']).encode()))
         self.app.store.prune_events(0)
         self.assertTrue(self.stream('?cursor=0').startswith(b'event: snapshot_required'))
+        # 事件表清空时 min_seq 是下一个序号：补读为空的客户端以 min_seq-1 续流，不能再次被要求快照。
+        empty = self.call('GET', '/events')
+        self.assertEqual((empty['events'], self.stream('?cursor=%d' % (empty['min_seq'] - 1))), ([], b': ping\n\n'))
 
 
 class BackupTest(ControllerCase):

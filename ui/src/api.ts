@@ -111,6 +111,8 @@ export const api = {
   job: (id: string) => call('GET', '/jobs/' + id),
   jobEvents: (id: string, before: number) => call('GET', '/jobs/' + id + '/events?limit=200&before=' + before),
   explain: (id: string) => call('GET', '/jobs/' + id + '/explain'),
+  // 全局事件按序号补读：after 之后的事件，按序号升序。
+  events: (after: number, limit = 1000) => call('GET', '/events?after=' + after + '&limit=' + limit),
   nodes: () => call('GET', '/nodes'),
   doctor: () => call('GET', '/doctor'),
   diff: (cp: string, against: string) => call('GET', '/checkpoints/' + cp + '/diff?against=' + encodeURIComponent(against)),

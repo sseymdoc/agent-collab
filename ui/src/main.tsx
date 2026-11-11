@@ -76,7 +76,11 @@ function App() {
       <div className="actions"><button onClick={() => void boot()}>重试</button><button className="link" onClick={() => leave(null)}>改用令牌登录</button></div></div>
     : <p className="muted">连接 controller…</p>}</main>
   if (phase.at === 'login') return isDesktop
-    ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={async opened => { setEpoch(opened.epoch); await enter().catch(e => leave(errText(e))) }} />
+    ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={async opened => {
+      setEpoch(opened.epoch)
+      // 只在失败的仍是当前这条连接时离开：期间若已换了连接，旧身份请求的失败不能关掉新连接。
+      await enter().catch(e => { if (currentEpoch() === opened.epoch) leave(errText(e)) })
+    }} />
     : <Login onDone={() => void enter().catch(e => setPhase(p => ({ ...p, at: 'boot', error: errText(e) })))} />
   // 浏览器退出要等 DELETE /session 答复后再显示登录页：否则马上重新登录时，迟到的旧答复会清掉新会话的 Cookie 和 CSRF 令牌。
   return <Shell key={phase.generation} onLeave={() => isDesktop ? leave(null) : void api.logout().catch(() => {}).finally(() => leave(null))} />

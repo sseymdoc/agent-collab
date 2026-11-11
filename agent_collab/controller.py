@@ -1551,7 +1551,7 @@ class App:
     def sse_batch(self, cursor):
         minimum = self.min_seq()
         # Cursor zero on an unpruned stream means 'from the beginning'.
-        if minimum > 1 and cursor < minimum:
+        if minimum > 1 and cursor < minimum - 1:
             return [b'event: snapshot_required\ndata: ' + p.canonical_json({'min_seq': minimum}) + b'\n\n']
         events = self.store.events(cursor, 1000)
         return [('id: %d\nevent: %s\ndata: ' % (e['seq'], e['type'])).encode() + p.canonical_json(e) + b'\n\n' for e in events] or [b': ping\n\n']

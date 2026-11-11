@@ -276,6 +276,16 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(any(r['code'] == 'json_unreadable' and 'deep.json' in r['detail'] for r in report['risks']))
         self.assertNotIn('deep.json', {Path(r['file']).name for r in report['legacy']['references']})
 
+    def test_short_environment_values_hide_free_text_lines_without_global_replacement(self):
+        self.seed()
+        # 六位口令只出现在另一个文件的环境块里，不带任何凭据标记；后读到的环境块也要生效。
+        (self.scans / 'a-notes.txt').write_text('launcher.py 123456\nlauncher.py 1234567890\n', encoding='utf-8')
+        (self.scans / 'z-env.json').write_text(json.dumps({'env': {'PIN': '123456'}}), encoding='utf-8')
+        report = self.report()
+        texts = [r['text'] for r in report['legacy']['references'] if Path(r['file']).name == 'a-notes.txt']
+        self.assertEqual(texts, ['[redacted]', 'launcher.py 1234567890'])  # 只遮含有该值的行，不做子串替换
+        self.assertNotIn('123456"', json.dumps(report))
+
     def test_symlinked_backup_archive_does_not_count_as_a_backup_set(self):
         self.seed(idle=True)
         backups = self.controller.parent / 'backups'

@@ -1,6 +1,7 @@
 """隔离副本上的升级预演：身份、契约与历史不变，模型设置按规则迁移，旧 attempt 的结果被隔离，备份集与原数据目录不被改动。"""
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import uuid
@@ -122,6 +123,54 @@ class RehearseTests(ControllerCase):
         with patch.object(rehearse, 'restore', lossy):
             report = rehearse.rehearse(self.temp / 'backup', self.temp / 'work', config)
         self.assertFalse(next(c for c in report['checks'] if c['id'] == 'event_history_kept')['ok'])
+
+    def test_event_ownership_changes_are_detected(self):
+        self.old_deployment()
+        backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        config = self.temp / 'config.json'
+        config.write_text(json.dumps(tc.CONFIG), encoding='utf-8')
+        real = rehearse.restore
+
+        def reassigned(data, source):
+            generation = real(data, source)
+            with sqlite3.connect(str(data / 'controller.db')) as db:
+                db.execute('UPDATE events SET job_id=? WHERE seq=(SELECT MIN(seq) FROM events WHERE job_id IS NOT NULL)', (str(uuid.uuid4()),))
+            db.close()
+            return generation
+        with patch.object(rehearse, 'restore', reassigned):
+            report = rehearse.rehearse(self.temp / 'backup', self.temp / 'work', config)
+        self.assertFalse(next(c for c in report['checks'] if c['id'] == 'event_history_kept')['ok'])
+
+    def test_report_may_not_overwrite_the_generated_copy(self):
+        self.job()
+        backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        work = self.temp / 'w'
+        with patch('sys.stderr'):
+            code = rehearse.main(['--backup', str(self.temp / 'backup'), '--work', str(work), '--out', str(work / 'controller' / 'controller.db')])
+        self.assertEqual((code, work.exists()), (2, False))  # 拒绝时还没开始预演
+        with patch('sys.stdout'):
+            self.assertEqual(rehearse.main(['--backup', str(self.temp / 'backup'), '--work', str(work), '--out', str(work / 'report.json')]), 0)
+        self.assertTrue(json.loads((work / 'report.json').read_text(encoding='utf-8'))['ok'])
+
+    def test_report_may_not_overwrite_a_backup_file_reached_through_a_symlink(self):
+        self.job()
+        saved = backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        database = self.temp / 'backup' / json.loads((self.temp / 'backup' / 'backup-manifest.json').read_text(encoding='utf-8')).get('database', 'controller.db')
+        outside = self.temp / 'outside.db'
+        database.replace(outside)
+        try:
+            database.symlink_to(outside)
+        except OSError:
+            outside.replace(database)
+            self.skipTest('symlink unavailable')
+        alias = self.temp / 'alias.db'
+        os.link(str(outside), str(alias))
+        before = outside.read_bytes()
+        for n, out in enumerate((outside, alias)):
+            with patch('sys.stderr'):
+                code = rehearse.main(['--backup', str(self.temp / 'backup'), '--work', str(self.temp / ('s%d' % n)), '--out', str(out)])
+            self.assertEqual(code, 2)
+        self.assertEqual((outside.read_bytes(), saved['db_sha256']), (before, hashlib.sha256(before).hexdigest()))
 
     def test_report_may_not_overwrite_the_backup_set_or_the_config(self):
         self.job()

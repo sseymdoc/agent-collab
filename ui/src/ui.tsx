@@ -17,6 +17,10 @@ export function applyTheme(v: string | null) {
   else delete document.documentElement.dataset.theme
 }
 
+// 模型与 effort 的字段格式（docs/protocol.md §12.3）：手工输入时先在页面校验，controller 仍会再校验。
+export const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}$/
+export const EFFORT_RE = /^[a-z][a-z0-9_-]{0,31}$/
+
 export function show(v: unknown): string {
   if (v === null || v === undefined || v === '') return UNKNOWN
   if (typeof v === 'boolean') return v ? '是' : '否'
