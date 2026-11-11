@@ -173,7 +173,7 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 
 prompt 经 stdin 传入，context.json 全文内嵌在 prompt 末尾，要求仅返回结构化决策；`--tools ""` 不授予任何工具（含读文件）。适配器只解析 stdout JSON 的 structured_output，不从 result 自由文本猜测 JSON。固定 schema 由 controller/adapter 共用并在本地复核：follow_up 只是修复请求 `{title, goal, acceptance, instructions, effort}`，不含完整契约；完整的 codex 修复契约由 controller 基于被验收检查点与目标契约派生。结构化输出通过 schema 即由 agent 原子写入 decision.json，再走已有 final checkpoint 上传和 complete outbox；不合 schema 的结果失败且不写该文件。依赖目标状态的校验（租约归属、检查点、预算、副作用）只在 controller 进行：验收结论合法时一定记录，修复请求无法生成合法契约时写 coordinator.follow_up_rejected 而不是丢弃整个决策。
 
-进程使用现有 OwnedProcess 生命周期管理；每次协调创建新的 session UUID，不 resume 旧 Claude 会话，不读取任何登录文件或 transcript。runtime.model/effort 记录请求的配置值，runtime.observed 为 null，不将请求值冒充模型实际观测。进程输出包含认证失败时分类 auth_expired；controller 可据此标记 claude 的 auth_health 为 expired。认证恢复沿用节点报告 ok/管理员处理的既有机制。
+进程使用现有 OwnedProcess 生命周期管理；每次协调创建新的 session UUID，不 resume 旧 Claude 会话，不读取任何登录文件或 transcript。runtime.model/effort 记录请求的配置值，runtime.observed 为 null，不将请求值冒充模型实际观测。进程输出包含认证失败时分类 auth_expired，controller 据此标记 claude 的 auth_health 为 expired；本进程读不到凭据存储时例外，记为 capability_missing（见上文认证探测）。认证恢复沿用节点报告 ok/管理员处理的既有机制。
 
 Claude 与 Codex 使用相同命令解析规则。提示词要求 method、result、notes 以及 follow_up 的
 title/goal/acceptance/instructions 使用简体中文，字段名与结构化枚举保持不变；未调用真实模型验证语言遵循情况。
@@ -270,7 +270,7 @@ rc4 已有回执/写入意图会导入同一进度路径，避免升级后再次
 ```
 
 `tests/fake_controller.py` 仅为进程内端点 fixture，不含生产调度逻辑。
-测试临时目录均在仓库 `.dev/tmp` 内，结束清理；agent 的进程内测试不需要 socket，不访问网络，不调用模型。
+agent 测试的临时目录在仓库 `.dev/tmp` 内，结束清理（`test_e2e_local.py` 可用 `AGENT_COLLAB_TEST_TMP` 改位置，部分构建与安装测试用系统临时目录）；agent 的进程内测试不需要 socket，不访问网络，不调用模型。
 Windows 专属测试在其他平台跳过，需在 Windows 上运行才能覆盖。
 `test_agent_restart_controller.py` 使用真实 `App.handle` 做进程内重启集成验证；
 端到端测试 `test_e2e_local.py` 需要 loopback socket，环境不允许打开 loopback socket（如受限沙箱）时跳过。

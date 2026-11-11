@@ -33,9 +33,9 @@
 ```
 
 `recovery.auto` 缺省为 true，这时契约必须带 `inputs_manifest`（没有输入文件就写上面的空基线），且清单里的 blob 都已上传，
-否则任务停在 `waiting_capability`（原因含 `protection_not_ready`），不会派给任何节点。`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
+否则任务停在 `waiting_capability`，不会派给任何节点（`status_reason` 中会有 `protection_not_ready`，或在没有注册节点时只有 `no_registered_nodes` 与 `missing_blobs:…`）。清单完整而缺 blob 时补传 blob 即可解除；提交时没带 `inputs_manifest` 则无法补救（契约受理后不可修改），要取消该任务、补上清单后重新提交。`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
 `waiting_capability`，不会派到不满足条件的节点；等待计入 `budgets.deadline_s`（缺省 3600 秒），从首次提交起算，到期后任务转为
-`failed`（`budget_exhausted:deadline_s`）。需要等更久时调大该预算，或在失败后重新提交。管理令牌只在 controller 主机上时，从其他机器提交有两种做法：
+`failed`（`budget_exhausted:deadline_s`）。需要等更久时调大该预算，或在失败后重新提交：期限按工作包（`work_package_id`）的首次创建时间计算，沿用旧的 `work_package_id` 不会重新计时，预算已耗尽时还会直接拒绝，所以重新提交时省略 `work_package_id`（新建工作包）；`request_id` 也要用新的，CLI 未提供时会自动生成。管理令牌只在 controller 主机上时，从其他机器提交有两种做法：
 经云厂商的远程执行通道在 controller 主机上以服务用户运行同一条命令（令牌不离开该主机），
 或使用已安全交给执行用户、仅其可读的令牌副本直接访问 `<CONTROLLER>`：
 
@@ -109,7 +109,7 @@ $Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).conf
 "$PREFIX/bin/agent-collab" api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file <DATA>/admin.token
 ```
 
-`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点继续：有 durable 检查点时从最新的那个开始，没有时从 inputs 基线开始。合格指该节点在线（心跳新鲜，即服务在运行；macOS、Windows 的服务只在用户登录后运行，Linux 启用 linger 后无人登录也可在线）、所需 harness 的认证未被确认过期（`unknown` 不排除）、能取得恢复所需的检查点与输入，并具备契约 `requirements` 要求的平台、工具和硬件；只有某个平台或某块硬件能做的任务，等待符合条件的节点，不会换到别的平台上执行。
+`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点继续：有 durable 检查点时从最新的那个开始，没有时从 inputs 基线开始。合格指该节点在线（心跳新鲜，即服务在运行；macOS、Windows 的服务只在用户登录后运行，Linux 启用 linger 后无人登录也可在线）、所需 harness 的认证未被确认过期（`unknown` 不排除）、能取得恢复所需的检查点与输入，并具备契约 `requirements` 要求的平台、工具和硬件；只有某个平台或某块硬件能做的任务，等待符合条件的节点，不会换到别的平台上执行。任务本身也要允许自动恢复：`recovery.auto=false`、`side_effects=manual`、存在状态未知的副作用或预算耗尽时，任务进入 `waiting_reconcile` 或 `failed`，不会自动接管；接管迟迟没有发生时查看任务的 `status` 与 `status_reason`。
 
 ## 停用、启动与退役节点
 
