@@ -462,6 +462,8 @@ class EffectiveTests(unittest.TestCase):
         expected[expected.index('--json-schema') + 1] = '<decision-schema>'
         expected[expected.index('--session-id') + 1] = '<session-id>'
         self.assertEqual(effective['harness']['claude']['managed_argv'], expected)
+        self.assertEqual(effective['harness']['claude']['managed_env'], {'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'})
+        self.assertNotIn('managed_env', effective['harness']['codex'])
         for name in ('codex', 'claude'):
             entry = effective['harness'][name]
             self.assertEqual(entry['argv'], shown[name])
@@ -474,6 +476,44 @@ class EffectiveTests(unittest.TestCase):
         for secret in ('node-secret-value', 'lease-secret-value', 'node_token_sha256', 'admin-secret-value',
                        'private-inherited-path', 'thread-secret-value', 'origin-secret-value', 'env-secret-value'):
             self.assertNotIn(secret, serialized)
+
+    def test_doctor_separates_its_own_auth_probe_from_the_worker_service_result(self):
+        # doctor 在 Mac 的 SSH 会话里读不到钥匙串：自己的结果是 unknown 并写明原因，worker 在图形会话里验证过的 ok 原样另列。
+        node.save(self.temp / 'agent.json', self.config)
+        commands = resolve_commands(self.config, self.environment, system='Linux')
+        keychain = [36]
+        def runner(argv, **kwargs):
+            if argv[0] == '/usr/bin/security':
+                return subprocess.CompletedProcess(argv, keychain[0], '', 'User interaction is not allowed.')
+            if 'auth' in argv:
+                return subprocess.CompletedProcess(argv, 1, '{"loggedIn": false, "authMethod": "none"}', '')
+            return subprocess.CompletedProcess(argv, 0, 'Logged in using ChatGPT' if 'login' in argv else 'fixture 1', '')
+        def doctor(ssh):
+            env = {k: v for k, v in os.environ.items() if k not in ('SSH_CONNECTION', 'SSH_CLIENT')}
+            env.update({'SSH_CONNECTION': '192.0.2.1 50000 192.0.2.2 22'} if ssh else {})
+            with patch.object(node.shutil, 'which', return_value=None), patch.dict(os.environ, env, clear=True), \
+                    patch.object(node.platform, 'release', return_value='6.1-generic'):
+                return node.doctor(self.temp, lambda *args: (200, {}, b'{"ok": true}'), commands=commands, runner=runner, system='Darwin')
+        report = doctor(True)
+        self.assertEqual(report['auth_health'], {'codex': 'ok', 'claude': 'unknown'})
+        source = report['auth_source']
+        self.assertEqual((source['context'], source['via_ssh']), ('doctor_process', True))
+        self.assertEqual(source['reasons'], {'codex': 'logged_in', 'claude': 'credential_store_unreadable'})
+        self.assertTrue(source['checked_at'].endswith('Z'))
+        self.assertIsNone(report['worker_auth'])  # 没有 status.json
+        node.save(self.temp / 'status.json', dict(version='x', pid=42, last_heartbeat_ok_at='2026-11-11T00:00:00Z'))
+        self.assertIsNone(doctor(False)['worker_auth'])  # 旧版本 worker 没写认证字段
+        node.save(self.temp / 'status.json', dict(version='x', pid=42, last_heartbeat_ok_at='2026-11-11T00:00:05Z',
+                  auth_health={'codex': 'ok', 'claude': 'ok'}, auth_checked_at='2026-11-11T00:00:00Z'))
+        report = doctor(False)
+        self.assertFalse(report['auth_source']['via_ssh'])
+        self.assertEqual(report['auth_health']['claude'], 'unknown')
+        self.assertEqual(report['worker_auth'], dict(context='worker_service', auth_health={'codex': 'ok', 'claude': 'ok'},
+            checked_at='2026-11-11T00:00:00Z', pid=42, last_heartbeat_ok_at='2026-11-11T00:00:05Z'))
+        # 钥匙串可读时，同样的 CLI 输出是有依据的失效。
+        keychain[0] = 0
+        report = doctor(False)
+        self.assertEqual((report['auth_health']['claude'], report['auth_source']['reasons']['claude']), ('expired', 'not_logged_in'))
 
     def test_effective_is_redacted_even_when_display_fields_contain_credentials(self):
         config = dict(self.config, labels=['node-secret-value', 'lease-secret-value'])

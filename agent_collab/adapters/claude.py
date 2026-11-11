@@ -15,6 +15,10 @@ def classify_failure(text, returncode=None, abnormal=False):
     return classify_process_failure(text, returncode, abnormal)
 
 
+# 自动记忆不受 --setting-sources 控制（rc9 参数实测会带入工作目录对应项目的 MEMORY.md）；--safe-mode 已关闭它，这里再显式关一次。
+MANAGED_ENV = {'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1'}
+
+
 def build_argv(command, params, schema, session_id):
     command = [command] if isinstance(command, str) else list(command)
     if not command or not all(isinstance(x, str) and x for x in command):
@@ -24,15 +28,16 @@ def build_argv(command, params, schema, session_id):
     return command + ['-p', '--model', params['model'], '--effort', params['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(schema).decode(),
             '--permission-mode', 'dontAsk', '--tools', '', '--session-id', p.check_uuid(session_id),
-            # --setting-sources local 仍会读取工作目录及各级上级目录的 CLAUDE.local.md；--safe-mode 关闭全部记忆文件与定制。
-            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode']
+            # 受管回合不需要任何 user/project/local 设置：来源列表为空（local 仍会读取各级 CLAUDE.local.md 与本地设置文件）。
+            # --safe-mode 再关闭记忆文件、插件、hooks 等定制；订阅登录、模型选择与管理员下发的托管策略不受影响。
+            '--strict-mcp-config', '--setting-sources', '', '--safe-mode']
 
 
 class ClaudeAdapter:
     def __init__(self, context, command='claude', process_factory=OwnedProcess, env=None):
         self.context, self.command, self.process_factory = context, command, process_factory
         self.process = None
-        self.env = dict(os.environ if env is None else env)
+        self.env = dict(os.environ if env is None else env, **MANAGED_ENV)
         self.done = False
         self.session_id = str(uuid.uuid4())
         self.decision = None

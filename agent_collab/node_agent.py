@@ -24,7 +24,7 @@ from .adapters.codex import CodexAdapter, process_stamp, process_status
 from .adapters.claude import ClaudeAdapter
 from .adapters.stub import StubAdapter
 from .adapters.checks import ContractChecks
-from .adapters.commands import CODEX_CLEARED_ENV, resolve_commands, probe_auth
+from .adapters.commands import CODEX_CLEARED_ENV, resolve_commands, probe_auth, probe_auth_detail
 from .release import VERSION, release_info, version_directory
 
 LOG = logging.getLogger(__name__)
@@ -590,6 +590,7 @@ class Agent:
         if not 0 < self.auth_probe_s < float('inf'):
             raise ValueError('auth_probe_s must be positive and finite')
         self.auth_health = {'codex': 'unknown', 'claude': 'unknown'}
+        self.auth_checked_at = None
         self.auth_thread = None
         self.next_auth_probe = 0
         self.refresh_auth()
@@ -630,8 +631,9 @@ class Agent:
             return
         self.next_auth_probe = self.clock() + self.auth_probe_s
         def run():
-            self.auth_health = {name: probe_auth(name, command, self.auth_runner)
+            self.auth_health = {name: probe_auth(name, command, self.auth_runner, self.system)
                                 for name, command in self.commands.items()}
+            self.auth_checked_at = now()
         if background:
             self.auth_thread = threading.Thread(target=run, name='auth-status', daemon=True)
             self.auth_thread.start()
@@ -691,8 +693,10 @@ class Agent:
         result = self.client.json('POST', '/nodes/' + self.config['node_id'] + '/heartbeat',
             dict(authority_generation=self.generation, attempts=states,
                  auth_health=self.auth_health))
+        # auth_health 是本服务进程上下文里的探测结果；doctor 读它来与自己（可能在 SSH 会话里）的探测分开显示。
         save(self.directory / 'status.json', dict(self.release, pid=os.getpid(),
-             version_dir=str(version_directory()), last_heartbeat_ok_at=now()))
+             version_dir=str(version_directory()), last_heartbeat_ok_at=now(),
+             auth_health=self.auth_health, auth_checked_at=self.auth_checked_at))
         for item in result.get('revoked', []):
             if item['attempt_id'] in self.attempts:
                 self.attempts[item['attempt_id']].quarantine(item['reason'])
@@ -983,9 +987,20 @@ def effective_configuration(config, directory, commands, capabilities, system=No
                                             d.DECISION_SCHEMA, session)
                 managed[managed.index('--json-schema', len(argv)) + 1] = '<decision-schema>'
                 managed[managed.index('--session-id', len(argv)) + 1] = '<session-id>'
+                entry['managed_env'] = dict(claude.MANAGED_ENV)
             entry['managed_argv'] = shown + managed[len(argv):]
         harness[name] = entry
     return dict(node=node, agent=agent, harness=harness)
+
+
+def worker_auth(directory):
+    """worker 服务进程自己探测、随成功心跳写入 status.json 的认证结果；rc9 及更早的 worker 不写这两项。"""
+    try:
+        status = load(Path(directory) / 'status.json')
+        return dict(context='worker_service', auth_health=status['auth_health'], checked_at=status['auth_checked_at'],
+                    pid=status.get('pid'), last_heartbeat_ok_at=status.get('last_heartbeat_ok_at'))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def doctor(data_dir, transport=None, commands=None, runner=None, system=None):
@@ -1052,10 +1067,15 @@ def doctor(data_dir, transport=None, commands=None, runner=None, system=None):
         # agent.json 里的值类型不对（如 labels 不是字符串列表）：配置检查记为失败，其余检查照常返回。
         checks['configuration'] = False
         effective = dict(error_type=type(exc).__name__)
+    # auth_health 是本次 doctor 进程自己的探测，只输出、不上报 controller；worker 服务上下文的结果在 worker_auth。
+    auth = {name: probe_auth_detail(name, command, runner, system) for name, command in commands.items()}
     result = dict(ok=all(value for key, value in checks.items() if key != 'harness'),
                   checks=checks, restart_blockers=blockers, warnings=warnings, capabilities=capabilities,
-                  auth_health={name: probe_auth(name, command, runner) for name, command in commands.items()},
-                  effective=effective)
+                  auth_health={name: value[0] for name, value in auth.items()},
+                  auth_source=dict(context='doctor_process', checked_at=now(),
+                                   via_ssh=bool(os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_CLIENT')),
+                                   reasons={name: value[1] for name, value in auth.items()}),
+                  worker_auth=worker_auth(directory), effective=effective)
     return redact(result, secrets)
 
 

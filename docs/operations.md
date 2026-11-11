@@ -19,6 +19,30 @@
 | CLI 管理调用 | `"$PREFIX/bin/agent-collab" api GET /overview --url <CONTROLLER> --token-file <DATA>/admin.token`（证书始终校验；非 loopback 必须 https）。Linux 受管安装中令牌文件仅 `agent-collab` 可读：在 controller 主机上以 `runuser -u agent-collab --` 执行，或改用已安全交给执行用户、仅其可读的令牌副本 |
 | doctor | `"$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role controller` |
 
+## 提交任务与平台约束
+
+任务经 controller 的 `POST /jobs` 提交，`agent-collab submit <任务.json>` 与 `agent-collab api POST /jobs --data <JSON|@文件>` 是同一个接口。
+提交方不需要是节点：任何能以管理令牌访问 controller 的机器都可以提交，由 controller 按契约的 `requirements` 选择节点。
+要把任务限定在某个平台或硬件上，写 `requirements`，不要绕过 controller 直接登录目标机器启动模型：
+
+```json
+{"title": "只在 Windows 节点执行",
+ "contract": {"goal": "…", "harness": "stub", "harness_params": {"steps": [{"run": ["{python}", "-c", "print('ok')"]}]},
+              "requirements": {"os": ["windows"], "arch": [], "tools": [], "gpu": null, "labels": []}}}
+```
+
+`os` 取 `windows`、`macos`、`linux`；`gpu` 可写 `"cuda"`；`tools`、`labels` 要求节点上报了对应工具或标签。没有节点满足时任务停在
+`waiting_capability`，不会派到不满足条件的节点。管理令牌只在 controller 主机上时，从其他机器提交有两种做法：
+经云厂商的远程执行通道在 controller 主机上以服务用户运行同一条命令（令牌不离开该主机），
+或使用已安全交给执行用户、仅其可读的令牌副本直接访问 `<CONTROLLER>`：
+
+```sh
+# 在 controller 主机上（或经远程执行通道），任务内容以 base64 传入，不落盘
+runuser -u agent-collab -- "$PREFIX/bin/agent-collab" api POST /jobs --data "$(echo <任务.json 的 base64> | base64 -d)" \
+  --url http://127.0.0.1:18669 --token-file <DATA>/admin.token
+runuser -u agent-collab -- "$PREFIX/bin/agent-collab" api GET /jobs/<job_id> --url http://127.0.0.1:18669 --token-file <DATA>/admin.token
+```
+
 ## 节点配对
 
 在 controller 主机以服务用户生成一次性配对码（10 分钟有效），不要以 root 直接写数据库：
@@ -82,7 +106,7 @@ $Python = (Get-Content -Raw "$Prefix\installation.json" | ConvertFrom-Json).conf
 "$PREFIX/bin/agent-collab" api POST /jobs/<job_id>/cancel --data '{"expected_version":<版本>}' --url <CONTROLLER> --token-file <DATA>/admin.token
 ```
 
-`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点从确认检查点继续。
+`<版本>` 取自 `GET /nodes` 或 `GET /jobs/<id>` 的 `version`；过期返回 `409 version_mismatch`，重新读取后再提交。节点失联后的自动恢复无需操作：租约到期（默认 90s）即判失联，满足条件时自动在其他合格节点从确认检查点继续。合格指该节点在线（用户已登录、服务在运行）、认证正常、能取得恢复所需的检查点与输入，并具备契约 `requirements` 要求的平台、工具和硬件；只有某个平台或某块硬件能做的任务，等待符合条件的节点，不会换到别的平台上执行。
 
 ## 停用、启动与退役节点
 

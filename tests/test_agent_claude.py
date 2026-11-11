@@ -38,8 +38,11 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(argv, ['/custom/claude', '-p', '--model', PROFILE['model'], '--effort', PROFILE['effort'],
             '--output-format', 'json', '--json-schema', p.canonical_json(d.DECISION_SCHEMA).decode(),
             '--permission-mode', 'dontAsk', '--tools', '', '--session-id', session,
-            '--strict-mcp-config', '--setting-sources', 'local', '--safe-mode'])
+            '--strict-mcp-config', '--setting-sources', '', '--safe-mode'])
         self.assertNotIn('--bare', argv)
+        # 自动记忆不受来源列表控制：适配器环境里显式关闭，且不被继承环境覆盖。
+        adapter = ClaudeAdapter(None, '/custom/claude', env={'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '0', 'KEEP': 'x'})
+        self.assertEqual(adapter.env, {'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1', 'KEEP': 'x'})
         for value in ({}, {'model': 'x'}, {'model': 'x', 'effort': ''}):
             with self.assertRaises(ValueError):
                 build_argv('claude', value, d.DECISION_SCHEMA, session)

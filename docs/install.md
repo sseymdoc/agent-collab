@@ -95,8 +95,10 @@ Windows 使用当前交互用户 SID、InteractiveToken、LeastPrivilege、“�
 不索取账户密码。登出后没有交互令牌，不能保证任务继续运行。worker 优先用 `--python` 同目录的 pythonw.exe，
 不存在时沿用指定解释器（通常为 python.exe）。任务有两个触发器：登录触发器在登录时立即启动；
 时间触发器以过去时刻为起点、每 1 分钟无限重复（无 Duration，StopAtDurationEnd=false），拉起已退出的进程。
-MultipleInstancesPolicy=IgnoreNew 防止重叠，已有实例运行时重复触发被忽略。实测依据：进程被强制结束后
-RestartOnFailure（保留，间隔 1 分钟、最多 3 次）不会重启它；挂在登录触发器上的重复要到下一次登录才生效，
+MultipleInstancesPolicy=IgnoreNew 防止重叠，已有实例运行时重复触发被忽略。恢复依赖这个一分钟的触发周期，
+不是固定的恢复时限：一次实测中进程被强制结束后约 12 秒被拉起，实际间隔取决于退出时刻落在周期的哪个位置和任务计划程序的调度。
+采用时间触发器的依据是同一台机器上的实测：原任务定义里的 RestartOnFailure（保留，间隔 1 分钟、最多 3 次）
+没有覆盖进程被强制结束这种退出；挂在登录触发器上的重复要到下一次登录才生效，
 而安装和升级都是在会话中途重新注册任务。安装器停止任务前先禁用它，启动时重新启用，避免触发器在切换版本期间拉起进程。
 安装器在停止与启动之间被强行终止时，任务停留在禁用状态、不会自行恢复：按“Doctor、drain、升级、回退”一节核对安装状态后运行 `service start`。
 agent.lock 在 Windows 使用非阻塞字节锁、POSIX 使用 flock，第二个同数据目录进程立即失败。
@@ -219,7 +221,8 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 SSH 只用于安装、启动、诊断和恢复。任务的领取、续租、事件与工件上传都走 worker 自己的出站 HTTPS 连接：
 经 SSH 发出 `service start` 后可以断开，worker 由计划任务或 LaunchAgent 托管并继续运行。任务结果从 controller 查询，
 worker 是否在运行、心跳是否新鲜从 `service status` 查询。不要用 `Start-Job`、`nohup` 或 `ssh host claude ...` 代替受管服务：
-直接经 SSH 打开的模型会话没有检查点，也不会被接管。固定的 `service` 命令是运维约定，SSH 本身不限制命令。
+直接经 SSH 打开的模型会话没有检查点，也不会被接管。固定的 `service` 命令是运维约定，SSH 本身不限制命令：
+入口限制的是来源地址、账户和公钥，不是可执行的命令，不能当作命令白名单或最小权限入口。
 
 Windows 使用 Microsoft OpenSSH Server。`installer/windows-ssh-management.ps1` 在管理员 PowerShell 中运行，
 只接受公钥认证、一个账户和列出的来源地址：

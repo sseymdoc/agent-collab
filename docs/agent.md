@@ -23,12 +23,19 @@ python3 -m agent_collab.node_agent run --data-dir /absolute/agent-data
 内置 stub 始终上报；GPU 使用 `{name, cuda}` 结构。
 `doctor` 检查配置、令牌匹配、POSIX 权限、控制端健康检查、实际工作区根目录写入和 harness 版本。
 它还运行无模型的认证状态探测；stub 可用而 Codex 缺失时会单独显示 `harness.codex=false`。
+认证结果按执行上下文分开给出：`auth_health` 是本次 doctor 进程自己的探测，`auth_source` 写明它的上下文
+（`context=doctor_process`、是否经 SSH 调用的 `via_ssh`、探测时间 `checked_at`、每个 harness 的 `reasons`）；
+`worker_auth` 是 worker 服务进程随心跳写入 status.json 的结果（`context=worker_service`、`auth_health`、`checked_at`、`pid`、
+`last_heartbeat_ok_at`），没有 status.json 或 worker 版本较旧没写这两项时为 null。doctor 只输出，不向 controller 上报，
+它的结果不会改动 controller 上由 worker 上报的 `auth_health`。`reasons` 的取值：`logged_in`、`not_logged_in`、
+`credential_store_unreadable`（当前进程读不到凭据存储）、`probe_inconclusive`（输出无法识别）、`probe_failed`（命令失败或超时）、
+`command_missing`。
 Windows 工作区位于 USERPROFILE 内且 Codex 可用时，在 warnings 中报告 `workspace_in_profile`。
 `doctor` 还检查 attempt 租约文件及 POSIX 权限，并在 `restart_blockers` 中列出阻塞领取的
 attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查询命令；不输出凭据原值。
 `effective` 给出不含密钥的最终生效配置：`node`（身份、并发、标签、workspace_root、data_dir）、`agent`（版本、提交、
 版本目录、解释器、用户、平台）和每个 harness 的 `argv`、`version`、`disabled`、`path_prepend`、`managed_argv`
-（Codex 另有 `codex_home` 与被清除的环境变量名）。`managed_argv` 直接调用适配器的 `build_argv` 生成，
+（Codex 另有 `codex_home` 与被清除的环境变量名，Claude 另有适配器固定设置的 `managed_env`）。`managed_argv` 直接调用适配器的 `build_argv` 生成，
 `<work>`、`<attempt>`、`<sandbox>`、`<effort>`、`<profile.model>`、`<profile.effort>`、`<decision-schema>`、`<session-id>`
 是运行期才确定的值；环境变量只列名称，不列取值。`argv` 与 `managed_argv` 只原样显示可执行文件路径：
 `codex_command`、`claude_command` 里附带的其余参数可能含凭据，一律显示为 `<configured-argument>`。
@@ -63,7 +70,7 @@ installer、系统服务、长时间运行与整机重启验收属于后续工�
 
 同一物理主机上的多个节点（例如 Windows 原生节点与按需启用的 WSL 节点）应显式使用相同 `physical_host_id` 和 `host_slots`。
 默认每台物理主机只有一个原生节点，WSL 节点会带 `wsl` 标签。
-Codex 模型固定为 `gpt-6-astra`；effort 仅 `high/xhigh/max`，默认 `xhigh`。Claude 的 model/effort 必须来自 controller 的已配置 standby profile，不使用默认档位。
+Codex 模型固定为 `gpt-6-astra`；effort 仅 `high/xhigh/max`，契约不写 effort 时取 `xhigh`，其他取值在提交时被拒绝。Claude 的 model/effort 必须来自 controller 的已配置 standby profile，不使用默认档位。
 
 每个进程启动时只解析一次 harness argv：服务 PATH → `~/.local/bin` → macOS 的 `/opt/homebrew/bin`、
 `/usr/local/bin`。Windows 使用 PATHEXT，排除 WindowsApps 应用执行别名。探测与执行共用绝对 argv 和环境，
@@ -72,6 +79,11 @@ PATH 前置该可执行文件目录，不加载 shell rc；Codex 线程来源变
 启动时同步调用一次 `codex login status` / `claude auth status`（各 20 秒超时，最坏约 40 秒后才进入主循环），
 之后每隔 `auth_probe_s`（缺省 900 秒）在后台调用，只保留 ok/expired/unknown，
 不保存账户标识、凭据或命令输出。超时及无法识别的结果为 unknown，明确未登录为 expired。
+macOS 上 Claude 的订阅登录存在登录钥匙串里，只有图形登录会话能读：`claude auth status` 报未登录时再运行
+`security show-keychain-info`，钥匙串读不到（SSH 会话里 exit 36）就记为 unknown，原因 `credential_store_unreadable`，
+不据此判定凭据过期；钥匙串可读而 CLI 仍报未登录才是 expired。其他平台的凭据是文件，不做这一步。
+worker 若运行在读不到钥匙串的上下文里，同样上报 unknown；派到它的 Claude 回合会以 `auth_expired` 失败，
+controller 再依据这次实际失败标记 expired。
 Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.sandbox="elevated"`（可配置）。
 已有 model、effort、approval_policy、sandbox_workspace_write 隔离参数继续显式传递。
 `--ignore-user-config` 跳过整个用户 config.toml，不只是 MCP 与 notify：模型、effort、沙箱模式、审批策略、工作目录、
@@ -81,7 +93,8 @@ Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.san
 
 `release_info()` 从运行代码根目录的 release-manifest.json 获取 version/git_commit；缺失或无效时回退
 0.1.0.dev0/null。注册 agent_version、capabilities.agent、attempt.runtime.agent_version/agent_commit 均采用它。
-每次成功心跳原子写入 status.json，包含 version、git_commit、pid、version_dir、last_heartbeat_ok_at。
+每次成功心跳原子写入 status.json，包含 version、git_commit、pid、version_dir、last_heartbeat_ok_at，
+以及本服务进程最近一次认证探测的 auth_health 与 auth_checked_at。
 
 ```text
 agent-data/
@@ -130,19 +143,28 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 ```text
 [claude_command, -p, --model, <profile.model>, --effort, <profile.effort>,
  --output-format, json, --json-schema, <内联 JSON>, --permission-mode, dontAsk,
- --tools, "", --session-id, <新 UUID>, --strict-mcp-config, --setting-sources, local, --safe-mode]
+ --tools, "", --session-id, <新 UUID>, --strict-mcp-config, --setting-sources, "", --safe-mode]
 ```
 
-`--strict-mcp-config` 不加载任何 MCP 服务（含账户级连接器）；`--setting-sources local` 只读工作目录下的本地设置，
-因此用户级 settings、插件、hooks 和用户 CLAUDE.md 都不进入受管回合；`--safe-mode` 关闭用户与项目层的定制：记忆文件
-（各级目录的 CLAUDE.md、CLAUDE.local.md）、skills、插件和 hooks。管理员下发的托管策略不受这些参数影响，其中配置的 hooks 仍会运行。
+环境变量另加 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`，其余环境沿用节点解析出的命令环境。
+
+各项的作用范围不同，合起来才是“任务相关输入只来自契约”：`--tools ""` 只关闭内置工具，不关 MCP 工具；
+`--strict-mcp-config` 不加载任何 MCP 服务（含账户级连接器）；`--setting-sources ""` 不加载 user、project、local 三个来源的设置，
+因此用户级 settings、插件、hooks、各级 CLAUDE.md 与 CLAUDE.local.md、工作目录的 `.claude/settings.local.json` 都不进入受管回合
+（受管回合用不到任何一个来源，所以列表为空）；自动记忆（`~/.claude/projects/<项目>/memory/`）不受来源列表控制，
+由 `--safe-mode` 与上面的环境变量关闭；`--safe-mode` 同时关闭记忆文件、skills、插件、hooks 等定制。
+以下内容仍然存在，属于预期：Claude Code 自己的系统提示、内置的插件与斜杠命令清单（没有工具，无法调用）、
+`~/.claude.json` 全局配置、官方本机登录，以及管理员下发的托管策略（其中配置的 hooks 仍会运行）。
 认证仍用官方本机登录（不使用 `--bare`，它读不到订阅登录）。
-实测（Claude Code 2.1.302）：只有 `--tools ""` 时回合会连接账户的邮件、笔记等连接器，加载用户插件并运行 SessionStart/UserPromptSubmit hooks；
-`--setting-sources project` 仍会带入用户 CLAUDE.md；`--setting-sources local` 仍会读取工作目录及其上级目录里的 `CLAUDE.local.md`，
-加上 `--safe-mode` 后不再读取。工作目录自己的 `.claude/settings.local.json` 里的 hooks 在只有 `--setting-sources local` 时会运行，
-加上 `--safe-mode` 后不运行；工作目录是某个 Git 仓库的子目录时，仓库根目录的 `.claude/settings.local.json` 没有被读取。
+
+实测（Claude Code 2.1.302 与 2.1.321，工作目录与上级目录各放带标记的 CLAUDE.local.md，对应项目的自动记忆目录放带标记的 MEMORY.md，
+核对 init 事件与回答）：只有 `--tools ""` 时回合会连接账户的邮件、笔记等连接器，加载用户插件并运行 SessionStart/UserPromptSubmit hooks；
+`--setting-sources project` 仍会带入用户 CLAUDE.md；`--strict-mcp-config --setting-sources local` 下工具与 MCP 列表为空、没有用户插件和 hooks，
+但两个 CLAUDE.local.md 标记和自动记忆标记都被带入；`--setting-sources ""` 不再带入 CLAUDE.local.md，自动记忆仍在；
+加上 `--safe-mode`，或只加环境变量，自动记忆不再加载；现行组合下三个标记都不出现，订阅登录正常。
+工作目录自己的 `.claude/settings.local.json` 里的 hooks 在 `--setting-sources local` 且没有 `--safe-mode` 时会运行。
 协调工作区里若出现 `.claude`，适配器仍然不启动 Claude 并以 `code_failure` 结束。
-本机 Claude Code 必须支持这三个参数，不支持的旧版本不能用于协调回合。
+本机 Claude Code 必须支持这些参数，不支持的旧版本不能用于协调回合。
 
 这些都是 Claude Code 的命令行参数，不构成操作系统级隔离。提示词要求协调者只依据提供的上下文判断、不声称没看到的检查，
 证据不足或没有检查点时选择 `escalate`；结构化决策本身不是独立验证，目标契约声明了 checks 时，`passed` 是否成立由 controller
