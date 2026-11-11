@@ -333,7 +333,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 **11.7 验收证据门禁（controller）**：contract.checks 非空时，任何来源（受管协调者、管理员、UI 会话）的 `passed` 验收，都要求产生被验收检查点的 attempt 的 `report.checks.manifest_sha256` 等于该检查点 manifest 哈希，且每项必需检查都存在、`exit_code == 0`、`timed_out == false`。不满足时验收记录仍保存，但 `status` 改为 `unverified`，并附 `requested_status: "passed"` 与 `evidence_gaps: [{"check", "reason": "missing|failed|timed_out|manifest_mismatch|no_report"}]`；写 `job.evidence_gap` 事件。满足时验收记录附 `evidence: {"attempt_id", "manifest_sha256", "checks": [name...]}`。job.acceptance 透出 `requested_status`、`evidence_gaps`。`publish.requires_acceptance` 仍只认 passed。
 
-**11.8 任务级协调策略（controller）**：contract 可选 `coordination: {"policy": "always|on_failure|none"}`，缺省 always（即 §10 所述的触发行为）。on_failure 只在目标进入 `waiting_reconcile`、`failed`、`waiting_capability`，或以 completed 结束但交付 attempt 带 `recovered_from_attempt`（发生过接管）时触发；none 从不触发受管协调。修复契约继承目标的 coordination。
+**11.8 任务级协调策略（controller）**：contract 可选 `coordination: {"policy": "always|on_failure|none"}`，缺省 always（即 §10 所述的触发行为）。on_failure 只在目标进入 `waiting_reconcile`、`failed`、`waiting_capability`，或以 completed 结束但交付 attempt 带 `recovered_from_attempt`（发生过接管）时触发，`rework` 验收不触发（即使目标当时处于上述状态）；none 从不触发受管协调。修复契约继承目标的 coordination。
 - 触发去重键为 `目标 job_id + 触发类型 + durable_checkpoint_id + acceptance.status`；同一目标已有未结束的协调 job 时不再创建新的。取消请求或根预算耗尽后不派生修复（已有 budget_reason 与 cancel 检查须覆盖受管修复路径）。
 
 **11.9 能力证据（controller）**：node 记录包含 `capability_evidence: {"<harness>": {"status": "ok|degraded|unproven", "bound": {"agent_version", "harness_version", "harness_path"}, "last_success": {"attempt_id", "at"}|null, "last_failure": {"attempt_id", "at", "reason"}|null}}`。

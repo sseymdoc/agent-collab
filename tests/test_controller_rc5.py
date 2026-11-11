@@ -232,6 +232,17 @@ class CoordinationPolicyTests(Rc5Case):
         self.app.tick()
         self.assertEqual(len(self.coordinators()), 4)
 
+    def test_on_failure_ignores_rework_on_already_failed_target(self):
+        node = self.node('worker')
+        job = self.job(contract(coordination={'policy': 'on_failure'}, recovery={'auto': False}))
+        a = node.claim()
+        cp = node.checkpoint(a)
+        node.complete(a, outcome='failed', failure_class='code_failure')
+        self.assertEqual(self.current(job)['status'], 'failed')
+        self.configured()  # 失败时没有配置，未创建协调 job；之后的 rework 验收不应补出一次
+        self.assess(job, cp, status='rework')
+        self.assertFalse(self.coordinators())
+
     def test_on_failure_triggers_completed_takeover(self):
         self.configured()
         node = self.node('worker')

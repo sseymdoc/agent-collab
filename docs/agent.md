@@ -81,7 +81,7 @@ PATH 前置该可执行文件目录，不加载 shell rc；Codex 线程来源变
 不保存账户标识、凭据或命令输出。超时及无法识别的结果为 unknown，明确未登录为 expired。
 macOS 上 Claude 的订阅登录存在登录钥匙串里，只有图形登录会话能读：`claude auth status` 报未登录时再运行
 `security show-keychain-info`，钥匙串读不到（SSH 会话里 exit 36）就记为 unknown，原因 `credential_store_unreadable`，
-不据此判定凭据过期；钥匙串可读时再调用一次 `claude auth status`（这一步可能刚解锁了被手动锁定的钥匙串，前一次结果已过时），仍报未登录才是 expired。其他平台的凭据是文件，不做这一步。
+不据此判定凭据过期；钥匙串可读时再调用一次 `claude auth status`（这一步可能刚解锁了被手动锁定的钥匙串，前一次结果已过时），仍报未登录才是 expired。钥匙串可读不等于 Claude 的凭据项可读：若该项的访问控制拒绝当前进程，这一步无法区分，结果仍记为 expired；要确认只能读出凭据本身，适配器按设计不读取凭据，这是已知限制。其他平台的凭据是文件，不做这一步。
 worker 若运行在读不到钥匙串的上下文里，同样上报 unknown；派到它的 Claude 回合失败且输出是认证错误时，适配器再检查一次钥匙串，
 读不到就以 `capability_missing` 结束（只记本节点该 harness 能力降级），不报 `auth_expired`，
 因为 controller 收到 `auth_expired` 会把共享同一 `provider_account_refs` 的节点都标成 expired。

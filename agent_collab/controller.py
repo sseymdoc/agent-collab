@@ -496,7 +496,8 @@ class App:
         if policy == 'none':
             return
         if policy == 'on_failure':
-            if not (job['status'] in ('waiting_reconcile', 'failed', 'waiting_capability') or
+            # on_failure 只看进入失败类状态与接管完成；对已处于 failed 的目标提交 rework 验收不算新的失败。
+            if trigger == 'rework' or not (job['status'] in ('waiting_reconcile', 'failed', 'waiting_capability') or
                     (job['status'] == 'completed' and attempt and attempt['recovered_from_attempt'])):
                 return
         elif trigger not in ('completed', 'waiting_reconcile', 'rework'):
