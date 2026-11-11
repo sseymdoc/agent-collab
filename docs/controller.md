@@ -152,7 +152,7 @@ controller 生成的修复契约使用 codex、gpt-6-astra、workspace-write，e
 
 只有验收非法或租约/目标/检查点前提失效时，才整体拒绝并写 coordinator.decision_rejected。显式 escalate 保持原行为：只写事件，目标继续等待人工，不凭 null checkpoint_id 创造验收记录。测试夹具 tests/fixtures/claude_rework_request.json 保留一份真实 Claude 决策样本的 assessment，仅将 follow_up 转为当前的请求形状；测试证明样本可记录 rework 并生成合法 Codex 修复 job，测试中不重新调用真实模型。
 
-本实现只处理新触发：因 interactive 租约或配置缺失被跳过的历史事件，不在租约过期/配置启用时自动补发。managed 应用中的 rework 验收属于该轮决策，不再触发自身的下一轮；修复 job 后续完成可正常触发。以上控制器行为由 `test_controller_rc5.py`、`test_coordinator.py` 覆盖；真实 CLI 与认证可用性、跨机接管需要在实际部署中核对，单元测试不调用真实模型。
+本实现只处理新触发：因 interactive 租约或配置缺失被跳过的历史事件，不在租约过期/配置启用时自动补发。managed 应用中的 rework 验收属于该轮决策，不再触发自身的下一轮；修复 job 后续完成可正常触发。`test_coordinator.py` 覆盖 interactive 租约持有期间、profile 缺失或不完整时不派协调任务，以及 managed 回合不递归触发自身；租约到期或配置恢复后不补发历史事件尚无回归测试；真实 CLI 与认证可用性、跨机接管需要在实际部署中核对，单元测试不调用真实模型。
 
 ## 契约检查、能力证据与回写待办
 
