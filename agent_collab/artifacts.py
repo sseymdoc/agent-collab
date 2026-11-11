@@ -101,19 +101,45 @@ def owner_only(path):
         raise OSError('%s still grants access to: %s' % (path, ', '.join(n for n in remaining if n.casefold() != name.casefold()) or 'nobody'))
 
 
-def atomic_write(path, data, mode=0o600, prepare=None):
-    """prepare(临时文件路径)：在写入内容前调用，例如在 Windows 上先收紧 ACL；它抛出异常时不写入、不替换。"""
+class SecretFile:
+    """凭据文件的预留位：先建好仅当前用户可访问的临时文件，再去换取凭据，拿到后 save() 原子替换成 path。
+
+    配对码只能用一次，配对还会撤销同一身份的旧凭据：所以权限收紧必须在发出请求之前完成，失败时（构造时抛 OSError）
+    请求还没发出。离开 with 块时没有 save() 的临时文件会被删除。
+    """
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.temp = self.path.with_name('.' + self.path.name + '.' + uuid.uuid4().hex + '.tmp')
+        os.close(os.open(str(self.temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        try:
+            owner_only(self.temp)
+        except BaseException:
+            self.temp.unlink()
+            raise
+
+    def save(self, data):
+        with self.temp.open('r+b') as stream:  # 写进已收紧的同一个文件，保留它的 DACL
+            stream.write(data)
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(str(self.temp), str(self.path))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.temp.exists():
+            self.temp.unlink()
+
+
+def atomic_write(path, data, mode=0o600):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name('.' + path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        if prepare:
-            try:
-                prepare(temp)
-            except BaseException:
-                os.close(fd)
-                raise
         with os.fdopen(fd, 'wb') as stream:
             stream.write(data)
             stream.flush()

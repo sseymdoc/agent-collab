@@ -18,7 +18,7 @@ import threading
 import uuid
 
 from . import protocol as p
-from .artifacts import DEFAULT_EXCLUDES, EMPTY, atomic_write, checked_manifest, integrate, materialize, owner_only, snapshot
+from .artifacts import DEFAULT_EXCLUDES, EMPTY, SecretFile, atomic_write, checked_manifest, integrate, materialize, snapshot
 from .client import APIError, Client, ConnectionFailure, validate_url
 from .adapters.codex import CodexAdapter, model_catalog, process_stamp, process_status
 from .adapters.claude import ClaudeAdapter
@@ -974,13 +974,16 @@ def pair(args, transport=None):
     if (directory / 'agent.json').exists() or (directory / 'node.token').exists():
         raise ValueError('data directory is already paired; use a new directory')
     client = Client(args.controller, ca_file=args.ca_file, transport=transport)
-    result = client.json('POST', '/nodes/pair', dict(code=args.code, node_id=args.node_id))
-    if result['node_id'] != args.node_id or not isinstance(result['node_token'], str) or not result['node_token'].strip():
-        raise ValueError('invalid pairing response')
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Protocol §2 explicitly requires this client-side bearer file. Controller
     # stores hashes; agent.json stores only a hash and never the credential.
-    atomic_write(directory / 'node.token', result['node_token'].encode(), prepare=owner_only)
+    # 先建好仅当前用户可访问的 node.token 预留文件再配对：配对会用掉配对码并撤销同一 node_id 的旧凭据，
+    # 收紧失败时请求还没发出。
+    with SecretFile(directory / 'node.token') as secret:
+        result = client.json('POST', '/nodes/pair', dict(code=args.code, node_id=args.node_id))
+        if result['node_id'] != args.node_id or not isinstance(result['node_token'], str) or not result['node_token'].strip():
+            raise ValueError('invalid pairing response')
+        secret.save(result['node_token'].encode())
     config = dict(controller=validate_url(args.controller), node_id=args.node_id,
                   controller_id=result['controller_id'], authority_generation=result['authority_generation'],
                   node_token_sha256=p.sha256_bytes(result['node_token'].encode()),

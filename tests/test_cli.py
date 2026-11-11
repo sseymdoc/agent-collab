@@ -142,11 +142,13 @@ class CliTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
     def test_client_credential_file_has_no_inherited_access_on_windows(self):
         import subprocess
-        from agent_collab.artifacts import atomic_write
+        from agent_collab import artifacts
         path = self.temp / 'cred.json'
-        atomic_write(path, b'{}', prepare=cli.owner_only)
-        listing = subprocess.run(['icacls', str(path)], capture_output=True, text=True, errors='replace').stdout
-        self.assertNotIn('(I)', listing)  # 继承来的 ACE 已去掉，只剩当前用户
+        with artifacts.SecretFile(path) as secret:
+            secret.save(b'{}')
+        listing = subprocess.run([artifacts._system_tool('icacls.exe'), str(path)], capture_output=True, text=True, errors='replace', check=True).stdout
+        self.assertNotIn('(I)', listing)  # 继承来的 ACE 已去掉
+        self.assertEqual([n.casefold() for n in artifacts._principals(path)], [artifacts._current_user()[0].casefold()])
         self.assertEqual(path.read_bytes(), b'{}')
 
     @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
@@ -174,9 +176,11 @@ class CliTests(unittest.TestCase):
         subprocess.run([artifacts._system_tool('icacls.exe'), str(folder), '/inheritance:r', '/grant:r', '*%s:F' % sid], capture_output=True, check=True)
         probe = folder / 'probe'
         probe.write_bytes(b'')
-        self.assertTrue(any(n.casefold() != name.casefold() for n in artifacts._principals(probe)))  # 前提成立：新文件确实带着其他主体
+        if not any(n.casefold() != name.casefold() for n in artifacts._principals(probe)):
+            self.skipTest('这台机器上新文件的默认 DACL 只有当前用户，构造不出要验证的情况')
         path = folder / 'cred.json'
-        artifacts.atomic_write(path, b'{"token": "x"}', prepare=cli.owner_only)
+        with artifacts.SecretFile(path) as secret:
+            secret.save(b'{"token": "x"}')
         self.assertEqual([n.casefold() for n in artifacts._principals(path)], [name.casefold()])
         self.assertEqual(path.read_bytes(), b'{"token": "x"}')
         self.assertEqual([x.name for x in folder.iterdir() if x.name.endswith('.tmp')], [])
@@ -239,6 +243,22 @@ class CliTests(unittest.TestCase):
             self.assertEqual(cli.Conn(argparse.Namespace(profile='default', url='https://paired.example/', token_file=None,
                                                          ca_file=None)).url, 'https://paired.example')
         sent.assert_not_called()
+
+    def test_pair_restricts_the_credential_file_before_spending_the_code(self):
+        home, clients = self.temp / 'pair-home', self.temp / 'pair-home' / 'clients'
+        argv = ['client', 'pair', '--url', 'https://paired.example', '--code', 'one-time']
+        with patch.dict(os.environ, {'AGENT_COLLAB_HOME': str(home)}):
+            # 收紧失败：配对请求根本没有发出，配对码还能用，也不留下文件。
+            with patch('agent_collab.artifacts.owner_only', side_effect=OSError('icacls failed')),                     patch.object(cli, 'request') as sent, self.assertRaises(SystemExit):
+                cli.main(argv)
+            sent.assert_not_called()
+            self.assertEqual(list(clients.iterdir()) if clients.exists() else [], [])
+            # 收紧成功：凭据写进预留的文件，不留临时文件。
+            body = {'client_id': 'c1', 'name': 'automation', 'kind': 'cli', 'scopes': ['read'], 'controller_id': CONTROLLER, 'client_token': 'secret'}
+            with patch.object(cli, 'request', return_value=(200, body)), redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(argv), 0)
+        self.assertEqual([x.name for x in clients.iterdir()], ['default.json'])
+        self.assertEqual(json.loads((clients / 'default.json').read_text(encoding='utf-8'))['token'], 'secret')
 
     def test_forget_revoke_uses_the_profile_credential_and_keeps_it_until_revoked(self):
         home = self.profile()

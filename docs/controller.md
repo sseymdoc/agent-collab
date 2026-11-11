@@ -13,7 +13,7 @@ python -m agent_collab.controller client-code --data-dir /local/controller-data 
 
 `client-code` 为桌面端、CLI 或其他自动化客户端生成一次性配对码（输出 JSON：`code`、`scopes`、`ttl_s`）；`--role` 取 `owner`、`operator`、`viewer`，或用 `--scopes read,tasks` 逐项指定；两者都省略时签发 `owner`，即全部五项权限。配对码只存哈希，最长有效 1 小时。客户端凭据、权限与撤销见 `docs/protocol.md` §12.1。
 
-`admin-token` 只打印文件路径。管理员令牌首次生成于 `admin.token`；POSIX 权限为 0600，Windows 上写入前先去掉继承的 ACL、只授予运行 controller 的用户，做不到时启动失败、不留下令牌文件。已存在的令牌文件不会被改动。此文件是协议要求的唯一明文凭据文件；数据库中的节点令牌、租约、UI 会话、CSRF 和配对码均只保存 SHA-256，比较使用 `hmac.compare_digest`。配对码过期或使用一次后失效，再次配对同一节点会撤销旧 node token。节点凭据不能访问客户端查询或控制端点；管理员/UI 凭据不能冒充节点。
+`admin-token` 只打印文件路径。管理员令牌首次生成于 `admin.token`；POSIX 权限为 0600，Windows 上写入前把 DACL 收紧到只留运行 controller 的用户，做不到时启动失败、不留下令牌文件。已存在的令牌文件不会被改动。此文件是协议要求的唯一明文凭据文件；数据库中的节点令牌、租约、UI 会话、CSRF 和配对码均只保存 SHA-256，比较使用 `hmac.compare_digest`。配对码过期或使用一次后失效，再次配对同一节点会撤销旧 node token。节点凭据不能访问客户端查询或控制端点；管理员/UI 凭据不能冒充节点。
 
 非 loopback 地址必须同时提供 `--tls-cert` 和 `--tls-key`，否则在创建监听器之前拒绝启动。例如：
 

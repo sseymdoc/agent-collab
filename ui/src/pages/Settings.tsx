@@ -43,6 +43,8 @@ function Models({ tick }: { tick: number }) {
   const [form, setForm] = useState<{ codex?: any; claude?: any } | null>(null)
   const [base, setBase] = useState<number | null>(null)   // 编辑副本所基于的 revision
   const pending = useRef<{ form: any; revision: number; id: string } | null>(null)
+  // 同一时刻只有一个保存请求：并行的两次保存基于同一 revision，先返回的冲突会盖掉后一次成功的提示。
+  const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<[string, string] | null>(null)
   const [conflict, setConflict] = useState<any>(null)
   const settings = view.data?.settings
@@ -82,7 +84,7 @@ function Models({ tick }: { tick: number }) {
     [cur.claude.default.model, MODEL_RE, '协调模型'], [cur.claude.default.effort, EFFORT_RE, '协调 effort']]
     .filter(([v, re]) => v != null && !(re as RegExp).test(v)).map(([, , name]) => name)
   const save = async () => {
-    setMsg(null); setConflict(null)
+    setMsg(null); setConflict(null); setSaving(true)
     const sent = form, revision = base ?? settings.revision
     // 应答丢失后再点“保存”：内容与基准版本都没变就复用 request_id，controller 原样返回第一次的结果。
     if (!pending.current || pending.current.form !== sent || pending.current.revision !== revision) pending.current = { form: sent, revision, id: uuid() }
@@ -94,6 +96,8 @@ function Models({ tick }: { tick: number }) {
     } catch (e) {
       if (e instanceof ApiError && e.code === 'version_mismatch') { setConflict(e.details.current); void view.reload() }
       else setMsg([e instanceof ApiError && e.details?.reason === 'model_not_allowed' ? '默认值不在许可范围内，请先调整许可范围或默认值' : errText(e), 'err'])
+    } finally {
+      setSaving(false)
     }
   }
   return <Section title="模型默认值" extra={<span className="muted">第 {settings.revision} 版{settings.updated_at ? ' · ' + actor(settings.updated_by) + ' 修改于 ' + when(settings.updated_at) : ' · 尚未设置'}</span>}>
@@ -136,7 +140,7 @@ function Models({ tick }: { tick: number }) {
       <label>协调推理强度（effort）<input disabled={!editable || !cur.claude.default.model} value={cur.claude.default.effort ?? ''} onChange={e => set(v => { v.claude.default.effort = e.target.value.trim() || null })} /></label>
     </div>
     {editable ? <p className="actions">
-      <button className="primary" disabled={!form || !!bad.length || (!!allowed && !Object.keys(allowed).length)} onClick={() => void save()}>保存</button>
+      <button className="primary" disabled={saving || !form || !!bad.length || (!!allowed && !Object.keys(allowed).length)} onClick={() => void save()}>保存</button>
       {!!bad.length && <small className="err">{bad.join('、')}格式不对：模型以字母或数字开头，可含 . _ : / -；effort 为小写字母开头，可含数字、_ 与 -。</small>}
       {form && <button onClick={() => { setForm(null); setMsg(null); setConflict(null) }}>撤销修改</button>}
       {msg && <small className={msg[1]}>{msg[0]}</small>}

@@ -122,15 +122,6 @@ def client_home():
     return Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'agent-collab'
 
 
-def owner_only(path):
-    """Windows 不认 0o600：去掉继承的 ACL，只给当前用户完全控制，再写入凭据。失败就不写。"""
-    from .artifacts import owner_only as restrict
-    try:
-        restrict(path)
-    except OSError:
-        raise SystemExit('无法把凭据文件限制为仅当前用户可访问，凭据没有保存；配对码已用掉，请重新签发后再配对')
-
-
 def profile_path(name):
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', name):
         raise SystemExit('profile 名只允许字母、数字、点、下划线和连字符')
@@ -234,16 +225,21 @@ def _client_command(argv):
     if a.action == 'pair':
         if path.exists():
             raise SystemExit('profile %s 已有凭据；先 agent-collab client forget，或换一个 --profile' % a.profile)
-        status, body = request(a.url, None, 'POST', '/clients/pair', {'code': a.code, 'name': a.name, 'kind': a.kind}, a.ca_file)
-        if status != 200:
-            out({'http_status': status, 'body': body})
-            return 2
-        from .artifacts import atomic_write
-        saved = {k: body[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id')}
-        saved.update(url=a.url.rstrip('/'), ca_file=str(Path(a.ca_file).absolute()) if a.ca_file else None, token=body['client_token'])
-        # 自动化客户端的凭据放在当前用户的配置目录里，文件权限仅本人可读写（POSIX 用 0600，Windows 去掉继承 ACL）；
-        # 它可单独撤销、权限按配对码授予。凭据值不打印。
-        atomic_write(path, json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'), prepare=owner_only)
+        from .artifacts import SecretFile
+        # 自动化客户端的凭据放在当前用户的配置目录里，文件仅本人可访问（POSIX 用 0600，Windows 的 DACL 只留当前用户）；
+        # 它可单独撤销、权限按配对码授予。凭据值不打印。先收紧再配对：配对码只能用一次。
+        try:
+            secret = SecretFile(path)
+        except OSError:
+            raise SystemExit('无法把凭据文件限制为仅当前用户可访问；配对码没有使用，凭据没有保存')
+        with secret:
+            status, body = request(a.url, None, 'POST', '/clients/pair', {'code': a.code, 'name': a.name, 'kind': a.kind}, a.ca_file)
+            if status != 200:
+                out({'http_status': status, 'body': body})
+                return 2
+            saved = {k: body[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id')}
+            saved.update(url=a.url.rstrip('/'), ca_file=str(Path(a.ca_file).absolute()) if a.ca_file else None, token=body['client_token'])
+            secret.save(json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'))
         out(dict({k: saved[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id', 'url')},
                  profile=a.profile, credential_file=str(path)))
         return 0

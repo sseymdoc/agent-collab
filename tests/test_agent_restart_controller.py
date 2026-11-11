@@ -61,9 +61,22 @@ class RestartControllerTests(ControllerCase):
 
     @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
     def test_node_and_admin_tokens_have_no_inherited_access_on_windows(self):
+        from agent_collab import artifacts
         for path in (self.agent_dir / 'node.token', self.temp / 'data' / 'admin.token'):
-            listing = subprocess.run(['icacls', str(path)], capture_output=True, text=True, errors='replace').stdout
-            self.assertNotIn('(I)', listing, path)  # 继承来的 ACE 已去掉，只剩当前用户
+            listing = subprocess.run([artifacts._system_tool('icacls.exe'), str(path)], capture_output=True, text=True, errors='replace', check=True).stdout
+            self.assertNotIn('(I)', listing, path)  # 继承来的 ACE 已去掉
+            self.assertEqual([n.casefold() for n in artifacts._principals(path)], [artifacts._current_user()[0].casefold()], path)
+
+    def test_pairing_is_not_sent_when_the_token_file_cannot_be_restricted(self):
+        # 配对会用掉配对码并撤销同一 node_id 的旧凭据：收紧失败时请求不能发出，目录里也不留下凭据。
+        directory = self.temp / 'unrestricted'
+        args = argparse.Namespace(controller='https://controller.invalid', code=self.app.pairing_code('second'), node_id='second',
+            data_dir=str(directory), ca_file=None, slots=1, host_slots=1, physical_host_id='host', failure_domain='domain', label=[])
+        before = len(self.calls)
+        with patch('agent_collab.artifacts.owner_only', side_effect=OSError('icacls failed')), self.assertRaises(OSError):
+            pair(args, self.transport)
+        self.assertEqual(self.calls[before:], [])
+        self.assertEqual(list(directory.iterdir()), [])
 
     def test_admin_token_is_not_left_behind_when_it_cannot_be_restricted(self):
         from agent_collab.controller import App

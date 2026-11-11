@@ -16,7 +16,7 @@ agent-collab controller client-code --data-dir <controller 数据目录> --role 
 agent-collab client pair --url https://<controller 地址> --code <配对码> --name "<这个客户端的名字>" --kind agent
 ```
 
-凭据写入当前用户配置目录下仅本人可读写的文件（POSIX 为 0600；Windows 上先去掉继承的 ACL、只授予当前用户，做不到时不保存凭据，需重新签发配对码），之后的命令自动使用它；多个 controller 用 `--profile <名字>` 区分。凭据绑定这个 controller 的身份和配对时的地址：命令不会把它发往 `--url` 指定的其他地址（地址变了就重新配对），应答来自别的 controller 时命令以退出码 3 结束。拥有者可以随时在桌面端“设置 → 客户端”里撤销它。
+凭据写入当前用户配置目录下仅本人可读写的文件（POSIX 为 0600；Windows 上 DACL 只留当前用户；这一步在发出配对请求之前完成，做不到时命令直接退出，配对码没有使用），之后的命令自动使用它；多个 controller 用 `--profile <名字>` 区分。凭据绑定这个 controller 的身份和配对时的地址：命令不会把它发往 `--url` 指定的其他地址（地址变了就重新配对），应答来自别的 controller 时命令以退出码 3 结束。拥有者可以随时在桌面端“设置 → 客户端”里撤销它。
 
 ## 提交
 
