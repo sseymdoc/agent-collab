@@ -89,7 +89,7 @@ class CodexTests(unittest.TestCase):
 
     def test_model_catalog_reads_model_list_over_stdio_and_reports_unknown_on_failure(self):
         server = self.temp / 'fake_app_server.py'
-        server.write_text(FAKE_APP_SERVER)
+        server.write_text(FAKE_APP_SERVER, encoding='utf-8')
         catalog = model_catalog([sys.executable, str(server)])
         self.assertEqual((catalog['status'], catalog['source'], catalog['reason'], catalog['provider']),
                          ('ok', 'app-server:model/list', None, 'openai'))
@@ -104,7 +104,7 @@ class CodexTests(unittest.TestCase):
 
     def test_model_catalog_is_not_taken_from_a_provider_other_than_the_one_execution_uses(self):
         server = self.temp / 'fake_app_server.py'
-        server.write_text(FAKE_APP_SERVER)
+        server.write_text(FAKE_APP_SERVER, encoding='utf-8')
         # 用户配置让 app-server 生效的 provider 不是执行用的那个：不采用这份目录。
         other = model_catalog([sys.executable, str(server)], env=dict(os.environ, FAKE_EFFECTIVE_PROVIDER='corp-gateway'))
         self.assertEqual((other['status'], other['reason'], other['provider'], other['models']), ('unknown', 'provider_mismatch', 'corp-gateway', []))

@@ -1168,9 +1168,20 @@ class App:
             raise APIError('conflict', 'application already has a final result', current=record)
         if data.get('action') not in ('status', 'resume', 'rollback', 'abandon'):
             raise ValueError('action must be status, resume, rollback or abandon')
+        if data['action'] != 'status':
+            # 节点按顺序执行：原应用或上一个变更型恢复还没被领取或还在执行时，新的变更会排在它后面，
+            # 而先到的那个结果会先结束记录、让后一个的结果被丢弃。等它有了结果（或超时）再处理。
+            for op in self.store.all('node_op'):
+                if (op['params'].get('application_id') == ident and op['status'] in ('requested', 'received')
+                        and (op['kind'] == 'project_apply' or (op['kind'] == 'project_recover' and op['params'].get('action') != 'status'))):
+                    raise APIError('conflict', 'another operation on this application is still pending on the node',
+                                   operation_id=op['op_id'])
         params = {k: record[k] for k in ('project_id', 'application_id', 'job_id', 'checkpoint_id')}
-        return response(self._new_operation(self.get('node', record['target_node_id']), 'project_recover',
-                                            dict(params, action=data['action']), identity), 201)
+        op = self._new_operation(self.get('node', record['target_node_id']), 'project_recover', dict(params, action=data['action']), identity)
+        if data['action'] != 'status':
+            # 从这里起只认这项恢复的结果：超时后晚到的原应用结果不再结束记录。
+            self.store.put('application', ident, dict(record, recovery_operation_id=op['op_id']))
+        return response(op, 201)
 
     def _settle_remote(self, op, result, now):
         """目标节点报来的应用结果落到应用记录上；只认这次应用指定的那台节点，已有结果的不改写。"""
@@ -1179,6 +1190,8 @@ class App:
             return
         record = self.store.get('application', op['params'].get('application_id'))
         if not record or record['status'] != 'started' or record.get('target_node_id') != op['node_id']:
+            return
+        if record.get('recovery_operation_id') not in (None, op['op_id']):
             return
         detail = value.get('detail') if isinstance(value, dict) else None
         if not isinstance(detail, dict) or value.get('status') not in p.APPLICATION_FINAL or len(p.canonical_json(detail)) > 262144:
@@ -2295,6 +2308,9 @@ class App:
                 raise ValueError('revisions of a work package stay in its project')
             if any(j['work_package_id'] == root_id and j['status'] not in ('completed', 'failed', 'cancelled') for j in self.store.all('job')):
                 raise APIError('conflict', 'work_package revisions must be serial')
+            if acceptance_run and root.get('project_id'):
+                # 修订沿用根的项目：没带 project_id 的验收运行也会落进项目，按项目任务处理（§13.9）。
+                raise ValueError('an acceptance run must not belong to a project, write back to a node, or declare side effects')
         else:
             # 根受理时冻结模型策略：后续修订与受管修复只读这里，不读之后修改的设置或项目默认值（§12.4、§13.1）。
             root = {'counters': dict(attempts=0, infra_retries=0, migrations=0, repairs=0), 'created_at': d.timestamp(now),

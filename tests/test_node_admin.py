@@ -307,7 +307,12 @@ class AgentOperationTests(ControllerCase):
                                                             'reason': 'command_missing', 'models': [], 'provider': None})
         self.addCleanup(self.agent.close)
 
+    drop_received = 0
+
     def transport(self, method, url, headers, body):
+        if self.drop_received and '/operations/' in url and b'"received"' in (body or b''):
+            self.drop_received -= 1
+            return 503, {}, b'{}'  # 代理临时故障：确认没有送到
         result = self.app.handle(method, urlsplit(url).path, headers, body)
         return result.status, result.headers, result.body
 
@@ -338,6 +343,13 @@ class AgentOperationTests(ControllerCase):
         self.assertEqual(set(result['context']) >= {'user', 'ssh', 'tty', 'launchd_label', 'windows_session', 'version', 'version_dir', 'platform'}, True)
         self.assertNotIn(self.agent.client.token, json.dumps(done))
         self.assertTrue(done['received_at'] and done['finished_at'])
+
+    def test_operation_whose_receipt_was_not_delivered_is_acknowledged_again_after_reconnecting(self):
+        self.drive(lambda: self.call('GET', '/nodes')['nodes'])
+        self.drop_received = 1
+        op = self.call('POST', '/nodes/worker/operations', {'request_id': uid(), 'kind': 'probe'}, status=201)
+        self.drive(lambda: self.operation(op['op_id'])['status'] in ('succeeded', 'failed'))
+        self.assertEqual((self.drop_received, self.operation(op['op_id'])['status']), (0, 'succeeded'))
 
     def test_raw_output_is_read_in_chunks_from_the_attempt_only_and_redacted(self):
         self.drive(lambda: self.call('GET', '/nodes')['nodes'])
@@ -373,6 +385,19 @@ class AgentOperationTests(ControllerCase):
         (attempt_dir / 'stdout.jsonl').write_text('token=' + self.agent.client.token + '\n', encoding='utf-8')
         leaked = self.agent.guarded(lambda: self.agent.log_tail({'attempt_id': attempt_id, 'stream': 'harness.stdout'}))[1]
         self.assertNotIn(self.agent.client.token, leaked['data'])
+        # 分块读取：无论块边界落在凭据的哪个位置，拼起来都拿不到它，也拿不到它的任何一段。
+        token = self.agent.client.token
+        content = ('before ' + token + ' after\n').encode('utf-8')
+        (attempt_dir / 'stdout.jsonl').write_bytes(content)
+        for cut in range(1, len(content)):
+            parts = [self.agent.log_tail({'attempt_id': attempt_id, 'stream': 'harness.stdout', 'offset': start, 'max_bytes': length})
+                     for start, length in ((0, cut), (cut, len(content)))]
+            joined = ''.join(part['data'] for part in parts)
+            self.assertEqual((parts[0]['next_offset'], parts[1]['eof']), (cut, True))
+            self.assertNotIn(token, joined)
+            for piece in (token[:8], token[-8:]):
+                self.assertNotIn(piece, joined, cut)
+            self.assertTrue(joined.startswith('before ') and joined.endswith(' after\n'), (cut, joined))
         self.assertEqual(self.agent.log_tail({'attempt_id': uid()}), {'retained': False, 'streams': []})
         # 固定布局之外的文件、符号链接都不在可取范围里。
         (attempt_dir / 'lease.copy').write_text('secret', encoding='utf-8')

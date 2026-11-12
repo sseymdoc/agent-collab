@@ -566,7 +566,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - 提交闸门：`POST /intake`（maintain）`{"request_id", "expected_version", "mode": "open|acceptance|closed", "reason"?}` → meta；`expected_version` 是 `GET /overview` 的 `controller.metadata_version`，`mode` 不是 `open` 时必须给原因。`GET /overview` 带 `intake: {"mode", "reason", "by", "at"}`。写 `controller.intake` 事件。
   - `closed`：`POST /jobs` 对任何凭据（含管理令牌）返回 409 `intake_closed`。读取、对已有任务的操作、节点上报与 controller 自己创建的协调回合和修复不受影响。
-  - `acceptance`：只接受验收运行，即请求带 `acceptance_run: true`、提交者具备 `maintain` 权限、不带 `project_id`、契约没有回写目标节点、`recovery.side_effects` 为 `none`；不满足形状的返回 400，没带标记的返回 409 `intake_closed`。
+  - `acceptance`：只接受验收运行，即请求带 `acceptance_run: true`、提交者具备 `maintain` 权限、不带 `project_id` 也不是项目任务的修订（`work_package_id` 指向属于项目的根）、契约没有回写目标节点、`recovery.side_effects` 为 `none`；不满足形状的返回 400，没带标记的返回 409 `intake_closed`。
   - 任意模式下都可以提交验收运行；job 带 `acceptance_run`，`GET /jobs?acceptance_run=1` 列出它们。
 - 备份清单（`backup-manifest.json`）带 `event_seq`：快照里最后一条事件的序号。
 - `GET /activity?after=<seq>`（read）→ `{"after", "last_seq", "jobs": [{"job_id", "title", "acceptance_run", "coordinates", "project_id"}], "ordinary_jobs", "acceptance_jobs", "counts", "disposable"}`：序号大于 `after` 的事件里受理的任务与各类事实的数量（确认的检查点、发布、验收、下载、基线、项目、节点写回 `integrated`、已写入的应用 `applications_written` 等）。协调回合随它协调的任务归类。`disposable` 为 true 表示其间没有普通任务，也没有任何写回或应用。
@@ -582,7 +582,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - `POST /projects/{id}/plans` `{"request_id", "job_id", "node_id"}` → 201 op（`kind: project_plan`），结果经 `GET /operations/{op_id}` 读取。
   - `POST /projects/{id}/applications` 带 `node_id` 时是远端写回：`{"request_id", "application_id", "job_id", "checkpoint_id", "node_id", "expected_base_manifest_sha256", "skip_conflicts"?, "plan"?}` → 201 应用记录，`status: started`，另带 `target_node_id`、`operation_id`（这次写回的 `project_apply` 操作）与 `skip_conflicts`，`device` 为节点名。`expected_base_manifest_sha256` 必填（任务没有输入时为 null）；它与 `checkpoint_id` 是客户端审阅时看到的值，与任务当前的输入基线、已发布检查点不一致返回 409 `conflict`（`details.current`）。不接受 `device` 与其他字段。应用 ID 由客户端给出，不能复用；同一 `request_id` 按 §5 的幂等规则重放原记录，不产生第二项操作。
   - `GET /projects/{id}/applications/{application_id}`（read）→ 应用记录（本机应用与远端写回都适用）。
-  - `POST /projects/{id}/applications/{application_id}/recover` `{"request_id", "action": "status|resume|rollback|abandon"}` → 201 op（`kind: project_recover`）。只用于远端写回、且记录仍为 `started`，否则 409。
+  - `POST /projects/{id}/applications/{application_id}/recover` `{"request_id", "action": "status|resume|rollback|abandon"}` → 201 op（`kind: project_recover`）。只用于远端写回、且记录仍为 `started`，否则 409。`status` 以外的动作在这次应用的 `project_apply` 或另一个非 status 的 `project_recover` 仍为 `requested` 或 `received` 时返回 409（`details.operation_id` 是那项操作）；受理后应用记录带 `recovery_operation_id`，此后只认这项操作的结果，超时后晚到的原应用结果不再结束记录。
   - 校验：任务属于该项目且有已发布检查点（409）；节点在册（404）、未退役（409 `node_retired`）、声明了该项目的绑定（409 `not_bound`）；项目未归档（写回，409 `project_archived`）。
   - 操作参数全部由 controller 按任务记录填写：`project_id`、`job_id`、`checkpoint_id` 与 `manifest_sha256`（已发布检查点）、`base_manifest_sha256`（任务的输入基线，可为 null）、`exclude`（契约的 `workspace.exclude`）；写回另有 `application_id`、`skip_conflicts`，恢复另有 `application_id`、`action`。通用的 `POST /nodes/{id}/operations` 不接受这三种操作（400）。远端写回的结果只由目标节点上报：经 `POST /projects/{id}/applications/{application_id}` 上报远端写回返回 403。
 - 节点执行：只在绑定目录上调用 `agent_collab/project.py` 的 plan、apply、recover（§13.4 的规则：三方比较、冲突缺省不写、`skip_conflicts` 时部分写入、逐文件备份与日志、中断后续写、回滚或按现状结束）；应用日志与备份在节点数据目录的 `projects/` 里。manifest 与成果内容用节点令牌经 `GET /blobs/<sha256>` 取得并核对哈希（节点令牌此前就可读 blob，没有新增权限）。节点同一时间只执行一项这类操作。

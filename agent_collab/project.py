@@ -562,16 +562,29 @@ def recover(state_dir, application_id, action='status', fetch=None, progress=Non
         raise ProjectError('no_application', '本机没有这次应用操作的记录：%s' % application_id) from None
     root, backup, locations = Path(record['root']), journal / 'backup', record.get('locations')
     files, written, remaining, diverged = record['files'], [], [], []
+    try:
+        with open(str(journal / 'done.log'), encoding='utf-8') as log:
+            logged = {json.loads(line)['path'] for line in log if line.strip()}
+    except FileNotFoundError:
+        logged = set()
     for change in record['changes']:
         name, entry = change['path'], files.get(change['path'])
         try:
             path = local_path(root, name, locations)
             current = file_hash(path) if path.is_file() else None
+            mode = None if current is None or os.name == 'nt' else bool(os.stat(str(path)).st_mode & 0o111)
         except (ProjectError, OSError):
             diverged.append(name)
             continue
-        target = entry['sha256'] if entry and change['action'] != 'delete' else None
-        if current == target:
+        if entry and change['action'] != 'delete':
+            at_target = current == entry['sha256'] and (mode is None or mode == entry['executable'])
+        else:
+            at_target = current is None
+        # 内容与成果一致不等于已写入（只改可执行位时成果与输入的哈希相同）：以逐文件日志为准。没有日志、
+        # 但已是成果内容的，只在写入确实开始过（有备份，或这是新建文件）时算已写入，即写完到记日志之间被打断。
+        if name in logged:
+            (written if at_target else diverged).append(name)
+        elif at_target and (change['action'] == 'add' or (backup / name).is_file()):
             written.append(name)
         elif current == change.get('expect'):
             remaining.append(name)
@@ -603,8 +616,12 @@ def recover(state_dir, application_id, action='status', fetch=None, progress=Non
             try:
                 if saved.is_file():
                     atomic_write(path, saved.read_bytes(), stat.S_IMODE(os.lstat(str(saved)).st_mode) if os.name != 'nt' else 0o644)
-                elif path.is_file():
-                    path.unlink()  # 这次应用新建的文件
+                elif change['action'] == 'add':
+                    if path.is_file():
+                        path.unlink()  # 这次应用新建的文件
+                else:
+                    kept.append(name)  # 没有备份就无法还原，不删除原有文件
+                    continue
                 restored.append(name)
             except OSError:
                 kept.append(name)

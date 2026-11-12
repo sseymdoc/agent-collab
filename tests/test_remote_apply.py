@@ -313,6 +313,38 @@ class RemoteTimeoutTests(RemoteCase):
         self.assertEqual((late['status'], late['reported_status'], late['result']['application']['status']), ('timed_out', 'succeeded', 'applied'))
         self.assertEqual(self.current(job)['integration_status'], 'integrated')
 
+    def test_recovery_waits_for_the_pending_application_and_then_only_its_result_counts(self):
+        self.bind()
+        job = self.published()
+        gate, original = threading.Event(), project.apply
+
+        def slow(*args, **kwargs):
+            gate.wait(30)
+            return original(*args, **kwargs)
+
+        def recover(action, status=201):
+            return self.call('POST', '/projects/%s/applications/%s/recover' % (self.pid, started['application_id']),
+                             {'request_id': uid(), 'action': action}, status=status)
+        with mock.patch.object(project, 'apply', slow):
+            started = self.apply(job)
+            self.drive(lambda: self.op(started['operation_id'])['status'] == 'received')
+            # 原应用还在节点上执行：变更型恢复要等它；只读的 status 不受影响。
+            refused = recover('rollback', status=409)
+            self.assertEqual((refused['error']['code'], refused['error']['details']['operation_id']), ('conflict', started['operation_id']))
+            recover('status')
+            self.clock.advance(self.app.config['project_operation_timeout_s'] + 1)
+            self.app.tick()
+            # 原应用超时、结果待确认：可以回滚；节点上排在原应用之后执行，晚到的原应用结果不结束记录。
+            rollback = recover('rollback')
+            self.assertEqual(self.application(started)['recovery_operation_id'], rollback['op_id'])
+            recover('abandon', status=409)
+            gate.set()
+            self.drive(lambda: self.op(rollback['op_id'])['status'] in ('succeeded', 'failed'))
+        done = self.application(started)
+        self.assertEqual(self.op(started['operation_id'])['result']['application']['status'], 'applied')
+        self.assertEqual((done['status'], done['detail'].get('rolled_back'), done['detail']['operation_id'], tree(self.folder)),
+                         ('failed', True, rollback['op_id'], INPUTS))
+
 
 class RemoteRestartTests(RemoteCase):
     def counting(self):

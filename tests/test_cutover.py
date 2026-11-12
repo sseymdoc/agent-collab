@@ -29,6 +29,9 @@ class IntakeTests(CutoverCase):
         owner = self.pair('owner', name='owner')['client_token']
         operator = self.pair('operator', name='op')['client_token']
         self.assertEqual(self.call('GET', '/overview')['intake']['mode'], 'open')
+        project = self.call('POST', '/projects', {'request_id': uid(), 'name': 'real'}, status=201)
+        project_job = self.submit(token=owner, project_id=project['project_id'])
+        self.mutate(project_job, 'cancel')
         accepted = self.submit(token=operator)
         self.assertEqual(self.set_intake('closed', token=operator, reason='x', status=403)['error']['details'], {'required_scope': 'maintain'})
         self.set_intake('closed', status=400)  # 关闭必须说明原因
@@ -39,15 +42,15 @@ class IntakeTests(CutoverCase):
             refused = self.submit(token=token, status=409)['error']
             self.assertEqual((refused['code'], refused['details']['intake']['mode']), ('intake_closed', 'closed'))
         self.assertEqual(self.submit(token=owner, acceptance_run=True, status=409)['error']['code'], 'intake_closed')
-        self.assertEqual(len(self.call('GET', '/jobs', token=operator)['jobs']), 1)
+        self.assertEqual(len(self.call('GET', '/jobs', token=operator)['jobs']), 2)
         self.mutate(accepted, 'cancel')
 
         # 只开放验收运行：要有 maintain 权限、带标记、不产生外部写入；这样的任务带着标记，事后可以整批找出来。
         self.set_intake('acceptance', token=owner, reason='升级后验收')
         self.assertEqual(self.submit(token=owner, status=409)['error']['code'], 'intake_closed')
         self.assertEqual(self.submit(token=operator, acceptance_run=True, status=403)['error']['details'], {'required_scope': 'maintain'})
-        project = self.call('POST', '/projects', {'request_id': uid(), 'name': 'real'}, status=201)
         for unsafe in ({'project_id': project['project_id']},
+                       {'work_package_id': project_job['work_package_id']},  # 修订会继承根的项目
                        {'contract': contract(integration={'target_node_id': 'n', 'target_path': '/srv/project'})},
                        {'contract': contract(recovery={'auto': True, 'side_effects': 'manual'})}):
             self.submit(token=owner, acceptance_run=True, status=400, **unsafe)

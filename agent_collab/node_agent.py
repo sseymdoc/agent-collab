@@ -855,11 +855,13 @@ class Agent:
                 continue
             if op_id in self.ops:
                 continue
-            self.ops.add(op_id)
             try:
                 self.client.json('POST', '/nodes/%s/operations/%s' % (self.config['node_id'], op_id), {'status': 'received'})
             except APIError:
+                self.ops.add(op_id)
                 continue  # 操作已不存在或已有结果
+            # 确认送达后才记为已处理：连接失败时异常向上走重连，下一次心跳仍会带上它，再确认一次。
+            self.ops.add(op_id)
             if kind == 'log_tail':
                 self.op_outbox[op_id] = self.guarded(lambda: self.log_tail(params))
             elif kind == 'probe':
@@ -915,13 +917,33 @@ class Agent:
             return {'retained': True, 'streams': index, 'missing': stream != 'index'}
         offset, limit = int(params.get('offset', 0)), min(int(params.get('max_bytes', 65536)), 262144)
         size = streams[stream].stat().st_size
+        secrets = [secret.encode('utf-8') for secret in self.secrets if secret]
+        margin = max(map(len, secrets), default=1) - 1
         while True:
+            # 前后多读一个凭据长度：跨越分块边界的凭据也能认出来，落在本块里的那部分同样遮住，分块拼接也拿不到完整凭据。
+            start = min(max(offset, 0), size)
+            before = min(start, margin)
             with streams[stream].open('rb') as source:
-                source.seek(min(max(offset, 0), size))
-                raw = source.read(limit)
+                source.seek(start - before)
+                window = source.read(before + limit + margin)
+            raw = window[before:before + limit]
+            hidden = bytearray(len(window))
+            for secret in secrets:
+                found = window.find(secret)
+                while found >= 0:
+                    hidden[found:found + len(secret)] = b'\x01' * len(secret)
+                    found = window.find(secret, found + 1)
+            hidden = hidden[before:before + limit]
+            text, i = [], 0
+            while i < len(raw):
+                j = i
+                while j < len(raw) and hidden[j] == hidden[i]:
+                    j += 1
+                text.append('[REDACTED]' if hidden[i] else raw[i:j].decode('utf-8', 'replace'))
+                i = j
             # 按文本返回并脱敏；转义后超出 controller 的结果上限时减半再取，next_offset 始终按原始字节计。
             result = {'retained': True, 'stream': stream, 'offset': offset, 'next_offset': offset + len(raw), 'total_bytes': size,
-                      'eof': offset + len(raw) >= size, 'data': self.clean(raw.decode('utf-8', 'replace')), 'streams': index}
+                      'eof': offset + len(raw) >= size, 'data': self.clean(''.join(text)), 'streams': index}
             if len(p.canonical_json(result)) <= 700000 or limit <= 1024:
                 return result
             limit //= 2

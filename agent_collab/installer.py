@@ -376,9 +376,17 @@ def worker_python(python, exists=None):
     return sibling if (exists or Path.is_file)(Path(sibling)) else str(python)
 
 
+def login_name():
+    # 容器里的 uid 可能没有 passwd 条目（getuser 在 3.9 抛 KeyError、3.13 起抛 OSError）；loginctl 也接受 uid。
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        return str(os.getuid())
+
+
 def default_windows_workspace(env=None, username=None):
     env = os.environ if env is None else env
-    return ntpath.join(env.get('SystemDrive', 'C:') + '\\', 'agent-collab-work', username or getpass.getuser())
+    return ntpath.join(env.get('SystemDrive', 'C:') + '\\', 'agent-collab-work', username or login_name())
 
 
 def workspace_acl_commands(root, user_directory, user_sid, sandbox_group=False):
@@ -741,7 +749,7 @@ def service_context(config):
         unattended = manager == 'systemd-system'
         if manager == 'systemd-user':
             try:
-                response = run(['loginctl', 'show-user', getpass.getuser(), '--property=Linger', '--value'], check=False)
+                response = run(['loginctl', 'show-user', login_name(), '--property=Linger', '--value'], check=False)
                 unattended = response.returncode == 0 and response.stdout.strip() == 'yes'
             except OSError:
                 pass

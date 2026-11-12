@@ -521,6 +521,36 @@ class InterruptionTests(ApplyCase):
         self.assertEqual((rolled['status'], rolled['restored'], rolled['kept'], (self.root / 'a.txt').read_text()),
                          ('partial', [], ['a.txt'], 'edited after the interrupted apply'))
 
+    @unittest.skipIf(os.name == 'nt', '可执行位只在 POSIX 上记录')
+    def test_mode_only_change_interrupted_before_its_write_is_remaining_and_rollback_keeps_the_file(self):
+        result = self.result({'a.txt': 'a1', 'b.txt': 'b0'})
+        for entry in result['files']:
+            if entry['path'] == 'b.txt':
+                entry['executable'] = True
+        real, calls = project._write_one, []
+
+        def crash(root, change, *rest):
+            if calls:
+                raise KeyboardInterrupt()
+            calls.append(change['path'])
+            return real(root, change, *rest)
+        application = str(uuid.uuid4())
+        with patch.object(project, '_write_one', side_effect=crash), self.assertRaises(KeyboardInterrupt):
+            project.apply(self.root, self.base, result, self.fetch, self.state, application, exclude=[])
+        status = project.recover(self.state, application)
+        self.assertEqual((status['written'], status['remaining'], status['diverged']), (['a.txt'], ['b.txt'], []))
+        rolled = project.recover(self.state, application, 'rollback')
+        self.assertEqual((rolled['status'], rolled['restored'], rolled['kept']), ('rolled_back', ['a.txt'], []))
+        self.assertEqual(((self.root / 'a.txt').read_text(), (self.root / 'b.txt').read_text()), ('a0', 'b0'))
+
+    def test_written_file_without_backup_is_kept_not_deleted_on_rollback(self):
+        result, application = self.interrupted()
+        journal = project._journal_dir(self.state, application)
+        (journal / 'backup' / 'a.txt').unlink()
+        rolled = project.recover(self.state, application, 'rollback')
+        self.assertEqual((rolled['status'], rolled['restored'], rolled['kept'], (self.root / 'a.txt').read_text()),
+                         ('partial', [], ['a.txt'], 'a1'))
+
     def test_abandoning_records_the_outcome_as_unknown_not_as_applied(self):
         result, application = self.interrupted()
         left = project.recover(self.state, application, 'abandon')
