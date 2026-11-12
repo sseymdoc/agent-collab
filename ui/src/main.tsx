@@ -91,7 +91,11 @@ function App() {
     ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={async (opened, _c, live) => {
       setEpoch(opened.epoch)
       // 只在失败的仍是当前这条连接时离开：期间若已换了连接，旧身份请求的失败不能关掉新连接。
-      await enter(live, opened.epoch).catch(e => { if (currentEpoch() === opened.epoch && live()) leave(errText(e)) })
+      await enter(live, opened.epoch).catch(e => {
+        // 流程已被取代：无论身份请求成功与否，都按这条连接的代次关闭它（外壳拒绝过期的代次，不会关掉更新的连接）。
+        if (!live()) return void invoke('connection_close', { epoch: opened.epoch }).catch(() => {})
+        if (currentEpoch() === opened.epoch) leave(errText(e))
+      })
     }} />
     : <Login onDone={() => void enter().catch(e => setPhase(p => ({ ...p, at: 'boot', error: errText(e) })))} />
   // 浏览器退出要等 DELETE /session 答复后再显示登录页：否则马上重新登录时，迟到的旧答复会清掉新会话的 Cookie 和 CSRF 令牌。

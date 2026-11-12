@@ -100,7 +100,7 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 
   前置条件：controller 已停止（命令取得数据目录的锁），派单已暂停，提交闸门不是 `open`；不满足时拒绝。效果见上表：恢复代次加一，全部 attempt 的租约令牌作废，协调租约失效，每个节点下次心跳被要求对账：心跳本身照常成功，返回 `reconcile_required: true`，旧代次的 attempt 列在 `revoked` 里；对账完成之前的领取，以及旧代次的检查点、完成与发布请求以 `fenced`（`stale_generation`）被拒绝。它写一条 `controller.barrier` 事件（原因、前后代次、被撤销的活动 attempt 数）；同一 `request_id` 重复执行不再推进代次。
 - 屏障（与恢复一样）之后，屏障之前已经结束、但还没发布的成果不能再发布：发布同样按 attempt 的代次核对，旧代次的成果以 `fenced/stale_generation` 被拒绝，客户端发布也一样。前置条件把这类任务算作已结束，所以运行屏障之前先发布（或明确放弃）需要保留的成果；屏障之后只能重跑。旧租约的进度事件不报 409，按 `stale: true` 记录、不改变状态。
-- 证明方法：在隔离副本上（预演恢复出的 `--work` 目录，或备份的副本）执行屏障，再用屏障之前的代次与租约发出心跳、检查点、完成与发布请求：心跳应当成功并返回 `reconcile_required: true`、旧 attempt 列在 `revoked` 里，检查点、完成与发布应当以 `fenced/stale_generation` 被拒绝；`tests/test_cutover.py` 对这四类请求以及“普通重启后同样的请求照常被接受”做了对照。恢复预演（`late_results_fenced`）证明的是恢复路径，不能用来说明普通原位升级的效果。
+- 证明方法：在隔离副本上（预演恢复出的 `--work` 目录，或备份的副本）先建立一份屏障之前有效的执行权：恢复本身已撤销副本里原有的 attempt 并推进了代次，所以要在副本上启动 controller、恢复派单、提交一个验收运行并让测试节点领取，确认它的心跳与检查点被接受；然后暂停派单、关闭提交闸门、停止 controller、执行屏障，再用这份租约与屏障之前的代次发出心跳、检查点、完成与发布请求：心跳应当成功并返回 `reconcile_required: true`、旧 attempt 列在 `revoked` 里，检查点、完成与发布应当以 `fenced/stale_generation` 被拒绝；`tests/test_cutover.py` 对这四类请求以及“普通重启后同样的请求照常被接受”做了对照。恢复预演（`late_results_fenced`）证明的是恢复路径，不能用来说明普通原位升级的效果。
 
 ## 回退边界
 

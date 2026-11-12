@@ -139,6 +139,9 @@ def shrink(value, limit):
     return value
 
 
+RETAIN_S = 30 * 86400  # 已上报或已放弃的操作记录保留 30 天
+
+
 class ProjectOps:
     """节点上的远端写回执行器。主循环在每次心跳后调用 pump()；执行在后台线程里一次一项。"""
 
@@ -150,10 +153,13 @@ class ProjectOps:
         self.client = Client(agent.config['controller'], agent.client.token, agent.config.get('ca_file'), transport)
         self.client.error_filter = agent.clean
         self.records, self.thread = {}, None
-        # ponytail: operations/*.json 不清理（每项几百字节，结果上报后去掉正文）；要回收时按 reported 且早于 N 天删除。
         for path in sorted(self.folder.glob('*.json')):
             record = _load(path, None)
             if not isinstance(record, dict) or record.get('op_id') != path.stem:
+                continue
+            if record.get('state') in ('reported', 'abandoned') and time.time() - record.get('at', 0) > RETAIN_S:
+                # 已结束的操作只保留一段时间：足够覆盖 controller 从近期备份恢复后的再次下发，之后删除，不让数据目录一直增长。
+                path.unlink()
                 continue
             if record['state'] == 'running':
                 # 上一个进程在执行中退出：不再执行，按本机应用日志确定能确定的结果，之后补报。
@@ -192,6 +198,8 @@ class ProjectOps:
                     ack = None
                 received = (ack or {}).get('status') == 'received'
                 if record['state'] == 'replay':
+                    # 已经执行过：controller 回答 timed_out 时也补报结果（从不重新执行，只对账）。
+                    received = received or (ack or {}).get('status') == 'timed_out'
                     if received and record['kind'] == 'project_recover' and record['params'].get('action') == 'status':
                         self.save(dict(record, state='queued'))  # 只读的现状核对：再做一次，得到当前的 report
                         continue

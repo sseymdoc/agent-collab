@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import shutil
 import threading
 import time
 import unittest
@@ -366,10 +367,11 @@ class RemoteTimeoutTests(RemoteCase):
         self.clock.advance(self.app.config['project_operation_timeout_s'] + 1)
         self.app.tick()
         self.assertEqual((self.op(started['operation_id'])['status'], self.application(started)['status']), ('timed_out', 'started'))
-        recover = self.call('POST', '/projects/%s/applications/%s/recover' % (self.pid, started['application_id']),
-                            {'request_id': uid(), 'action': 'abandon'}, status=201)
-        self.drive(lambda: self.op(recover['op_id'])['status'] in ('succeeded', 'failed'))
-        self.assertEqual((self.application(started)['status'], tree(self.folder)), ('unknown', OUTPUTS))  # 按现状结束：如实记为未知
+        # 节点再次拿到它（恢复后的心跳下发了到期前的 requested）：不重新执行，补报本机日志里的结果，已知的写入结果照样落到记录上。
+        op = self.op(started['operation_id'])
+        self.agent.projects.offer(op['op_id'], op['kind'], op['params'])
+        self.drive(lambda: self.application(started)['status'] != 'started')
+        self.assertEqual((self.application(started)['status'], tree(self.folder)), ('applied', OUTPUTS))
 
     def test_unsettled_application_blocks_retirement_counts_as_activity_and_unreceived_ones_end_at_the_barrier(self):
         self.bind()
@@ -456,6 +458,38 @@ class RemoteRestartTests(RemoteCase):
             self.assertEqual((done['status'], done['detail']['reason'], done['detail']['written'], len(calls)),
                              ('failed', 'interrupted_before_write', [], 2))
 
+    def test_reported_unknown_without_a_local_record_is_replayed_after_restore(self):
+        self.bind()
+        job = self.published()
+        original, wrote = project._write_one, []
+
+        def crash(*args, **kwargs):
+            if wrote:
+                raise SystemExit('simulated crash')
+            wrote.append(args[1]['path'])
+            return original(*args, **kwargs)
+        with mock.patch.object(project, '_write_one', crash):
+            started = self.apply(job)
+            self.drive(lambda: wrote and not self.agent.projects.thread.is_alive())
+        self.restart()
+        self.drive(lambda: self.op(started['operation_id'])['status'] in ('succeeded', 'failed'))
+        shutil.rmtree(str(self.directory / 'projects' / 'applies' / started['application_id']))  # 节点上已没有这次写回的本机记录
+        recover = self.call('POST', '/projects/%s/applications/%s/recover' % (self.pid, started['application_id']),
+                            {'request_id': uid(), 'action': 'abandon'}, status=201)
+        self.app.close()
+        backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)  # 备份时恢复操作还是 requested
+        self.app = App(self.temp / 'data', clock=self.clock)
+        self.drive(lambda: self.application(started)['status'] != 'started')
+        self.assertEqual((self.application(started)['status'], self.application(started)['detail']['reason']), ('unknown', 'no_local_record'))
+        self.app.close()
+        restore(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        self.app = App(self.temp / 'data', clock=self.clock)
+        self.assertEqual(self.application(started)['status'], 'started')
+        # 再次下发：没有本机日志可以推断，补报的是第一次上报时保存的结果。
+        self.drive(lambda: self.application(started)['status'] != 'started')
+        done = self.application(started)
+        self.assertEqual((done['status'], done['detail']['reason'], self.op(recover['op_id'])['status']), ('unknown', 'no_local_record', 'succeeded'))
+
     def test_interrupted_write_stays_started_and_is_recovered_on_the_node(self):
         self.bind()
         job = self.published()
@@ -532,6 +566,17 @@ class RemoteLimitsTests(RemoteCase):
         self.assertEqual(caught.exception.code, 'too_many_bindings')
         node_projects.bind(self.directory, next(iter(stored)), self.folder)  # 已有的绑定可以改，不受上限影响
         self.assertNotIn(chr(92), node_projects.root_name('/srv/a' + chr(92) + 'b'))
+
+    def test_finished_operation_records_are_removed_after_the_retention_window(self):
+        self.bind()
+        job = self.published()
+        done = self.settled(self.apply(job))
+        record = self.agent.projects.folder / (done['operation_id'] + '.json')
+        self.assertTrue(record.is_file())
+        self.agent.projects.thread and self.agent.projects.thread.join(10)
+        with mock.patch.object(node_projects.time, 'time', return_value=time.time() + node_projects.RETAIN_S + 60):
+            node_projects.ProjectOps(self.agent)
+        self.assertFalse(record.exists())
 
     def test_result_rejected_as_too_large_is_shrunk_and_reported_again(self):
         self.bind()

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import unicodedata
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -403,12 +404,18 @@ class SafetyTests(ApplyCase):
         with self.assertRaises(project.ProjectError) as caught:
             self.apply(self.result({'a.txt': 'a1'}))
         self.assertEqual((caught.exception.code, (self.root / 'a.txt').read_text()), ('unfinished_application', 'a0'))
+        # 进程在写标记时被终止留下的空标记：过了时限不再挡住目录。
+        old = time.time() - project.STALE_MARKER_S - 5
+        os.utime(str(marker), (old, old))
+        self.assertEqual(self.apply(self.result({'a.txt': 'a1'}))['status'], 'applied')
+        marker.write_text('', encoding='utf-8')  # 刚出现的空标记仍视为另一次应用正在占用
         # 没占到目录就没有开始：不向 controller 登记，也不留下日志。
-        registered = []
+        registered, current = [], project.scan(self.root, exclude=[])['manifest']
+        journals = lambda: sorted(d.name for d in (Path(self.state) / 'applies').iterdir() if d.name != 'roots')
+        before = journals()
         with self.assertRaises(project.ProjectError):
-            self.apply(self.result({'a.txt': 'a1'}), before_write=registered.append)
-        self.assertEqual(registered, [])
-        self.assertEqual([d.name for d in (Path(self.state) / 'applies').iterdir() if d.name != 'roots'], [])
+            self.apply(self.result({'a.txt': 'a2'}, base=current), base=current, before_write=registered.append)
+        self.assertEqual((registered, journals()), ([], before))
 
     def test_rollback_keeps_a_file_edited_after_the_status_check(self):
         real, calls = project._write_one, []

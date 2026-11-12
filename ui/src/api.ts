@@ -81,7 +81,8 @@ async function send(method: string, path: string, body?: string, extra: Record<s
     throw new ApiError(0, code, typeof e?.message === 'string' ? e.message : '无法连接 controller')
   }
   if (r.status < 200 || r.status >= 300) {
-    if (r.status === 401) { setCsrf(null); unauthorized('unauthorized') }
+    // 与上面相同：只有当前连接代次的请求得到 401 才回到登录或连接页，旧流程迟到的 401 不关掉新连接。
+    if (r.status === 401 && mine === currentEpoch()) { setCsrf(null); unauthorized('unauthorized') }
     let data: any = null
     try { data = JSON.parse(r.body) } catch { /* 不是 JSON 错误体 */ }
     const e = data?.error ?? {}

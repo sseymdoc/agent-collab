@@ -878,7 +878,8 @@ class App:
         if status not in ('received', 'succeeded', 'failed'):
             raise ValueError('status must be received, succeeded or failed')
         # 已领取但超时的远端写回：节点之后报来的结果仍要落到应用记录上。这是对账，不是重复执行（§13.10）。
-        late = (op['status'] == 'timed_out' and op['received_at'] and status != 'received'
+        # 从备份恢复后保留的写回（restored）在恢复后的数据里没有 received_at，但节点可能在备份之后已经执行过，同样接受。
+        late = (op['status'] == 'timed_out' and (op['received_at'] or op.get('restored')) and status != 'received'
                 and op['kind'] in ('project_apply', 'project_recover'))
         if op['status'] in ('succeeded', 'failed', 'timed_out') and not late:
             return response({'op_id': op_id, 'status': op['status']})  # 重发或迟到的上报不改变已定的结果
