@@ -1,14 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, lost } from './api'
 import { currentEpoch, openStream } from './transport'
 
 // 事件流只触发刷新；事实以 GET 快照为准。这里负责：按序号续读与去重、断线退避重连、
 // 游标过期（snapshot_required）后先刷新快照、再补读仍保留的事件、最后从补读到的位置续流，凭据失效时交回连接页。
 // lastAt 是最近一次收到事件或成功连上的时间：断线期间页面显示它，不把旧数据当作实时。
-export type Live = { state: 'connecting' | 'open' | 'retrying'; lastSeq: number | null; tick: number; lastAt: number | null }
+// forbidden：这份凭据没有读取事件的权限（403）。凭据仍然有效，所以不离开连接、也不反复重连；页面改为手动刷新。
+export type Live = { state: 'connecting' | 'open' | 'retrying' | 'forbidden'; lastSeq: number | null; tick: number; lastAt: number | null }
 
-export function useLive(enabled: boolean): Live {
+// onEvent：每条去重后的新事件（已解析的 event 记录），供系统通知判断；不影响刷新逻辑。
+export function useLive(enabled: boolean, onEvent?: (ev: any) => void): Live {
   const [live, setLive] = useState<Live>({ state: 'connecting', lastSeq: null, tick: 0, lastAt: null })
+  const listener = useRef(onEvent)
+  listener.current = onEvent
   useEffect(() => {
     if (!enabled) return
     let cursor = 0, close = async () => {}, timer: number | undefined, retry: number | undefined, healthy: number | undefined, delay = 1000, stopped = false
@@ -54,6 +58,7 @@ export function useLive(enabled: boolean): Live {
           if (!n || n <= cursor) return // 重连后服务端可能重发已读过的事件
           cursor = n
           lastMin = null
+          if (listener.current) try { listener.current(JSON.parse(e.data ?? 'null')) } catch { /* 数据异常不影响刷新 */ }
           bump()
         } else if (e.kind === 'snapshot_required') {
           // controller 已裁剪到 min_seq 之后（或恢复过数据）：先刷新快照，再从 min_seq-1 补读仍保留的事件，
@@ -75,6 +80,9 @@ export function useLive(enabled: boolean): Live {
         } else if (e.kind === 'unauthorized') {
           stopped = true
           lost('unauthorized')
+        } else if (e.kind === 'forbidden') {
+          stopped = true
+          setLive(l => ({ ...l, state: 'forbidden' }))
         } else if ((e.data === 'controller_mismatch' || e.data === 'stale_connection') && mine === currentEpoch()) {
           // 桌面端：外壳已关闭这条连接，用同一代次重连只会一直得到 stale_connection，交回连接页。
           stopped = true

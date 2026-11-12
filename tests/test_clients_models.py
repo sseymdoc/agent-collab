@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 
 from agent_collab import domain as d, protocol as p
@@ -29,7 +30,8 @@ def caps(models=None, status='ok'):
     value = {'os': 'linux', 'arch': 'x86_64', 'tools': {'python3': '3.9'}, 'gpu': [], 'labels': [],
              'harness': {'stub': '1', 'codex': '1'}}
     if models is not None:
-        value['models'] = {'codex': {'status': status, 'source': 'test', 'fetched_at': None, 'cli_version': '1', 'reason': None,
+        # 取得时间与夹具时钟（helpers.Clock）一致：目录按有效期判断新旧。
+        value['models'] = {'codex': {'status': status, 'source': 'test', 'fetched_at': d.timestamp(1804800000.0), 'cli_version': '1', 'reason': None,
                                      'models': [{'id': m, 'efforts': list(e), 'default_effort': None} for m, e in models.items()]}}
     return value
 
@@ -260,6 +262,51 @@ class StreamRevocationTests(ClientCase):
             server.server_close()
             thread.join(5)
 
+    def test_missing_read_permission_is_forbidden_not_unauthorized_and_keeps_the_credential(self):
+        """403 与 401 是两回事：权限不足的凭据仍然有效，它被允许的操作照常可用，流内帧也不是 unauthorized。"""
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+        server = Server(('127.0.0.1', 0), HTTPHandler)
+        server.app, server.stopping = self.app, threading.Event()
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
+        thread.start()
+        base = 'http://127.0.0.1:%d%s' % (server.server_address[1], p.API_PREFIX)
+        try:
+            # 只读客户端做变更：403，说明缺哪项权限；之后的读取照常成功，凭据没有被撤销。
+            viewer = self.pair('viewer', name='viewer')
+            denied = self.call('POST', '/dispatch', {'request_id': uid(), 'paused': True, 'expected_version': 1},
+                               token=viewer['client_token'], status=403)
+            self.assertEqual(denied['error']['details'], {'required_scope': 'maintain'})
+            self.assertEqual(self.call('GET', '/client', token=viewer['client_token'])['identity']['name'], 'viewer')
+            self.call('GET', '/overview', token=viewer['client_token'])
+            self.assertIsNone(next(c for c in self.call('GET', '/clients')['clients'] if c['name'] == 'viewer')['revoked_at'])
+
+            # 没有 read 权限的客户端打开事件流：HTTP 403（不是 401），身份自检仍然成功。
+            writer = self.pair(scopes=['tasks'], name='writer')
+            request = urllib.request.Request(base + '/events/stream?cursor=0', headers={'Authorization': 'Bearer ' + writer['client_token']})
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(request, timeout=20)
+            self.assertEqual(refused.exception.code, 403)
+            refused.exception.close()
+            self.assertEqual(self.call('GET', '/client', token=writer['client_token'])['identity']['scopes'], ['tasks'])
+
+            # 已打开的流在权限被收回后收到 forbidden 帧（凭据本身还在），而不是 unauthorized。
+            request = urllib.request.Request(base + '/events/stream?cursor=0', headers={'Authorization': 'Bearer ' + viewer['client_token']})
+            with urllib.request.urlopen(request, timeout=20) as stream:
+                self.assertTrue(stream.readline().startswith(b'id: '))
+                record = next(c for c in self.call('GET', '/clients')['clients'] if c['name'] == 'viewer')
+                with self.app.store.transaction():
+                    self.app.store.put('client', record['client_id'], dict(record, scopes=['tasks']))
+                rest = stream.read()
+            self.assertTrue(rest.endswith(b'event: forbidden\ndata: {}\n\n'), rest[-200:])
+            self.assertNotIn(b'event: unauthorized', rest)
+            self.assertEqual(self.call('GET', '/client', token=viewer['client_token'])['identity']['scopes'], ['tasks'])
+        finally:
+            server.stopping.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
+
 
 class ModelSettingsTests(ClientCase):
     def test_new_database_starts_unset_and_rejects_instead_of_guessing(self):
@@ -270,7 +317,8 @@ class ModelSettingsTests(ClientCase):
         job = self.codex_job(model=A, effort='low')  # 部署未作限制时，显式给全即可
         self.assertEqual(job['model_policy'], {'schema': 1, 'settings_revision': 0, 'requested': {'model': A, 'effort': 'low'},
                                                'resolved': {'model': A, 'effort': 'low'},
-                                               'source': {'model': 'task_override', 'effort': 'task_override'}})
+                                               'source': {'model': 'task_override', 'effort': 'task_override'},
+                                               'unverified_nodes': 'wait'})
         self.assertIsNone(self.job()['model_policy'])  # 不调用模型的任务没有模型策略
         for bad in ({'model': 'bad name', 'effort': 'low'}, {'model': A, 'effort': 'Very High'}, {'model': 5, 'effort': 'low'}):
             self.codex_job(status=400, **bad)
@@ -283,7 +331,7 @@ class ModelSettingsTests(ClientCase):
         one, two = first['client_token'], second['client_token']
         codex = {'default': {'model': A, 'effort': 'high'}, 'allowed': {A: ['high', 'max'], B: ['low']}}
         saved = self.put(one, expected_revision=0, codex=codex)
-        self.assertEqual((saved['revision'], saved['codex'], saved['claude']), (1, codex, EMPTY_CLAUDE))
+        self.assertEqual((saved['revision'], saved['codex'], saved['claude']), (1, dict(codex, unverified_nodes='wait'), EMPTY_CLAUDE))
         self.assertEqual(saved['updated_by'], {'kind': 'client', 'client_id': first['client_id'], 'name': 'one'})
         self.assertEqual(self.call('GET', '/settings/models', token=two)['settings'], saved)
         conflict = self.put(two, status=409, expected_revision=0, codex=dict(codex, default={'model': B, 'effort': 'low'}))['error']
@@ -291,7 +339,7 @@ class ModelSettingsTests(ClientCase):
         self.assertEqual(self.models()['settings'], saved)  # 过期的写入没有覆盖
         claude = {'default': {'model': 'coordinator-model', 'effort': 'xhigh'}}
         updated = self.put(two, expected_revision=1, claude=claude)
-        self.assertEqual((updated['revision'], updated['codex'], updated['claude']), (2, codex, claude))  # 两组互不覆盖
+        self.assertEqual((updated['revision'], updated['codex'], updated['claude']), (2, dict(codex, unverified_nodes='wait'), claude))  # 两组互不覆盖
         for bad in (dict(codex, default={'model': B, 'effort': 'high'}), dict(codex, allowed={}), dict(codex, allowed={A: []}),
                     dict(codex, allowed={A: ['high', 'high']}), dict(codex, default={'model': A, 'effort': None}),
                     dict(codex, extra=1), {'default': codex['default']}):
@@ -306,7 +354,8 @@ class ModelSettingsTests(ClientCase):
         view = self.models()
         self.assertEqual(view['settings'], updated)
         self.assertEqual([(h['revision'], h['actor']['name'], h['before']['codex'], h['after']['codex']) for h in view['history']],
-                         [(1, 'one', d.EMPTY_SETTINGS['codex'], codex), (2, 'two', codex, codex)])
+                         [(1, 'one', d.EMPTY_SETTINGS['codex'], dict(codex, unverified_nodes='wait')),
+                          (2, 'two', dict(codex, unverified_nodes='wait'), dict(codex, unverified_nodes='wait'))])
         self.assertEqual(len([e for e in self.call('GET', '/events')['events'] if e['type'] == 'settings.updated']), 2)
         # 应答丢失后原样重放：返回第一次的结果，不当作版本冲突，也不再递增 revision；同一 request_id 换了内容则拒绝。
         ident = uid()
@@ -324,7 +373,7 @@ class ModelSettingsTests(ClientCase):
         self.restart()
         settings = self.models()['settings']
         self.assertEqual(settings['codex'], {'default': {'model': 'gpt-6-astra', 'effort': 'xhigh'},
-                                             'allowed': {'gpt-6-astra': ['high', 'xhigh', 'max']}})
+                                             'allowed': {'gpt-6-astra': ['high', 'xhigh', 'max']}, 'unverified_nodes': 'wait'})
         self.assertEqual(settings['claude'], {'default': {'model': 'configured-model', 'effort': 'configured-effort'}})
         self.assertEqual((settings['revision'], settings['updated_by']['kind']), (1, 'migration'))
         self.assertEqual(self.codex_job()['contract']['harness_params'],
@@ -398,13 +447,15 @@ class RepairInheritanceTests(ClientCase):
         self.assertEqual(repairs[0]['contract']['harness_params'], {'model': A, 'effort': 'high', 'sandbox': 'workspace-write'})
         self.assertEqual(repairs[0]['model_policy'], {'schema': 1, 'settings_revision': 1, 'requested': {'model': None, 'effort': None},
                                                      'resolved': {'model': A, 'effort': 'high'},
-                                                     'source': {'model': 'root_frozen', 'effort': 'root_frozen'}})
+                                                     'source': {'model': 'root_frozen', 'effort': 'root_frozen'},
+                                                     'unverified_nodes': 'wait'})
         # 累计预算属于根工作包：修复计入 repairs，已用的 attempts 不清零，上限不超过根任务。
         self.assertEqual((root['counters'], repairs[0]['counters']), ({'attempts': 1, 'infra_retries': 0, 'migrations': 0, 'repairs': 1},) * 2)
         self.assertEqual(repairs[0]['contract']['budgets'], root['contract']['budgets'])
         frozen = self.app.get('root', root['work_package_id'])['model_policy']
         self.assertEqual(frozen, {'schema': 1, 'settings_revision': 1,
-                                  'codex': {'model': A, 'effort': 'high', 'allowed': {A: ['high', 'max'], B: ['low']}}})
+                                  'codex': {'model': A, 'effort': 'high', 'allowed': {A: ['high', 'max'], B: ['low']},
+                                            'unverified_nodes': 'wait'}})
 
     def test_legal_effort_override_changes_only_the_effort_and_records_its_source(self):
         root, repairs = self.rework('max')
@@ -491,9 +542,9 @@ class ModelCatalogTests(ClientCase):
         legacy = self.codex_job(model='gpt-6-astra', effort='xhigh')
         self.assertEqual(self.reasons(legacy)['old'], ([], 'legacy'))
         self.assertEqual(self.reasons(legacy)['partial'], (['model_unsupported:gpt-6-astra'], 'ok'))
-        unknown = self.node('unknown', capabilities=caps({}, status='unknown'))  # 目录未知：不排除，也不声称支持
-        self.assertEqual(self.reasons(job)['unknown'], ([], 'unknown'))
-        self.assertEqual(unknown.claim()['job_id'], job['job_id'])
+        unknown = self.node('unknown', capabilities=caps({}, status='unknown'))  # 目录未知：缺省不派单，也不声称不支持
+        self.assertEqual(self.reasons(job)['unknown'], (['model_catalog_unverified:unknown'], 'unknown'))
+        self.assertIsNone(unknown.claim(status=204))
         self.assertIsNone(self.reasons(self.job())['old'][1])  # 不调用模型的任务不看目录
 
     def test_selectable_is_the_intersection_of_policy_and_catalogs(self):
@@ -520,6 +571,7 @@ class ModelCatalogTests(ClientCase):
         self.assertEqual(ok['features'], list(p.FEATURES))
         entry = node.record['capabilities']['models']['codex']
         for bad in ({'other': entry}, {'codex': dict(entry, status='legacy')}, {'codex': dict(entry, models=[{'id': A}])},
+                    {'codex': dict(entry, status='stale', fetched_at=None)}, {'codex': dict(entry, provider=7)}, {'codex': dict(entry, extra=1)},
                     {'codex': dict(entry, models=[{'id': 'bad id', 'efforts': [], 'default_effort': None}])},
                     {'codex': dict(entry, models=[{'id': A, 'efforts': ['Bad'], 'default_effort': None}])},
                     {'codex': {'status': 'ok', 'models': []}}, []):

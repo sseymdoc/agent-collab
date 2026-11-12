@@ -17,14 +17,14 @@ import time
 import threading
 import uuid
 
-from . import protocol as p
+from . import node_projects, project, protocol as p
 from .artifacts import DEFAULT_EXCLUDES, EMPTY, SecretFile, atomic_write, checked_manifest, integrate, materialize, snapshot
 from .client import APIError, Client, ConnectionFailure, validate_url
-from .adapters.codex import CodexAdapter, model_catalog, process_stamp, process_status
+from .adapters.codex import PROVIDER as codex_provider, CodexAdapter, model_catalog, process_stamp, process_status
 from .adapters.claude import ClaudeAdapter
 from .adapters.stub import StubAdapter
 from .adapters.checks import ContractChecks
-from .adapters.commands import CODEX_CLEARED_ENV, resolve_commands, probe_auth, probe_auth_detail
+from .adapters.commands import CODEX_CLEARED_ENV, NO_WINDOW, resolve_commands, probe_auth, probe_auth_detail
 from .release import VERSION, release_info, version_directory
 
 LOG = logging.getLogger(__name__)
@@ -43,10 +43,48 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
+def service_context(environment=None):
+    """这个进程实际所在的运行上下文：用于区分“已安装的后台服务”与“从 SSH 或终端手工启动”。只取事实，不含凭据。"""
+    environment = os.environ if environment is None else environment
+    context = {'user': getpass.getuser(), 'pid': os.getpid(), 'ssh': bool(environment.get('SSH_CONNECTION') or environment.get('SSH_CLIENT')),
+               'launchd_label': environment.get('XPC_SERVICE_NAME') or None, 'windows_session': None, 'tty': False,
+               'systemd_unit': environment.get('INVOCATION_ID') and (environment.get('SYSTEMD_UNIT') or 'systemd') or None}
+    try:
+        context['tty'] = bool(sys.stdin and sys.stdin.isatty())
+    except (OSError, ValueError):
+        pass
+    if os.name == 'nt':
+        try:
+            import ctypes
+            session = ctypes.c_ulong()
+            if ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
+                context['windows_session'] = session.value
+        except (OSError, AttributeError):
+            pass
+    return context
+
+
+def log_streams(directory):
+    """attempt 目录里可以取回的原始输出：固定布局里的固定文件名，别的路径取不到。"""
+    streams = {}
+    def add(name, folder):
+        for kind, filename in (('stdout', 'stdout.jsonl'), ('stderr', 'stderr.log')):
+            file = folder / filename
+            if file.is_file() and not file.is_symlink():
+                streams[name + '.' + kind] = file
+    add('harness', directory)
+    for prefix, pattern, cut in (('check', 'checks/*', 0), ('step', 'step-*', 5)):
+        for folder in directory.glob(pattern):
+            index = folder.name[cut:]
+            if folder.is_dir() and not folder.is_symlink() and index.isdigit() and len(index) <= 2:
+                add('%s.%d' % (prefix, int(index)), folder)
+    return streams
+
+
 def probe(argv, env=None, runner=None):
     try:
         result = (runner or subprocess.run)(argv, env=env, stdin=subprocess.DEVNULL,
-                                            capture_output=True, text=True, timeout=10)
+                                            capture_output=True, text=True, timeout=10, **NO_WINDOW)
         if result.returncode == 0:
             return (result.stdout or result.stderr).strip() or None
     except (OSError, subprocess.TimeoutExpired):
@@ -600,7 +638,13 @@ class Agent:
         if not 0 < self.model_catalog_s < float('inf'):
             raise ValueError('model_catalog_s must be positive and finite')
         self.controller_models = False
+        self.catalog_provenance = False  # controller 是否接受目录的 provider 字段与 stale 状态
+        self.catalog_lock, self.closed = threading.Lock(), False
+        # 管理操作（protocol §13.6）：op_id → 已收到；outbox 里是待上报的结果，由主循环发送。
+        self.ops, self.op_outbox = set(), {}
         self.models = None
+        # 远端项目写回（§13.10）：controller 声明 remote_apply 后才上报本机绑定；reported_bindings 是最近一次注册带上的那份。
+        self.controller_remote, self.reported_bindings = False, None
         self.catalog_revision = 0  # 目录内容每变一次加一；注册据此判断发出去的是不是最新目录
         self.catalog_thread = None
         self.next_catalog = 0
@@ -635,6 +679,7 @@ class Agent:
             meta = load(path)
             attempt = Attempt(self, meta['assignment'], meta)
             self.attempts[attempt.id] = attempt
+        self.projects = node_projects.ProjectOps(self, transport)
 
     def refresh_auth(self, background=False):
         if self.clock() < self.next_auth_probe or (self.auth_thread and self.auth_thread.is_alive()):
@@ -657,18 +702,33 @@ class Agent:
         self.next_catalog = self.clock() + self.model_catalog_s
         def run():
             command = self.commands['codex']
-            codex = dict(self.catalog_probe(command['argv'], command['env']), fetched_at=now(),
-                         cli_version=self.capabilities.get('harness', {}).get('codex'))
+            version = self.capabilities.get('harness', {}).get('codex')
+            probed = dict(self.catalog_probe(command['argv'], command['env']))
+            probed.setdefault('provider', None)
+            saved = self.directory / 'model-catalog.json'
+            if probed['status'] == 'ok':
+                codex = dict(probed, fetched_at=now(), cli_version=version)
+                with self.catalog_lock:  # close() 之后不再写数据目录：探测可能在节点停止后才返回
+                    if self.closed:
+                        return
+                    save(saved, codex)  # 最近一次成功的目录，连同取得时间、CLI 版本与 provider
+            else:
+                # 刷新失败：CLI 版本与 provider 都没变时沿用上一次成功的目录，标为 stale 并保留它原来的取得时间，
+                # controller 按有效期决定还信不信它。版本或 provider 变了的旧目录不再代表当前能力。
+                try:
+                    last = load(saved)
+                except (OSError, ValueError):
+                    last = None
+                same = (isinstance(last, dict) and last.get('status') == 'ok' and last.get('cli_version') == version
+                        and last.get('provider') == codex_provider and probed['provider'] in (None, codex_provider))
+                codex = (dict(last, status='stale', reason=probed['reason']) if same
+                         else dict(probed, fetched_at=now(), cli_version=version))
             claude = dict(status='unknown', source=None, fetched_at=now(), reason='no_catalog_interface',
                           cli_version=self.capabilities.get('harness', {}).get('claude'), models=[])
-            models = dict(codex=codex, claude=claude)
-            changed = self.models is None or any(
-                (self.models[name]['status'], self.models[name]['models']) != (models[name]['status'], models[name]['models'])
-                for name in models)
-            self.models = models
-            if changed:
-                self.catalog_revision += 1
-                self.registered = False  # 下一轮带上新目录重新注册
+            self.models = dict(codex=codex, claude=claude)
+            # 每次探测后都重新注册：成功的刷新即使内容没变，取得时间也要更新到 controller，否则目录会按有效期过期。
+            self.catalog_revision += 1
+            self.registered = False
         self.catalog_thread = threading.Thread(target=run, name='model-catalog', daemon=True)
         self.catalog_thread.start()
 
@@ -699,7 +759,15 @@ class Agent:
         config = self.config
         revision = self.catalog_revision  # 先取版本再取目录：两者之间目录被刷新时，结束后会再注册一次
         models = self.models if self.controller_models else None
+        if models and not self.catalog_provenance:
+            # 不认识 provider 与 stale 的 controller：去掉 provider，沿用的旧目录按 unknown 上报（它没有有效期判断）。
+            models = {name: ({k: v for k, v in entry.items() if k != 'provider'} if entry['status'] != 'stale' else
+                             dict({k: v for k, v in entry.items() if k != 'provider'}, status='unknown', models=[]))
+                      for name, entry in models.items()}
         capabilities = dict(self.capabilities, models=models) if models else self.capabilities
+        bindings = node_projects.public(self.directory) if self.controller_remote else None
+        if bindings is not None:
+            capabilities = dict(capabilities, project_bindings=bindings)
         record = dict(node_id=config['node_id'], physical_host_id=config['physical_host_id'],
             failure_domain=config['failure_domain'], capabilities=capabilities,
             runtime_profile=dict(user=getpass.getuser(), workspace_policy='isolated-attempt'),
@@ -708,6 +776,11 @@ class Agent:
             auth_health=self.auth_health, agent_version=self.release['version'])
         result = self.client.json('POST', '/nodes/register', record)
         self.controller_models = 'node_models' in result.get('features', [])
+        self.controller_remote, self.reported_bindings = 'remote_apply' in result.get('features', []), bindings
+        provenance = 'catalog_provenance' in result.get('features', [])
+        if provenance != self.catalog_provenance:
+            self.catalog_provenance = provenance
+            self.catalog_revision += 1  # 目录的上报形状变了：下一轮按新形状再注册一次
         self.generation = result['authority_generation']
         for attempt in self.attempts.values():
             if attempt.assignment['authority_generation'] != self.generation and attempt.meta['state'] != 'reported':
@@ -717,7 +790,11 @@ class Agent:
         if self.heartbeat_s <= 0 or self.lease_ttl_s <= 0:
             raise ValueError('invalid controller timing configuration')
         # 刚得知 controller 支持目录、或注册期间后台探测换了目录：下一轮带上当前目录再注册（§12.5）。
-        self.registered = not (self.controller_models and self.models) or (models is not None and revision == self.catalog_revision)
+        self.registered = ((not (self.controller_models and self.models) or (models is not None and revision == self.catalog_revision))
+                           and (not self.controller_remote or bindings == node_projects.public(self.directory)))
+        if self.controller_remote and bindings is None:
+            # 刚得知 controller 支持远端写回：立即带上本机绑定再注册一次，不让 controller 上的绑定在两次注册之间空着一个周期。
+            self.register()
 
     def heartbeat(self):
         states = []
@@ -761,6 +838,93 @@ class Agent:
         self.next_heartbeat = self.clock() + self.heartbeat_s * self.rng.uniform(.8, 1.2)
         if self.reconciled:
             self.integrations(result.get('integrations', []))
+        self.operations(result.get('operations', []))
+        # 本机绑定改了（project-bind/unbind，不需要重启服务）：下一轮重新注册，controller 随之更新。
+        if self.controller_remote and node_projects.public(self.directory) != self.reported_bindings:
+            self.registered = False
+
+    def operations(self, items):
+        """领取 controller 下发的管理操作。种类是封闭集合；不认识的种类回报 failed，不执行任何别的东西。"""
+        for item in items if isinstance(items, list) else []:
+            try:
+                op_id, kind, params = p.check_uuid(item['op_id']), item['kind'], item.get('params') or {}
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            if kind in p.PROJECT_OPERATIONS:
+                self.projects.offer(op_id, kind, params)  # 远端写回：先落盘再确认领取，见 node_projects
+                continue
+            if op_id in self.ops:
+                continue
+            self.ops.add(op_id)
+            try:
+                self.client.json('POST', '/nodes/%s/operations/%s' % (self.config['node_id'], op_id), {'status': 'received'})
+            except APIError:
+                continue  # 操作已不存在或已有结果
+            if kind == 'log_tail':
+                self.op_outbox[op_id] = self.guarded(lambda: self.log_tail(params))
+            elif kind == 'probe':
+                # 探测要调用官方 CLI，可能要几十秒：放到后台线程，结果由主循环上报（线程里不发网络请求）。
+                threading.Thread(target=lambda op_id=op_id: self.op_outbox.__setitem__(op_id, self.guarded(self.probe_now)),
+                                 name='node-operation', daemon=True).start()
+            else:
+                self.op_outbox[op_id] = ('failed', None, 'unsupported operation')
+        for op_id, (status, result, error) in list(self.op_outbox.items()):
+            try:
+                self.client.json('POST', '/nodes/%s/operations/%s' % (self.config['node_id'], op_id),
+                                 {'status': status, 'result': result, 'error': error})
+            except APIError:
+                pass  # 终态拒绝（已超时、已不存在）：不再重发
+            del self.op_outbox[op_id]
+        self.projects.pump()
+
+    def guarded(self, action):
+        try:
+            return 'succeeded', self.clean(action()), None
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return 'failed', None, type(exc).__name__ + ': ' + self.clean(str(exc))[:500]
+
+    def probe_now(self):
+        """在这个服务进程自己的上下文里重新探测官方 CLI 的登录状态与模型目录；不调用模型。
+
+        用户在节点本机按官方方式登录后，用它确认“后台服务真的可用”：在终端里能登录不等于服务进程读得到凭据。
+        """
+        auth = {}
+        for name, command in self.commands.items():
+            status, reason = probe_auth_detail(name, command, self.auth_runner, self.system)
+            auth[name] = {'status': status, 'reason': reason, 'command': command['argv'][0] if command['argv'] else None,
+                          'disabled': command['disabled']}
+        catalog = self.catalog_probe(self.commands['codex']['argv'], self.commands['codex']['env'])
+        self.auth_health = {name: value['status'] for name, value in auth.items()}
+        self.auth_checked_at = now()
+        self.next_catalog = 0  # 下一轮刷新并重新注册，controller 上的目录与认证状态随之更新
+        return {'at': now(), 'auth': auth, 'harness': dict(self.capabilities.get('harness', {})),
+                'catalog': {'codex': {'status': catalog.get('status'), 'reason': catalog.get('reason'),
+                                      'provider': catalog.get('provider'), 'models': len(catalog.get('models', []))}},
+                'context': dict(service_context(self.environment), version=self.release['version'],
+                                version_dir=str(version_directory()), platform=platform.platform())}
+
+    def log_tail(self, params):
+        directory = self.directory / 'attempts' / p.check_uuid(params['attempt_id'])
+        if not directory.is_dir():
+            # 这台节点上已经没有该 attempt 的本地文件（从未在此执行，或已被清理）。
+            return {'retained': False, 'streams': []}
+        streams = log_streams(directory)
+        index = [{'stream': name, 'bytes': streams[name].stat().st_size} for name in sorted(streams)]
+        stream = params.get('stream', 'index')
+        if stream == 'index' or stream not in streams:
+            return {'retained': True, 'streams': index, 'missing': stream != 'index'}
+        offset, limit = int(params.get('offset', 0)), min(int(params.get('max_bytes', 65536)), 262144)
+        size = streams[stream].stat().st_size
+        while True:
+            with streams[stream].open('rb') as source:
+                source.seek(min(max(offset, 0), size))
+                raw = source.read(limit)
+            # 按文本返回并脱敏；转义后超出 controller 的结果上限时减半再取，next_offset 始终按原始字节计。
+            result = {'retained': True, 'stream': stream, 'offset': offset, 'next_offset': offset + len(raw), 'total_bytes': size,
+                      'eof': offset + len(raw) >= size, 'data': self.clean(raw.decode('utf-8', 'replace')), 'streams': index}
+            if len(p.canonical_json(result)) <= 700000 or limit <= 1024:
+                return result
+            limit //= 2
 
     def integrations(self, items):
         for item in items:
@@ -842,6 +1006,19 @@ class Agent:
                     manifests.append(manifest)
                 for entry in manifests[1]['files']:
                     self.fetch_blob(entry['sha256'])
+                roots = self.config.get('integration_roots')
+                if roots is not None:
+                    # 本节点只允许回写到配置列出的目录之内（解析链接后比较）；之外的目标如实报告为冲突，不写入。
+                    target = Path(item['target_path']).expanduser().resolve()
+                    if not any(target == Path(r).expanduser().resolve() or Path(r).expanduser().resolve() in target.parents for r in roots):
+                        record.update(request_id=str(uuid.uuid4()), status='conflict', detail=dict(
+                            changed=[], conflicts=['Target path is outside this node\'s integration_roots'], backup=None))
+                        save(path, progress)
+                        outcome = self.report_integration(job, record)
+                        if outcome != 'lease':
+                            progress.update(reported=True, superseded=outcome == 'superseded')
+                            save(path, progress)
+                        return
                 # 取 blob 期间可能已有更新的发布替代本交付：写入前再确认一次。
                 # ponytail: 剩余窗口只有本地写入时长；彻底消除需要 controller 侧的目标写租约。
                 if not current(fresh=True):
@@ -961,6 +1138,8 @@ class Agent:
             attempt.tick()
 
     def close(self):
+        with self.catalog_lock:
+            self.closed = True
         for attempt in self.attempts.values():
             if attempt.adapter and attempt.meta['state'] == 'running':
                 attempt.quarantine('agent stopped')
@@ -1193,9 +1372,21 @@ def main(argv=None):
     detecting.add_argument('--data-dir', help='read optional command/disable configuration')
     check = commands.add_parser('doctor')
     check.add_argument('--data-dir', required=True)
+    # 节点本机的项目目录绑定（§13.10）：只在这台机器上授权，controller 只看到项目 ID 与目录名。
+    for name, positional in (('project-bind', ('project_id', 'directory')), ('project-unbind', ('project_id',)), ('project-bindings', ())):
+        binding = commands.add_parser(name)
+        binding.add_argument('--data-dir', required=True)
+        for item in positional:
+            binding.add_argument(item)
     args = parser.parse_args(argv)
     try:
-        if args.command == 'pair':
+        if args.command == 'project-bind':
+            result = node_projects.bind(args.data_dir, args.project_id, args.directory)
+        elif args.command == 'project-unbind':
+            result = node_projects.unbind(args.data_dir, args.project_id)
+        elif args.command == 'project-bindings':
+            result = node_projects.listing(args.data_dir)
+        elif args.command == 'pair':
             result = pair(args)
         elif args.command == 'detect':
             result = detect(load(Path(args.data_dir) / 'agent.json') if args.data_dir else None)
@@ -1217,11 +1408,16 @@ def main(argv=None):
             result = dict(pid=child.pid, status='spawned', log=str(directory / 'agent.log'))
         print(json.dumps(result, ensure_ascii=False))
         return 0
+    except project.ProjectError as exc:
+        print(json.dumps(p.error_body(exc.code, exc.message), ensure_ascii=False))
+        return 1
     except (ValueError, OSError, KeyError, APIError, ConnectionFailure) as exc:
-        # 锁冲突信息不含路径或凭据，可以原样给出；其他错误保持笼统，避免泄露配置细节。
-        known = str(exc) if str(exc) == 'another agent owns this data directory' else None
-        print(json.dumps(p.error_body('conflict' if known else 'invalid',
-                                      known or 'Agent command failed; check configuration and controller access')))
+        # 锁冲突与连接失败的信息都是本包内的固定文案（证书校验失败只附带校验原因），不含路径或凭据，可以原样给出；
+        # 其他错误保持笼统，避免泄露配置细节。
+        code = ('conflict' if str(exc) == 'another agent owns this data directory'
+                else 'unreachable' if isinstance(exc, ConnectionFailure) else 'invalid')
+        print(json.dumps(p.error_body(code, str(exc) if code != 'invalid' else
+                                      'Agent command failed; check configuration and controller access')))
         return 1
 
 

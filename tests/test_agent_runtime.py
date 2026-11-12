@@ -393,6 +393,25 @@ class RuntimeTests(unittest.TestCase):
             fault.unlink()
             self.assertTrue(self.agent.client.json('GET', '/healthz')['ok'])
 
+    def test_certificate_rejection_reports_the_reason_and_nothing_else(self):
+        import ssl
+
+        def rejected(method, url, headers, body):
+            error = ssl.SSLCertVerificationError(1, 'verify failed for https://secret-host/path')
+            error.verify_message = 'self-signed certificate'
+            raise error
+
+        client = Client('https://controller.example', 'token-value', transport=rejected)
+        with self.assertRaises(ConnectionFailure) as raised:
+            client.json('GET', '/healthz')
+        self.assertEqual(str(raised.exception), 'TLS certificate verification failed: self-signed certificate')
+        # 其他传输错误仍然只给固定文案。
+        client = Client('https://controller.example', 'token-value',
+                        transport=lambda *a: (_ for _ in ()).throw(OSError('token-value leaked')))
+        with self.assertRaises(ConnectionFailure) as raised:
+            client.json('GET', '/healthz')
+        self.assertEqual(str(raised.exception), 'controller unavailable or TLS verification failed')
+
     def test_fault_exit_only_after_durable_checkpoint(self):
         self.fake.add([{'checkpoint': {}}])
         self.agent.fault_exit_after_checkpoint = 1

@@ -23,7 +23,8 @@ export function Jobs({ tick }: { tick: number }) {
   return <>
     {creating && <NewJob onCreated={id => { setCreating(false); location.hash = '#/jobs/' + id }} />}
     <Section title="任务" extra={<span className="actions">
-      {can('tasks') && <button onClick={() => setCreating(c => !c)}>{creating ? '收起新建' : '新建任务'}</button>}
+      <button disabled={!can('tasks')} title={can('tasks') ? undefined : '需要任务权限（tasks）'} onClick={() => setCreating(c => !c)}>{creating ? '收起新建' : '新建任务'}</button>
+      {!can('tasks') && <small className="muted">新建需要任务权限</small>}
       <select aria-label="按状态筛选任务" value={status} onChange={e => { setStatus(e.target.value); setPages([]) }}>
         <option value="">全部状态</option>
         {['queued', 'waiting_capability', 'running', 'recovering', 'waiting_reconcile', 'cancel_requested', 'cancelled', 'completed', 'failed'].map(s => <option key={s} value={s}>{s}</option>)}

@@ -1,4 +1,4 @@
-//! 信任边界上的纯校验函数：controller 地址、请求路径、blob 摘要、文件名、窗口导航。
+//! 信任边界上的纯校验函数：controller 地址、请求路径、blob 摘要、各种 ID、文件名、窗口导航。
 //! 不依赖 Tauri 运行时，全部由单元测试覆盖。
 
 use reqwest::Url;
@@ -75,6 +75,33 @@ pub fn sha256_hex(s: &str) -> bool {
 /// 只接受短的 ASCII 标识符。
 pub fn ident(s: &str) -> bool {
     (1..=128).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// 小写 UUID（`8-4-4-4-12`）。项目、任务、检查点、快照与应用的 ID 都是这个形状；
+/// 它们进入请求路径与本机文件名，所以页面给的值先过这一关。
+pub fn uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
+        })
+}
+
+/// 节点 ID：小写字母、数字和连字符，最长 63，不以连字符开头（与 controller 的规则相同）。
+pub fn node_id(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && !s.starts_with('-')
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// 一次性配对码：短的可见 ASCII，不以连字符开头（不会被命令行当成选项）。
+pub fn pairing_code(s: &str) -> bool {
+    (1..=256).contains(&s.len()) && !s.starts_with('-') && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// 页面给出的排除规则列表：只限制数量与长度，规则本身由本机助手校验。
+pub fn excludes(patterns: &[String]) -> bool {
+    patterns.len() <= 2000 && patterns.iter().all(|p| !p.is_empty() && p.len() <= 1024 && !p.chars().any(char::is_control))
 }
 
 /// controller 签发的凭据：可见 ASCII，能放进 `Authorization` 头。
@@ -205,6 +232,47 @@ mod tests {
         assert!(!token(""));
         assert!(!token("a b"));
         assert!(!token("a\r\nX-Injected: 1"));
+    }
+
+    #[test]
+    fn uuid_must_be_lowercase_and_hyphenated() {
+        assert!(uuid("3f2b6c1e-0c8e-4c57-9a43-1f6f0c9b7e11"));
+        for bad in [
+            "",
+            "3F2B6C1E-0C8E-4C57-9A43-1F6F0C9B7E11",
+            "3f2b6c1e0c8e4c579a431f6f0c9b7e11",
+            "3f2b6c1e-0c8e-4c57-9a43-1f6f0c9b7e1",
+            "3f2b6c1e-0c8e-4c57-9a43-1f6f0c9b7e111",
+            "3f2b6c1e-0c8e-4c57-9a43-1f6f0c9b7e1g",
+            "3f2b6c1e/0c8e-4c57-9a43-1f6f0c9b7e11",
+            "../../../../../../../../../etc/passwd",
+            "{3f2b6c1e-0c8e-4c57-9a43-1f6f0c9b7e1}",
+        ] {
+            assert!(!uuid(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn values_passed_to_the_installer_cannot_look_like_options() {
+        assert!(node_id("node-mac-1") && node_id("a") && node_id(&"a".repeat(63)));
+        for bad in ["", "-node", "Node", "node_1", "node 1", "节点", &"a".repeat(64)] {
+            assert!(!node_id(bad), "{bad}");
+        }
+        assert!(pairing_code("3f9a0c1d2e4b5a6978") && pairing_code("AbC_123-xyz"));
+        for bad in ["", "-code", "--uninstall", "a b", "a\nb", "码", &"a".repeat(257)] {
+            assert!(!pairing_code(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn exclude_lists_are_bounded() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(excludes(&[]));
+        assert!(excludes(&list(&[".git/**", "*.pem", "目录/**"])));
+        assert!(!excludes(&list(&[""])));
+        assert!(!excludes(&list(&["a\nb"])));
+        assert!(!excludes(&["x".repeat(1025)]));
+        assert!(!excludes(&vec!["x".to_string(); 2001]));
     }
 
     #[test]

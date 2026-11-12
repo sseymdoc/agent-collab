@@ -11,7 +11,9 @@ python -m agent_collab.controller pairing-code --data-dir /local/controller-data
 python -m agent_collab.controller client-code --data-dir /local/controller-data --role owner --ttl 600
 ```
 
-`client-code` 为桌面端、CLI 或其他自动化客户端生成一次性配对码（输出 JSON：`code`、`scopes`、`ttl_s`）；`--role` 取 `owner`、`operator`、`viewer`，或用 `--scopes read,tasks` 逐项指定；两者都省略时签发 `owner`，即全部五项权限。配对码只存哈希，最长有效 1 小时。客户端凭据、权限与撤销见 `docs/protocol.md` §12.1。
+controller 的子命令共八个：`serve`、`pairing-code`、`client-code`、`admin-token`、`backup`、`restore`、`prune-events`、`barrier`；后四个见下文“备份、恢复与事件保留”。
+
+`client-code` 为桌面端、CLI 或其他自动化客户端生成一次性配对码（输出 JSON：`code`、`scopes`、`ttl_s`）；`--role` 取 `owner`、`operator`、`viewer`，或用 `--scopes read,tasks` 逐项指定；两者都省略时签发 `owner`，即全部五项权限。配对码只存哈希，最长有效 1 小时。客户端凭据、权限与撤销见 `docs/protocol.md` §12.1。节点配对码与客户端配对码也可以经 API 签发（`POST /nodes/codes` 需要 `devices` 权限，`POST /clients/codes` 需要 `maintain` 权限；§13.5、§12.1），不必登录 controller 主机。
 
 `admin-token` 只打印文件路径。管理员令牌首次生成于 `admin.token`；POSIX 权限为 0600，Windows 上写入前把 DACL 收紧到只留运行 controller 的用户，做不到时启动失败、不留下令牌文件。已存在的令牌文件不会被改动。此文件是协议要求的唯一明文凭据文件；数据库中的节点令牌、租约、UI 会话、CSRF 和配对码均只保存 SHA-256，比较使用 `hmac.compare_digest`。配对码过期或使用一次后失效，再次配对同一节点会撤销旧 node token。节点凭据不能访问客户端查询或控制端点；管理员/UI 凭据不能冒充节点。
 
@@ -44,6 +46,9 @@ serve 全生命周期持有 OS 文件锁 `controller.lock`；第二个 serve 或
   "max_blob_bytes": 67108864,
   "max_json_bytes": 2097152,
   "sse_ping_s": 15,
+  "catalog_max_age_s": 172800,
+  "node_operation_timeout_s": 120,
+  "project_operation_timeout_s": 1800,
   "score_weights": {
     "free_slots": 10,
     "success_rate": 2,
@@ -54,9 +59,11 @@ serve 全生命周期持有 OS 文件锁 `controller.lock`；第二个 serve 或
 }
 ```
 
+`catalog_max_age_s`（缺省 172800 秒）是节点模型目录的有效期：取得时间早于它的目录按未核实处理（`docs/protocol.md` §12.5）。`node_operation_timeout_s`（缺省 120 秒）是节点管理操作从请求到完成的时限，超时记 `timed_out`，不重发（§13.6）。`project_operation_timeout_s`（缺省 1800 秒）是远端项目写回的三种操作的时限，到期规则与对账见 §13.10。
+
 `web_console`（布尔，缺省 true）控制浏览器控制台：设为 false 后 `POST /session` 被拒绝、已有会话在关闭期间不能使用（会话记录保留，重新启用后未过期的会话恢复可用）、不再提供静态页面，客户端凭据与管理令牌不受影响。
 
-模型默认值与部署许可范围不在 `config.json` 里，而是保存在数据库的 `settings/models` 记录中，经 `GET` / `PUT /settings/models` 读写（`docs/protocol.md` §12.3）。新数据库从未设置开始；已有任务或节点记录但没有该记录的数据库，在升级后首次启动时写入一次迁移值，其中协调模型取 `standby_profiles` 里当时生效的 profile。之后设置里的协调模型优先于 profile 的 `model` 与 `effort`，profile 的 `node_ids` 与启用开关仍取自 `config.json`。
+模型默认值与部署许可范围不在 `config.json` 里，而是保存在数据库的 `settings/models` 记录中，经 `GET` / `PUT /settings/models` 读写（`docs/protocol.md` §12.3）。新数据库从未设置开始；已有任务或节点记录但没有该记录的数据库，在升级后首次启动时写入一次迁移值，其中协调模型取 `standby_profiles` 里当时生效的 profile。之后设置里的协调模型优先于 profile 的 `model` 与 `effort`。协调是否启用与候选节点列表：经 `PUT /settings/coordination` 保存过之后取那份设置（§13.7），此前取自 `config.json` 的启用开关与 profile 的 `node_ids`。
 
 顶层未知配置键、非正/非有限时间或尺寸、错误公开源均拒绝。`managed_coordinator` 与 `standby_profiles` 内部只读取已定义字段：未知子键被忽略，字段缺失或非法时 overview 显示 `profile_missing`（不报配置错误），请据此核对拼写。时间由 controller 的 `clock()` 决定；生产默认 wall clock，需保持主机时钟正常。以上间隔是协议默认值，不是实测 RTO/RPO。重启不会增加 generation；会延长已有活动租约并记录 `controller.started`，不重复建立 attempt。后台每秒 tick；claim/heartbeat 也调度。心跳正常而没有输出不会判为失联。
 
@@ -67,8 +74,8 @@ SQLite 事务同时提交权威状态、事件和幂等回执。请求错误回�
 API 路径统一前缀 `/api/v1`，另支持无认证 `/healthz`。`GET /healthz` 仅返回 `{"ok":true}`。请求 ID 使用小写 UUID v4。错误统一 `protocol.error_body`。
 
 - §5 的通用规则优先于表格省略字段：客户端 cancel/retry/assess/publish/integration/drain/dispatch 均须携带 `request_id`、`expected_version`；assess 还须独立 `assessment_id`。创建 jobs 没有已有行版本，只要求 `request_id`。session 登录/注销是凭据生命周期，不使用通用幂等缓存，避免持久化明文 session/CSRF 响应。节点端点按 §4 的专用规则执行；节点 integration 无 expected_version，仍检查当前交付指针。
-- 客户端和节点均可 PUT/HEAD/GET blob。协议只在节点表列出了上传接口，但客户端需要上传初始输入；此处允许已认证管理员/UI 上传，UI PUT 仍受 CSRF/Origin 约束。blob 不执行、不物化。
-- 集合返回 `{"jobs":[...]}`、`{"nodes":[...]}`、`{"events":[...],"min_seq":N}`。job 详情为 job 字段加 `attempts/checkpoints/publications/assessments/events`；explain 返回 `{"nodes":[...],"selected_node_id":...}`。job `status_reason` 为原因码及缺失 hash 组成的字符串。`/overview.controller.version` 为软件版本，`metadata_version` 用作 `/dispatch.expected_version`。
+- 客户端和节点均可 PUT/HEAD/GET blob。协议只在节点表列出了上传接口，但客户端需要上传初始输入；此处允许管理令牌、UI 会话与带 `tasks` 权限的客户端凭据上传（读取需要 `read` 权限），UI PUT 仍受 CSRF/Origin 约束。blob 不执行、不物化。
+- 集合返回 `{"jobs":[...]}`、`{"nodes":[...]}`、`{"events":[...],"min_seq":N}`。job 详情为 job 字段加 `attempts/checkpoints/publications/assessments/downloads/applications/events`；explain 返回 `{"nodes":[...],"selected_node_id":...}`。job `status_reason` 为原因码及缺失 hash 组成的字符串。`/overview.controller.version` 为软件版本，`metadata_version` 用作 `/dispatch.expected_version`。
 - GPU 要求可为名称字符串或属性对象，按名称/属性精确匹配；没有自动推断 CUDA 版本兼容性。labels 也硬过滤，协议未列出的原因码使用 `label_missing:<label>`。协议没有初次执行的源节点字段，因此首次 source locality 分数中立；恢复时用上一 attempt 的节点计算不同故障域、同节点缓存等分数。近期成功率取该节点最近 20 个结束 attempt，未知为 0.5；没有伪造硬件或迁移耗时测量值。
 - root 工作包只允许串行修订；新修订累计 repairs，各 job 暴露同根累计 counters。协议没有 `max_infra_retries`，由 `max_attempts` 同时限制基础设施重试。slots 按 contract.resources.slots 预留；同主机取所有节点 host_slots 的最小值，注册也不能把容量降到已有预留以下。
 - quota 对同 harness/账户分组封锁 `quota_block_s`，新提交任务在封锁结束后可调度。失败的 quota/auth_expired/capability_missing job 保持 waiting_capability，外部条件修复后显式 retry；不会自动跨账户或主机探路。auth_expired 同时将已知同账户节点的 auth_health 标为 expired。
@@ -95,6 +102,8 @@ API 路径统一前缀 `/api/v1`，另支持无认证 `/healthz`。`GET /healthz
 }
 ```
 
+这些项也可以不改 `config.json` 而经 API 设置，API 保存的值覆盖 `config.json` 的对应项：协调模型与 effort 是模型设置里的 `claude.default`（`PUT /settings/models`，`docs/protocol.md` §12.3）；是否启用与候选节点列表是协调设置（`PUT /settings/coordination`，§13.7），保存过一次（`revision > 0`）之后由它决定，已退役的节点不能列入。`GET /settings/coordination` 返回保存的设置、实际生效的配置（`effective`，即下面 overview 里的对象）和不在已登记节点里的 ID（`unknown_nodes`）。
+
 `GET /api/v1/overview` 中受管协调者的字段如下，其余字段形状不受影响：
 
 ```json
@@ -107,7 +116,7 @@ API 路径统一前缀 `/api/v1`，另支持无认证 `/healthz`。`GET /healthz
 }
 ```
 
-缺失或不完整时为 `{"status":"profile_missing","profile_id":null,"profile":null}`；如果已给出 profile_id，保留其配置值。显式关闭为 `{"status":"disabled","profile_id":null,"profile":null}`，同样保留已配置的 profile_id。ready 只说明字段完整；CLI 缺失、节点不可用或认证过期通过协调 job 的 waiting_capability 和 explain 表达。profile 不完整不会阻止普通 job 完成，但不生成协调 job。
+缺失或不完整时为 `{"status":"profile_missing","profile_id":null,"profile":null}`；如果已给出 profile_id，保留其配置值。显式关闭为 `{"status":"disabled","profile_id":null,"profile":null}`，同样保留已配置的 profile_id。经 API 保存过协调设置之后，这个对象的 `profile_id` 固定为 `settings`，并多一个 `"source":"settings"`：设置里 `enabled` 为 false 时 status 为 `disabled`；没有候选节点，或既没有设置 `claude.default`、`config.json` 里也没有完整且启用的 profile 可提供 model 与 effort 时，为 `profile_missing`。ready 只说明字段完整；CLI 缺失、节点不可用或认证过期通过协调 job 的 waiting_capability 和 explain 表达。profile 不完整不会阻止普通 job 完成，但不生成协调 job。
 
 `GET /api/v1/packages/{work_package_id}/coordinator` 返回 JSON `null`，或以下对象（没有 token/hash）：
 
@@ -115,7 +124,7 @@ API 路径统一前缀 `/api/v1`，另支持无认证 `/healthz`。`GET /healthz
 {"holder_kind":"interactive","holder_ref":"desktop-session","expires_at":"2026-11-09T03:50:00.000Z","version":1,"authority_generation":1}
 ```
 
-POST 同路径提交 `{"request_id":"<UUID v4>","holder_kind":"interactive","holder_ref":"desktop-session","ttl_s":90,"takeover":false,"reason":""}`，返回 `{"coordinator_token":"<不透明凭据>","expires_at":"<UTC时间>","version":<租约版本>,"authority_generation":<恢复代次>}`；客户端用（代次, 版本）识别自己持有的租约。续租使用新 request_id、相同 holder_kind/ref，并带 `X-Coordinator-Token`；DELETE 带该头释放，返回 `{}`。其他持有者占用时为 409 conflict；管理员 Bearer 或经管理员登录建立的 UI 会话可用 takeover=true 和非空 reason 接管，并写 coordinator.takeover 事件。节点身份不能获取/接管。UI 仍须提供 CSRF 和合法 Origin。
+POST 同路径提交 `{"request_id":"<UUID v4>","holder_kind":"interactive","holder_ref":"desktop-session","ttl_s":90,"takeover":false,"reason":""}`，返回 `{"coordinator_token":"<不透明凭据>","expires_at":"<UTC时间>","version":<租约版本>,"authority_generation":<恢复代次>}`；客户端用（代次, 版本）识别自己持有的租约。续租使用新 request_id、相同 holder_kind/ref，并带 `X-Coordinator-Token`；DELETE 带该头释放，返回 `{}`。其他持有者占用时为 409 conflict；管理员 Bearer、经管理员登录建立的 UI 会话或带 `maintain` 权限的客户端凭据可用 takeover=true 和非空 reason 接管，并写 coordinator.takeover 事件。客户端凭据取得、续租与释放租约需要 `tasks` 权限（`docs/protocol.md` §12.1）。节点身份不能获取/接管。UI 仍须提供 CSRF 和合法 Origin。
 
 协调租约按目标根工作包独占。客户端 assess/publish/retry/integration 及同根新 job 提交缺少匹配 token 时返回 `409 {"error":{"code":"conflict","message":"…","details":{"reason":"coordinator_lease"}}}`。cancel 不受门禁影响；节点 auto publish 豁免协调 token，但仍受 epoch/generation/CAS 约束；节点 integration 不豁免。检查门禁后才读写普通请求幂等回执，旧协调者不能凭旧请求重放绕过租约。
 
@@ -123,7 +132,7 @@ POST 同路径提交 `{"request_id":"<UUID v4>","holder_kind":"interactive","hol
 
 缺省策略下 completed/waiting_reconcile/rework 事件与协调 job 创建同事务提交。以目标 job_id、触发类型、durable_checkpoint_id、acceptance.status 持久去重；同一目标已有未结束协调 job 时不再新建。每个协调 job 有独立根及执行预算，contract.coordinates 指向被协调的目标根；执行不增加目标根 attempts/repairs。model/effort 与 node_ids 在触发时冻结；仅允许名单节点领取，领取时原子取得 managed 租约，holder_ref 为协调 attempt_id。心跳续租，结束/失联释放；被接管后旧 attempt 不能应用结果或释放新租约。协调 job 不自动恢复，也不递归触发协调。正常客户端不能伪造 claude/coordinates job。
 
-context.json 提供目标 job（含契约与状态）、最新 attempt report、最新 durable checkpoint 对 inputs 的 diff 和验收记录。decision-schema.json 为 controller/adapter 共用的固定 schema。两文件通过 inputs_manifest 和 blob 提供；不复制原生 transcript 或 provider 凭据。
+context.json 提供目标 job（含契约与状态）、最新 attempt report、最新 durable checkpoint 对 inputs 的 diff 和验收记录，以及 `repair_policy: {"model", "effort", "allowed_efforts"}`：根工作包冻结的修复模型、effort 与该模型许可的 effort 列表（不限时为 null），供协调者参考，最终由 controller 检查。decision-schema.json 为 controller/adapter 共用的固定 schema。两文件通过 inputs_manifest 和 blob 提供；不复制原生 transcript 或 provider 凭据。
 
 context.json 另附 files 与 files_omitted：优先最新 final，无则最新 durable；每个 UTF-8 文本 ≤32 KiB、总计 ≤256 KiB，按路径排序，
 明确记录 excluded/too_large/binary/budget。report 保留 agent 传入的对象与 usage 计数；显式非对象返回 400、canonical JSON
@@ -149,11 +158,11 @@ context.json 另附 files 与 files_omitted：优先最新 final，无则最新 
 }
 ```
 
-acceptance 必须是非空字符串数组，effort 仅 high/xhigh/max。schema 的 follow_up 对象为 additionalProperties=false；旧 contract、scope、base_checkpoint_id 或 budgets 字段都不接受。adapter 仅作 schema 形状复核，schema 合法就写 decision.json；assessment 的 checkpoint/状态语义和修复准入条件由 controller 判断。缺字段、旧形状等在 adapter 端仍会失败，controller 的部分应用不绕过这一节点边界。
+acceptance 必须是非空字符串数组。effort 是字符串或 null，不是枚举（示例里的 `xhigh` 只是一个取值）：为 null 时沿用根工作包冻结的 effort；给出值时必须在根冻结的许可范围内（许可范围为 null 时不限），不在范围内时拒绝该修复请求（写 coordinator.follow_up_rejected，原因 `effort_not_allowed`），验收结论保留（`docs/protocol.md` §12.4）。schema 的 follow_up 对象为 additionalProperties=false；旧 contract、scope、base_checkpoint_id 或 budgets 字段都不接受。adapter 仅作 schema 形状复核，schema 合法就写 decision.json；assessment 的 checkpoint/状态语义和修复准入条件由 controller 判断。缺字段、旧形状等在 adapter 端仍会失败，controller 的部分应用不绕过这一节点边界。
 
-当前 decision schema（follow_up 为修复请求）要求 controller 与 Claude adapter 同步升级；已创建协调 job 的 inputs 中保存的是创建时的固定 schema，不自动改写。新 adapter 遇到不匹配的旧 schema 会拒绝启动该回合，不迁移历史数据。管理员可以取消旧的待执行回合，但取消不会清除去重记录：同一去重键（目标 job、触发、durable 检查点、验收状态）不会再创建协调 job，也没有手动触发接口；只有目标产生新的触发状态、新的 durable 检查点或验收状态变化时，才会按新 schema 创建协调 job。在此之前该目标需要人工协调（interactive 租约）。
+节点的 Claude adapter 同时接受现行 decision schema（follow_up.effort 为字符串或 null）和此前的 schema（effort 必填、枚举 high/xhigh/max），按协调 job 随 inputs 下发的那一份提示并复核，所以 controller 与节点不要求同步升级，顺序是先节点、后 controller（`docs/migration.md`）。已创建协调 job 的 inputs 中保存的是创建时的固定 schema，不自动改写：升级前的 controller 创建的协调 job 带着当时的 schema，升级后的节点照常执行。下发的 schema 两者都不是时，adapter 不启动 Claude，该回合以 code_failure 结束，不迁移历史数据。管理员可以取消待执行的回合，但取消不会清除去重记录：同一去重键（目标 job、触发、durable 检查点、验收状态）不会再创建协调 job，也没有手动触发接口；只有目标产生新的触发状态、新的 durable 检查点或验收状态变化时，才会创建新的协调 job。在此之前该目标需要人工协调（interactive 租约）。
 
-controller 生成的修复契约使用 codex、gpt-6-astra、workspace-write，effort 取请求；goal/acceptance 取请求，prompt 由 instructions、目标、验收项和目标契约 excludes 组成。excludes、requirements、recovery、resources、publish、integration、workspace、checks、coordination 继承目标；requirements.tools 增加 codex，不替换既有工具。budgets 继承目标的累计上限并保留取较小值约束，沿同根计数，不让模型填写预算或将上限误写为剩余额度。inputs_manifest 原样取被验收检查点（含 base/deleted），由 domain.validate_contract 验证结构，再由 controller 校验同根检查点来源；普通客户端仍不能提交带未知 base 的初始输入。
+controller 生成的修复契约使用 harness=codex、sandbox=workspace-write；model 取根工作包冻结的 model，不是固定值（冻结的 model 为 null 时该修复请求以 `model_default_unset` 被拒绝），effort 取请求里的值，请求为 null 时取冻结的 effort（`docs/protocol.md` §12.4）；goal/acceptance 取请求，prompt 由 instructions、目标、验收项和目标契约 excludes 组成。excludes、requirements、recovery、resources、publish、integration、workspace、checks、coordination 继承目标；requirements.tools 增加 codex，不替换既有工具。budgets 继承目标的累计上限并保留取较小值约束，沿同根计数，不让模型填写预算或将上限误写为剩余额度。inputs_manifest 原样取被验收检查点（含 base/deleted），由 domain.validate_contract 验证结构，再由 controller 校验同根检查点来源；普通客户端仍不能提交带未知 base 的初始输入。
 
 应用前仍检查持有权、目标 epoch/状态/检查点/验收/取消状态和串行修订关系；自动 publish 的版本更新不使决策失效。合法 accept/rework 的验收绑定 checkpoint manifest，先记录并写 coordinator.decision_applied，再在单独保存点处理 follow_up。形状错误、生成契约无效或派单失败只回滚修复步骤，写 coordinator.follow_up_rejected（含原因）；超预算或副作用未知写 coordinator.escalated。验收保留、repairs 不增加，协调 attempt 为 succeeded、协调 job 为 completed。follow_up=null 时仅记录验收；成功修复派单沿同根增加 repairs。waiting_reconcile 的旧目标在修复创建前置为 failed(managed_rework)，创建失败则该状态变更回滚，但保留验收。完成请求重放既不重复验收，也不重复派单或拒绝事件。
 
@@ -177,19 +186,28 @@ node.capability_evidence 与 explain 的各节点条目展示同一证据。领�
 
 SQLite 沿用通用 records 表，不改 SQL 表结构。启动时事务性补齐既有 job.acceptance 和 node.capability_evidence 缺省字段，同时补齐在途协调 context 的比较状态，并从旧触发记录及其捕获状态建立 rc5 去重键；重复启动幂等。不改历史不可变契约、请求哈希、幂等回执或版本号，不把历史 attempt 追认为能力证明。已有 integrated job/保留的 job.integration 事件可恢复旧回写基线；若旧基线及事件均已不可恢复，只能退回根 inputs。升级不自动补发 rc4 历史交付的回写待办，新发布后启用待办机制。备份/恢复自然包含新增 records，恢复后仍需 generation 对账。
 
+## 项目、节点管理、协调设置与提交闸门
+
+以下能力的端点、字段与规则以 `docs/protocol.md` §13 为准，本文不重复：项目与项目默认值（§13.1）、输入基线与增量上传（§13.2）、成果下载与应用到项目的记录（§13.3、§13.4）、节点配对码、维护与退役（§13.5）、节点管理操作与原始日志取回（§13.6，时限为上文的 `node_operation_timeout_s`）、协调设置（§13.7）、提交闸门与 `GET /activity`（§13.9）、远端项目写回（§13.10）。controller 在 `GET /client`、`GET /overview` 的 `controller.features` 与节点注册响应的 `features` 里列出已支持的能力名。已退役的节点只保留记录供历史引用，不出现在 `GET /nodes`、总览的节点列表、调度解释与模型目录里；`GET /overview` 另带 `intake`（提交闸门）与 `retired_nodes`（已退役节点数）。日常操作的命令见 [operations.md](operations.md)。
+
 ## 备份、恢复与事件保留
 
 ```sh
 python -m agent_collab.controller backup --data-dir /local/controller-data --dest /local/controller-backup
 python -m agent_collab.controller restore --data-dir /local/controller-data --from /local/controller-backup
 python -m agent_collab.controller prune-events --data-dir /local/controller-data --keep 10000
+python -m agent_collab.controller barrier --data-dir /local/controller-data --request-id <UUID v4> --reason "<原因>"
 ```
 
-backup 可与 serve 并行，使用 SQLite backup API 取得一致快照，仅复制该快照引用且已存在的 blobs。缺失的 uploading 数据可以保留为缺失；durable/protected 数据缺失则备份失败。目的目录包含不可变 `controller-<db_sha256>.db`、blob 子目录、`backup-manifest.json`（database、db_sha256、blob hash/size 清单、authority_generation、created_at）。blob 增量复制，先完成新数据库，再原子切换清单；切换中断仍可使用上次清单。历史数据库和多余 blob 不自动删除。
+backup 不是只读操作：它在源数据目录上打开数据库（必要时补建表、执行轻量迁移），快照之后再写一条 `backup/latest` 记录与一条 `controller.backup` 事件（快照里不含这两条，清单的 `event_seq` 是快照里最后一条事件）。所以不要用新版本的 `controller backup` 去备份仍在运行的旧版本 controller 的数据目录；要只读地取副本时用 SQLite 的只读连接（`mode=ro`）加 backup API。在 macOS 系统 SQLite 上观察到目的目录每次留下一对 `.backup-<uuid>.db-shm` / `.db-wal` 旁文件，可以删除。
+
+backup 可与 serve 并行，使用 SQLite backup API 取得一致快照，仅复制该快照引用且已存在的 blobs。缺失的 uploading 数据可以保留为缺失；durable/protected 数据缺失则备份失败。目的目录包含不可变 `controller-<db_sha256>.db`、blob 子目录、`backup-manifest.json`（database、db_sha256、blob hash/size 清单、authority_generation、event_seq、created_at；`event_seq` 是快照里最后一条事件的序号，之后用 `GET /activity?after=<event_seq>` 查看这份备份之后产生了什么）。blob 增量复制，先完成新数据库，再原子切换清单；切换中断仍可使用上次清单。历史数据库和多余 blob 不自动删除。
 
 restore 必须停止同目录 controller，校验清单、数据库和每个 blob 后，在数据目录暂存并原子替换数据库。generation 更新为 `max(当前,备份)+1`，旧租约全部撤销，旧活动任务变为 waiting_reconcile，取消中的任务保留 cancel_requested；所有派单暂停，旧 UI sessions 清除，节点先完成新 generation 心跳对账。管理员核对工作区和副作用后，对可继续的 job 显式 retry，再解除 dispatch 暂停。当前目录的 admin.token 保留；恢复到新目录时下次 App 启动生成新管理员令牌。
 
 恢复到原目录保留事件序号的高水位，新事件不会重用备份之后曾分配的 seq。恢复到全新目录无法知道备份之外的旧 seq，客户端应重新登录并获取快照/游标。备份数据库包含节点身份哈希等控制状态，备份目录须按状态目录保护；同机器目录备份不等于实例外备份。
+
+barrier 是切换屏障（`docs/protocol.md` §13.9，使用场景见 `docs/migration.md`）：在已停止的 controller 上运行（命令取得数据目录的锁），要求派单已暂停、提交闸门不是 `open`，否则拒绝。它把 generation 加一并撤销此前签发的全部执行权，处理与 restore 相同，但数据不回退：attempt 的租约令牌作废，进行中的 attempt 记为失联，未结束的任务变为 waiting_reconcile（取消中的保留 cancel_requested），协调租约失效，节点下次心跳被要求对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果，不再推进 generation。普通的停止再启动保留 generation、租约与协调租约。
 
 prune-events 只裁剪事件内容，保留 event_id/hash 去重账本，防止迟到重发重复改变状态。旧游标收到 snapshot_required 后重新请求快照。没有后台 blob GC 或幂等/去重账本淘汰策略。
 

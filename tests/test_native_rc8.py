@@ -278,7 +278,7 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue(err.startswith('Installer: '))
         runner.assert_not_called()
 
-    def test_upgrade_and_rollback_reenable_a_previously_disabled_service(self):
+    def test_upgrade_and_rollback_keep_a_previously_disabled_service_stopped(self):
         config, directory, manifest = self.installation('Windows')
         runner = Mock(return_value=subprocess.CompletedProcess([], 0, 'Running', ''))
         self.assertEqual(self.invoke('stop', config, runner)[0], 0)
@@ -295,13 +295,14 @@ class ServiceTests(unittest.TestCase):
                 ins.transaction(config, old, target, payload, args)
             enable = ['schtasks', '/Change', '/TN', 'agent-collab-worker', '/ENABLE']
             start = ['schtasks', '/Run', '/TN', 'agent-collab-worker']
-            self.assertLess(calls.index(enable), calls.index(start))
-            # 升级期间先禁用再结束（挡住每分钟触发器），最后一定重新启用。
+            self.assertNotIn(enable, calls)
+            self.assertNotIn(start, calls)
+            # 升级期间先禁用再结束，成功后的期望状态仍为停用。
             disable = ['schtasks', '/Change', '/TN', 'agent-collab-worker', '/DISABLE']
             self.assertLess(calls.index(disable), calls.index(['schtasks', '/End', '/TN', 'agent-collab-worker']))
-            self.assertLess(calls.index(disable), calls.index(enable))
             self.assertEqual(ins.current_version(self.prefix, 'Windows'), target['version'])
             old = ins.read_json(self.prefix / 'installation.json')
+            self.assertEqual(old['desired'], {'worker': 'stopped'})
 
     def test_controller_start_uses_local_doctor_without_admin_or_api(self):
         config, directory, manifest = self.installation('Windows', 'controller')

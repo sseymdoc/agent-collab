@@ -19,12 +19,17 @@ MODEL = 'gpt-6-astra'  # 稳定 launcher 固定的模型；适配器本身不再
 
 ROOT = Path(__file__).resolve().parents[1]
 # 假的 `codex app-server`：两页 model/list，夹一行非 JSON 与一个名称不合约束的条目。
-FAKE_APP_SERVER = '''import json, sys
-assert sys.argv[1] == 'app-server'
+FAKE_APP_SERVER = '''import json, os, sys
+# 探测必须带着与执行相同的 provider 覆盖启动；用户配置里的 provider 由环境变量模拟。
+assert sys.argv[1:] == ['-c', 'model_provider="openai"', 'app-server'], sys.argv
 for line in sys.stdin:
     m = json.loads(line)
     if m.get('method') == 'initialize':
         print(json.dumps({'id': m['id'], 'result': {}}), flush=True)
+    elif m.get('method') == 'config/read':
+        effective = os.environ.get('FAKE_EFFECTIVE_PROVIDER', 'openai')
+        print(json.dumps({'id': m['id'], 'error': {'message': 'unknown method'}} if effective == 'unsupported' else
+                         {'id': m['id'], 'result': {'config': {'model_provider': effective}}}), flush=True)
     elif m.get('method') == 'model/list':
         page = m['params']['cursor']
         data = [{'model': 'm-two', 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}], 'defaultReasoningEffort': 'high'}] if page else [
@@ -43,7 +48,7 @@ class CodexTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(self.temp))
 
     def test_argv_new_and_resume_exact_golden_layout(self):
-        common = ['codex', 'exec', '--ignore-user-config', '-C', str(self.temp), '--sandbox', 'workspace-write',
+        common = ['codex', 'exec', '--ignore-user-config', '-c', 'model_provider="openai"', '-C', str(self.temp), '--sandbox', 'workspace-write',
             '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort="xhigh"',
             '-c', 'sandbox_workspace_write.writable_roots=[]',
             '-c', 'sandbox_workspace_write.network_access=false',
@@ -71,7 +76,8 @@ class CodexTests(unittest.TestCase):
                         q = dict(op=operation, cwd=str(self.temp), sandbox=sandbox, effort=effort,
                                  session_id=SESSION, structured_report=structured)
                         expected = namespace['argv']({'codex': ['python', 'wrapper']}, q, self.temp)
-                        expected.insert(expected.index('exec') + 1, '--ignore-user-config')
+                        # 稳定 launcher 之后加入的三项：不读用户配置，并显式固定 provider（与目录探测一致）。
+                        expected[expected.index('exec') + 1:expected.index('exec') + 1] = ['--ignore-user-config', '-c', 'model_provider="openai"']
                         actual = build_argv(['python', 'wrapper'], self.temp, self.temp,
                             {'model': MODEL, 'sandbox': sandbox, 'effort': effort}, SESSION if operation == 'resume' else None, structured, system='Darwin')
                         self.assertEqual(actual, expected)
@@ -85,7 +91,8 @@ class CodexTests(unittest.TestCase):
         server = self.temp / 'fake_app_server.py'
         server.write_text(FAKE_APP_SERVER)
         catalog = model_catalog([sys.executable, str(server)])
-        self.assertEqual((catalog['status'], catalog['source'], catalog['reason']), ('ok', 'app-server:model/list', None))
+        self.assertEqual((catalog['status'], catalog['source'], catalog['reason'], catalog['provider']),
+                         ('ok', 'app-server:model/list', None, 'openai'))
         self.assertEqual(catalog['models'], [{'id': 'm-one', 'efforts': ['low', 'max'], 'default_effort': 'low'},
                                              {'id': 'm-two', 'efforts': ['high'], 'default_effort': 'high'}])
         self.assertEqual(model_catalog(None)['reason'], 'command_missing')
@@ -94,6 +101,19 @@ class CodexTests(unittest.TestCase):
         broken.write_text('import sys; sys.exit(3)')
         failed = model_catalog([sys.executable, str(broken)], timeout=5)
         self.assertEqual((failed['status'], failed['reason'], failed['models']), ('unknown', 'probe_failed', []))
+
+    def test_model_catalog_is_not_taken_from_a_provider_other_than_the_one_execution_uses(self):
+        server = self.temp / 'fake_app_server.py'
+        server.write_text(FAKE_APP_SERVER)
+        # 用户配置让 app-server 生效的 provider 不是执行用的那个：不采用这份目录。
+        other = model_catalog([sys.executable, str(server)], env=dict(os.environ, FAKE_EFFECTIVE_PROVIDER='corp-gateway'))
+        self.assertEqual((other['status'], other['reason'], other['provider'], other['models']), ('unknown', 'provider_mismatch', 'corp-gateway', []))
+        # 读不回生效的 provider（CLI 不支持 config/read）：同样不采用，不靠猜。
+        blind = model_catalog([sys.executable, str(server)], env=dict(os.environ, FAKE_EFFECTIVE_PROVIDER='unsupported'))
+        self.assertEqual((blind['status'], blind['reason'], blind['provider']), ('unknown', 'provider_unverified', None))
+        # 执行的 argv 带着同一条覆盖，并且不读用户配置。
+        argv = build_argv('codex', self.temp, self.temp, {'model': MODEL, 'effort': 'high'}, system='Linux')
+        self.assertEqual(argv[1:5], ['exec', '--ignore-user-config', '-c', 'model_provider="openai"'])
 
     def test_model_catalog_gives_up_at_the_deadline_even_while_notifications_keep_arriving(self):
         chatty = self.temp / 'chatty.py'

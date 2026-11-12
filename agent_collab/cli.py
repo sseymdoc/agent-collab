@@ -10,17 +10,22 @@
 
 客户端子命令与桌面端共用同一套 API 和授权（docs/protocol.md §12），输出都是 JSON：
 
-    agent-collab client pair --url U --code C [--name N]    # 用配对码换取本机的客户端凭据
+    agent-collab client pair --url U --code C [--name N] [--credential-store system|file]   # 用配对码换取本机的客户端凭据
     agent-collab client status | forget [--revoke]
     agent-collab submit 任务.json
     agent-collab submit --template T --goal 目标 [--input-dir 目录 | --baseline ID] [--check 名称=命令] [--wait]
+    agent-collab submit --resume REQUEST_ID | --pending    # 恢复（或列出）没有得到明确答复的提交，不重复创建任务
     agent-collab job list | show ID | wait ID | follow ID | results ID | artifacts ID [--download 目录]
     agent-collab job publish ID | cancel ID | retry ID --reason 原因
     agent-collab baseline add 目录 --name 名称 | list
+    agent-collab project list | create | set | bind | push | plan | apply | recover ...   # 项目、本机目录、输入与成果应用，见 project --help
     agent-collab settings get | set [--codex-model M --codex-effort E] [--allow M=e1,e2 | --allow-any] ...
     agent-collab api METHOD PATH [--data JSON|@文件]
 
-凭据：--profile（缺省 default；client pair 写入的客户端凭据），或 --token-file（controller 本机的管理令牌）。
+凭据：--profile（缺省 default；client pair 得到的客户端凭据），或 --token-file（controller 本机的管理令牌）。
+客户端凭据缺省保存在系统凭据存储（Windows 凭据管理器、macOS 登录钥匙串、Linux Secret Service）；没有图形会话的部署
+在配对时用 --credential-store file（或环境变量 AGENT_COLLAB_CREDENTIAL_STORE=file）显式选择仅当前用户可访问的文件。
+系统存储不可用时命令报错，不会自动改用文件；文件后端每次读取前核对文件的实际访问权限。
 变更请求缺 request_id 时自动生成。证书始终校验，http:// 仅限 loopback。
 退出码：0 成功；1 本地错误；2 请求被拒绝或参数格式错误；3 连接、凭据（HTTP 401）或 controller 身份问题；4 等待超时；5 任务以失败、取消或需人工处理结束。
 """
@@ -128,6 +133,32 @@ def profile_path(name):
     return client_home() / 'clients' / (name + '.json')
 
 
+CREDENTIAL_STORES = ('system', 'file')
+
+
+def credential_account(saved):
+    return '%s/%s' % (saved['controller_id'], saved['client_id'])
+
+
+def profile_token(name, path, saved):
+    """按 profile 记下的后端取凭据。后端之间不互相回退；没有 credential_store 字段的是此前版本写的文件后端。"""
+    from . import credstore
+    if saved.get('credential_store', 'file') == 'file':
+        problem = credstore.file_problem(path)
+        if problem:
+            raise SystemExit('凭据文件 %s 的访问权限不止当前用户（%s），没有使用它。收紧权限，或 agent-collab client forget 后重新配对' % (path, problem))
+        return saved['token']
+    try:
+        token = credstore.load(credential_account(saved))
+    except credstore.StoreError as exc:
+        raise SystemExit('profile %s 的凭据在系统凭据存储里，当前会话读不到它（%s）。没有图形会话的环境请另行配对一份 '
+                         '--credential-store file 的凭据' % (name, exc)) from None
+    if token is None:
+        raise SystemExit('系统凭据存储里没有 profile %s 的凭据（%s）；agent-collab client forget 后重新配对'
+                         % (name, credstore.location(credential_account(saved))))
+    return token
+
+
 class Conn:
     """一条已认证的 controller 连接：客户端凭据（绑定 controller 身份）或本机管理令牌。"""
     def __init__(self, a, profile_only=False):
@@ -144,7 +175,8 @@ class Conn:
         # 凭据只发往配对时的地址：X-Controller-Id 要等应答回来才能核对，那时凭据已经送出。地址变了就重新配对。
         if a.url and a.url.rstrip('/') != saved['url']:
             raise SystemExit('profile %s 配对的地址是 %s；凭据不会发往 --url 指定的其他地址，地址变了请重新配对' % (a.profile, saved['url']))
-        self.url, self.token, self.controller_id = saved['url'], saved['token'], saved['controller_id']
+        self.url, self.controller_id = saved['url'], saved['controller_id']
+        self.token = profile_token(a.profile, path, saved)
         self.ca_file = a.ca_file or saved.get('ca_file')
 
     def send(self, method, path, data=None):
@@ -179,6 +211,97 @@ def connection_args(parser):
     parser.add_argument('--ca-file')
 
 
+def receipt_path(request_id):
+    """尚无明确答复的请求（任务提交、输入基线登记）在本机的回执：<配置目录>/requests/<request_id>.json。"""
+    try:
+        ok = str(uuid.UUID(request_id)) == request_id
+    except (ValueError, AttributeError, TypeError):
+        ok = False
+    if not ok:
+        raise SystemExit('request_id 必须是小写 UUID')
+    return client_home() / 'requests' / (request_id + '.json')
+
+
+def send_with_receipt(conn, path, body, resume, kind, resumed=False, what='这次提交'):
+    """发出一次创建请求；得到 controller 的明确答复之前，完整的请求体作为回执留在本机。
+
+    回执在请求发出之前写好；`resume` 是之后在任何进程里原样重放它的命令。2xx 或明确的拒绝（401 以外的 4xx）后删除。
+    """
+    from .artifacts import atomic_write
+    body.setdefault('request_id', str(uuid.uuid4()))
+    path_ = receipt_path(body['request_id'])
+    if not resumed:
+        if path_.exists():
+            raise SystemExit('request_id %s 已有未完成的请求；用 %s 恢复它' % (body['request_id'], resume))
+        atomic_write(path_, json.dumps({'request_id': body['request_id'], 'kind': kind, 'path': path, 'resume': resume,
+                                        'controller_id': conn.controller_id, 'url': conn.url,
+                                        'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'body': body},
+                                       ensure_ascii=False).encode('utf-8'))
+    try:
+        status, answer = conn.send('POST', path, body)
+    except Unreachable:
+        print(json.dumps({'error': {'code': 'network', 'message': 'controller 不可达，%s是否已被受理未知；请求已保存在本机，'
+                                    '恢复同一次请求（不会重复创建）：%s' % (what, resume)},
+                          'request_id': body['request_id'], 'resume': resume, 'receipt': str(path_)}, ensure_ascii=False), file=sys.stderr)
+        raise SystemExit(3)
+    if 200 <= status < 300 or (400 <= status < 500 and status != 401):
+        path_.unlink()  # 明确答复：受理，或被拒绝且重放不会改变结果
+    return status, answer
+
+
+def load_receipt(conn, request_id, kind):
+    """读出一份回执，并确认它属于当前连接的 controller；不是就退出，不把旧请求送进另一份数据。"""
+    path = receipt_path(request_id)
+    if not path.is_file():
+        fail('no_receipt', '本机没有 request_id %s 的未完成请求：它已得到明确答复，或不是在这个配置目录下发出的' % request_id, 2)
+    saved = json.loads(path.read_text(encoding='utf-8'))
+    if saved.get('kind', 'job') != kind:
+        fail('invalid', 'request_id %s 不是这种请求；用 %s 恢复它' % (request_id, saved.get('resume')), 2)
+    if saved['controller_id'] != conn.controller_id or (conn.controller_id is None and saved['url'] != conn.url):
+        fail('controller_mismatch', '这次请求是发给另一个 controller 的（%s）；用配对到它的 --profile 恢复' % saved['url'], 2)
+    return saved
+
+
+def submit_job(conn, body, resumed=False):
+    """发出一次任务提交；得到 controller 的明确答复之前，请求体作为回执留在本机。
+
+    应答丢失、进程被中断或 controller 暂时不可达时，这次提交是否已被受理是未知的。回执保存了完整的请求体
+    （含 request_id），`agent-collab submit --resume <request_id>` 在任何之后的进程里把它原样重放：controller 按
+    request_id 返回第一次受理的任务和它当时冻结的快照，期间默认模型等设置的变化不影响它；重放同样先检查当前凭据。
+    得到 2xx 或明确的拒绝（4xx）后回执删除。不带 --resume 的提交总是新的 request_id，即新的任务。
+    """
+    body.setdefault('request_id', str(uuid.uuid4()))
+    return send_with_receipt(conn, '/jobs', body, 'agent-collab submit --resume ' + body['request_id'], 'job', resumed)
+
+
+def _submit_receipts(argv):
+    """submit --resume <request_id>：原样重放一次没有得到明确答复的提交；submit --pending：列出这些提交。"""
+    ap = argparse.ArgumentParser(prog='agent-collab submit')
+    choice = ap.add_mutually_exclusive_group(required=True)
+    choice.add_argument('--resume', metavar='REQUEST_ID')
+    choice.add_argument('--pending', action='store_true')
+    ap.add_argument('--wait', action='store_true')
+    ap.add_argument('--timeout', type=float, default=3600)
+    connection_args(ap)
+    a = ap.parse_args(argv)
+    if a.pending:
+        # 列出全部没有明确答复的请求（任务提交与输入基线登记），各自带恢复命令。
+        saved = [json.loads(p.read_text(encoding='utf-8')) for p in sorted((client_home() / 'requests').glob('*.json'))]
+        out({'pending': [{'request_id': r['request_id'], 'kind': r.get('kind', 'job'), 'created_at': r['created_at'], 'url': r['url'],
+                          'title': r['body'].get('title') or r['body'].get('name'),
+                          'resume': r.get('resume') or 'agent-collab submit --resume ' + r['request_id']} for r in saved]})
+        return 0
+    conn = Conn(a)
+    # 回执只对受理它的那个 controller 有意义：换了 controller 不重放，避免把旧请求送进另一份数据。
+    saved = load_receipt(conn, a.resume, 'job')
+    status, body = submit_job(conn, saved['body'], resumed=True)
+    if not 200 <= status < 300 or not a.wait:
+        # 201：这次重放才第一次受理；200：此前已受理，body 是当时的受理结果（含冻结的 model_policy）。
+        out({'http_status': status, 'body': body, 'request_id': a.resume, 'replayed': status == 200})
+        return 0 if 200 <= status < 300 else rejected(status)
+    return wait(conn, body['job_id'], a.timeout)
+
+
 def _client(argv, submit):
     """api 与“提交任务文件”：输出 {"http_status", "body"}，只有 2xx 算成功。"""
     ap = argparse.ArgumentParser(prog='agent-collab ' + ('submit' if submit else 'api'))
@@ -193,15 +316,16 @@ def _client(argv, submit):
     a = ap.parse_args(argv)
     conn = Conn(a)
     if submit:
-        method, path, data = 'POST', '/jobs', json.loads(Path(a.job_file).read_text(encoding='utf-8-sig'))
-    else:
-        method, path = a.method, a.path
-        data = None
-        if a.data:
-            data = json.loads(Path(a.data[1:]).read_text(encoding='utf-8-sig')) if a.data.startswith('@') else json.loads(a.data)
+        status, body = submit_job(conn, json.loads(Path(a.job_file).read_text(encoding='utf-8-sig')))
+        out({'http_status': status, 'body': body})
+        return 0 if 200 <= status < 300 else rejected(status)
+    method, path = a.method, a.path
+    data = None
+    if a.data:
+        data = json.loads(Path(a.data[1:]).read_text(encoding='utf-8-sig')) if a.data.startswith('@') else json.loads(a.data)
     if method != 'GET' and isinstance(data, dict):
         data.setdefault('request_id', str(uuid.uuid4()))
-    extra = {'headers': {'X-Coordinator-Token': a.coordinator_token}} if not submit and a.coordinator_token else {}
+    extra = {'headers': {'X-Coordinator-Token': a.coordinator_token}} if a.coordinator_token else {}
     status, body = request(conn.url, conn.token, method, path, data, conn.ca_file, conn.controller_id, **extra)
     out({'http_status': status, 'body': body})
     return 0 if 200 <= status < 300 else rejected(status)  # 3xx 不算送达
@@ -217,17 +341,29 @@ def _client_command(argv):
     pairing.add_argument('--kind', choices=('cli', 'agent'), default='cli')
     pairing.add_argument('--profile', default=os.environ.get('AGENT_COLLAB_PROFILE', 'default'))
     pairing.add_argument('--ca-file')
+    pairing.add_argument('--credential-store', choices=CREDENTIAL_STORES, default=os.environ.get('AGENT_COLLAB_CREDENTIAL_STORE') or 'system',
+                         help='凭据放在哪里。system（缺省）：系统凭据存储；file：仅当前用户可访问的文件，给没有图形会话的部署用。'
+                              '系统存储不可用时不会自动改用文件')
     for name in ('status', 'forget'):
         connection_args(sub.add_parser(name))
     sub.choices['forget'].add_argument('--revoke', action='store_true', help='同时在 controller 上撤销这份凭据')
     a = ap.parse_args(argv)
     path = profile_path(a.profile)
     if a.action == 'pair':
+        from . import credstore
+        from .artifacts import SecretFile
+        if a.credential_store not in CREDENTIAL_STORES:
+            raise SystemExit('AGENT_COLLAB_CREDENTIAL_STORE 只能是 system 或 file')
         if path.exists():
             raise SystemExit('profile %s 已有凭据；先 agent-collab client forget，或换一个 --profile' % a.profile)
-        from .artifacts import SecretFile
-        # 自动化客户端的凭据放在当前用户的配置目录里，文件仅本人可访问（POSIX 用 0600，Windows 的 DACL 只留当前用户）；
-        # 它可单独撤销、权限按配对码授予。凭据值不打印。先收紧再配对：配对码只能用一次。
+        # 配对码只能用一次：先确认凭据有地方放，再发配对请求。系统存储写不了时报错并说明另一后端的选法，不自动落文件。
+        if a.credential_store == 'system':
+            try:
+                credstore.probe()
+            except credstore.StoreError as exc:
+                raise SystemExit('系统凭据存储在当前会话不可用（%s）；配对码没有使用，凭据没有保存。没有图形会话的部署请显式选择文件后端：'
+                                 '--credential-store file（凭据保存在仅当前用户可访问的文件里，可单独撤销）' % exc) from None
+        # profile 文件（文件后端时含凭据）仅本人可访问：POSIX 用 0600，Windows 的 DACL 只留当前用户。
         try:
             secret = SecretFile(path)
         except OSError:
@@ -238,10 +374,24 @@ def _client_command(argv):
                 out({'http_status': status, 'body': body})
                 return 2
             saved = {k: body[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id')}
-            saved.update(url=a.url.rstrip('/'), ca_file=str(Path(a.ca_file).absolute()) if a.ca_file else None, token=body['client_token'])
+            saved.update(url=a.url.rstrip('/'), ca_file=str(Path(a.ca_file).absolute()) if a.ca_file else None,
+                         credential_store=a.credential_store)
+            if a.credential_store == 'file':
+                saved['token'] = body['client_token']
+                place = str(path)
+            else:
+                place = credstore.location(credential_account(saved))
+                try:
+                    credstore.store(credential_account(saved), body['client_token'])
+                except credstore.StoreError as exc:
+                    # 凭据已签发却没能保存：用它自我撤销，不留下无人保管的凭据。
+                    revoked = request(a.url, body['client_token'], 'DELETE', '/client', None, a.ca_file, body['controller_id'])[0] == 200
+                    raise SystemExit('凭据没能写入系统凭据存储（%s）；%s' % (exc, '已在 controller 上撤销它' if revoked else
+                                     '撤销它也没有成功，请在另一客户端撤销客户端 ' + body['client_id'])) from None
             secret.save(json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'))
+        # 输出存放位置，不输出凭据值。
         out(dict({k: saved[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id', 'url')},
-                 profile=a.profile, credential_file=str(path)))
+                 profile=a.profile, credential_store=a.credential_store, credential_location=place, credential_file=str(path)))
         return 0
     if a.action == 'status':
         out(Conn(a).call('GET', '/client'))
@@ -254,6 +404,13 @@ def _client_command(argv):
             out({'profile': a.profile, 'forgotten': False, 'revoked': False})
             return 2  # 撤销没成功就保留凭据文件，以便重试
     if path.exists():
+        saved = json.loads(path.read_text(encoding='utf-8'))
+        if saved.get('credential_store') == 'system':
+            from . import credstore
+            try:
+                credstore.delete(credential_account(saved))
+            except credstore.StoreError as exc:
+                raise SystemExit('没能从系统凭据存储删除凭据（%s）；profile 保留，稍后重试' % exc) from None
         path.unlink()
     out({'profile': a.profile, 'forgotten': True, 'revoked': revoked})
     return 0
@@ -377,8 +534,10 @@ def stream(conn, cursor):
             continue
         if response.getcode() != 200:
             response.close()
-            if response.getcode() in (401, 403):
-                fail('unauthorized', '凭据已失效或没有读取权限')
+            if response.getcode() == 401:
+                fail('unauthorized', '凭据已失效或被撤销')
+            if response.getcode() == 403:
+                fail('forbidden', '这份凭据没有读取事件的权限（需要 read）；凭据仍然有效', 2)
             time.sleep(2)
             yield None
             continue
@@ -395,6 +554,8 @@ def stream(conn, cursor):
                 elif not line:
                     if kind == 'unauthorized':
                         fail('unauthorized', '凭据已被撤销')
+                    if kind == 'forbidden':
+                        fail('forbidden', '这份凭据没有读取事件的权限（需要 read）；凭据仍然有效', 2)
                     if kind == 'snapshot_required':
                         yield SNAPSHOT
                         # min_seq 是仍保留的第一条，而流按 seq > cursor 续读：先补读从它开始的一页，再从补读到的位置续接。
@@ -477,6 +638,8 @@ def follow(conn, job_id, timeout):
 
 
 def _submit(argv):
+    if '--resume' in argv or '--pending' in argv:
+        return _submit_receipts(argv)
     if argv and not argv[0].startswith('-') and '--template' not in argv:
         return _client(argv, True)  # 提交现成的任务文件
     ap = argparse.ArgumentParser(prog='agent-collab submit')
@@ -493,7 +656,9 @@ def _submit(argv):
     ap.add_argument('--effort')
     ap.add_argument('--os', action='append', default=[], choices=('windows', 'linux', 'macos'))
     ap.add_argument('--dry-run', action='store_true', help='只输出将提交的契约与解析后的模型，不创建任务')
-    ap.add_argument('--request-id', help='幂等键（UUID）；网络失败后用同一个值重试不会重复创建任务')
+    ap.add_argument('--project', help='项目 ID：用项目的默认值；没有另给输入时用项目最近登记的输入（先 agent-collab project push）')
+    ap.add_argument('--request-id', help='这次提交的幂等键（UUID），缺省自动生成。应答丢失后用 submit --resume <request_id> 恢复，'
+                                         '不要带着它重跑整条命令：重跑会重新草拟，内容一变就被拒绝')
     ap.add_argument('--wait', action='store_true')
     ap.add_argument('--timeout', type=float, default=3600)
     connection_args(ap)
@@ -510,17 +675,22 @@ def _submit(argv):
         draft['inputs_manifest'] = upload_directory(conn, a.input_dir)
     elif a.baseline:
         draft['baseline_id'] = a.baseline
+    if a.project:
+        draft['project_id'] = a.project
     drafted = conn.call('POST', '/contracts/draft', draft)
     if a.dry_run:
         out(drafted)
         return 0
     # 带上草拟时的设置版本：期间默认模型被改动则被拒绝，不会按没看过的解析结果受理。
     request = {'title': drafted['title'], 'contract': drafted['contract'], 'expected_settings_revision': drafted['settings_revision']}
+    if a.project:
+        # 项目默认值在草拟后变了同样被拒绝：受理时用的就是草拟时看到的那一版。
+        request.update(project_id=a.project, expected_project_revision=drafted['project_revision'])
     if a.request_id:
         request['request_id'] = a.request_id
-    status, body = conn.send('POST', '/jobs', request)
+    status, body = submit_job(conn, request)
     if not 200 <= status < 300 or not a.wait:
-        out({'http_status': status, 'body': body, 'warnings': drafted['warnings']})
+        out({'http_status': status, 'body': body, 'warnings': drafted['warnings'], 'request_id': request['request_id']})
         return 0 if 200 <= status < 300 else rejected(status)
     return wait(conn, body['job_id'], a.timeout)
 
@@ -583,6 +753,9 @@ def _job(argv):
             if target.exists() and any(target.iterdir()):
                 raise SystemExit('下载目录必须为空或不存在')
             materialize(target, {'version': 1, 'base': None, 'files': files['files'], 'deleted': []}, conn.blob)
+            # 整包下载完成（每个文件的哈希都核对过）才登记“已下载”；只列清单不登记。
+            conn.call('POST', '/jobs/%s/downloads' % a.job_id, {'checkpoint_id': checkpoint, 'files': len(files['files']),
+                                                               'bytes': sum(f['size'] for f in files['files'])})
         out(dict(files, job_id=a.job_id, published=bool(job['delivery_checkpoint_id']), downloaded_to=str(target) if target else None))
     return 0
 
@@ -647,8 +820,13 @@ def _migrate(argv):
 
 
 MODULES = {'controller': 'agent_collab.controller', 'agent': 'agent_collab.node_agent', 'legacy': 'agent_collab.legacy'}
+def _project(argv):
+    from . import project_cli
+    return project_cli.main(argv)
+
+
 COMMANDS = {'client': _client_command, 'submit': _submit, 'job': _job, 'baseline': _baseline, 'settings': _settings,
-            'migrate': _migrate, 'api': lambda argv: _client(argv, False)}
+            'project': _project, 'migrate': _migrate, 'api': lambda argv: _client(argv, False)}
 
 
 def main(argv=None):

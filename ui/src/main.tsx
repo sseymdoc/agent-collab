@@ -11,6 +11,12 @@ import { Nodes } from './pages/Nodes'
 import { Jobs } from './pages/Jobs'
 import { JobDetail } from './pages/JobDetail'
 import { Settings } from './pages/Settings'
+import { Projects } from './pages/Projects'
+import { ProjectDetail } from './pages/ProjectDetail'
+import { Activity } from './pages/Activity'
+import { Unfinished } from './pages/JobResult'
+import { BuildMark } from './pages/Wizard'
+import { useNotifier } from './notify'
 import './styles.css'
 
 try { applyTheme(localStorage.getItem('ac_theme')) } catch { /* 存储不可用时跟随系统 */ }
@@ -66,7 +72,8 @@ function App() {
       await enter()
     } catch (e) {
       if (isDesktop) return setPhase(p => ({ ...p, at: 'login', reason: null, error: e instanceof ApiError ? errText(e) : bridgeText(e) }))
-      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) leave(null)
+      // 只有 401 表示需要重新登录；403 是权限不足，会话仍然有效，按错误显示。
+      if (e instanceof ApiError && e.status === 401) leave(null)
       else setPhase(p => ({ ...p, error: errText(e) }))
     }
   }
@@ -86,13 +93,16 @@ function App() {
   return <Shell key={phase.generation} onLeave={() => isDesktop ? leave(null) : void api.logout().catch(() => {}).finally(() => leave(null))} />
 }
 
-// 导航按“总览 → 任务 → 设备 → 设置”排列；项目与活动两页在后续版本加入同一列表。
-const NAV = [['overview', '总览'], ['jobs', '任务'], ['nodes', '设备'], ['settings', '设置']]
+const NAV = [['overview', '总览'], ['projects', '项目'], ['jobs', '任务'], ['activity', '活动'], ['nodes', '设备'], ['settings', '设置']]
 
 function Shell({ onLeave }: { onLeave: () => void }) {
   const hash = useHash()
-  const live = useLive(true)
+  // 通知去重表与“连接建立时的最大序号”挂在 Shell 上，随连接切换（generation）重建。
+  const notify = useNotifier()
+  const live = useLive(true, notify)
   const who = session()
+  const [info, setInfo] = useState<any>(null)
+  useEffect(() => { if (isDesktop) invoke('app_info').then(setInfo, () => {}) }, [])
   // 浏览器会话可能在页面空闲时过期：事件流断开期间定时探测，过期由 401 切回登录页。
   useEffect(() => {
     if (isDesktop || live.state !== 'retrying') return
@@ -103,7 +113,8 @@ function Shell({ onLeave }: { onLeave: () => void }) {
   }, [live.state])
   const [, page, id] = hash.split('/')
   const at = live.lastAt ? new Date(live.lastAt).toLocaleTimeString('zh-CN', { hour12: false }) : '尚无'
-  const conn = live.state === 'open' ? ['good', '实时'] : live.state === 'retrying' ? ['bad', '连接中断 · 数据截至 ' + at] : ['warn', '连接中']
+  const conn = live.state === 'open' ? ['good', '实时'] : live.state === 'retrying' ? ['bad', '连接中断 · 数据截至 ' + at]
+    : live.state === 'forbidden' ? ['warn', '无实时事件权限 · 手动刷新'] : ['warn', '连接中']
   return <>
     <header className="top">
       <strong>Agent Collab</strong>
@@ -113,11 +124,16 @@ function Shell({ onLeave }: { onLeave: () => void }) {
       <button className="link" onClick={onLeave}>{isDesktop ? '断开' : '退出'}</button>
     </header>
     <main>
+      <Unfinished />
       {page === 'nodes' ? <Nodes tick={live.tick} />
+        : page === 'projects' && id ? <ProjectDetail key={id} id={id} tick={live.tick} />
+        : page === 'projects' ? <Projects tick={live.tick} />
+        : page === 'activity' ? <Activity tick={live.tick} />
         : page === 'jobs' && id ? <JobDetail key={id} id={id} tick={live.tick} />
         : page === 'jobs' ? <Jobs tick={live.tick} />
         : page === 'settings' ? <Settings tick={live.tick} onLeave={onLeave} />
         : <Overview tick={live.tick} />}
+      <footer><BuildMark info={info} /></footer>
     </main>
   </>
 }

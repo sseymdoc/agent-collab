@@ -17,12 +17,17 @@ serde_json = "1"
 # 不带缺省 feature：rustls + 系统根证书，不引入 native-tls、cookie、压缩、系统代理。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
-# 系统“另存为”对话框。直接用 rfd，不注册 tauri-plugin-dialog（它会带进 tauri-plugin-fs 和面向页面的对话框命令）。
+# 系统对话框（另存为、选择文件夹、打开文件）。直接用 rfd，不注册 tauri-plugin-dialog（它会带进 tauri-plugin-fs 和面向页面的对话框命令）。
 rfd = "0.17"
 sha2 = "0.10"
 tokio = { version = "1", features = ["sync"] }
 url = "2"
+# 系统通知。只用它的 Rust API（`notify` 命令）；capabilities 里不授予它自带的页面权限。
+tauri-plugin-notification = "2"
+# 以下两项本来就在依赖树里（由 tauri、reqwest 带入）：生成 request_id 与应用 ID；解码 PEM 证书。
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
 
 [features]
-# 仅候选版验证用：编译进自动化钩子（src/lib.rs 的 automation 模块）。默认关闭。
+# 仅内部测试版用：编译进自动化钩子、对话框替身与助手位置覆盖（见 docs/desktop.md“自动化钩子”）。默认关闭。
 automation = []

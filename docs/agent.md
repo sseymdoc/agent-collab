@@ -14,7 +14,12 @@ python3 -m agent_collab.node_agent detect
 python3 -m agent_collab.node_agent detect --data-dir /absolute/agent-data
 python3 -m agent_collab.node_agent doctor --data-dir /absolute/agent-data
 python3 -m agent_collab.node_agent run --data-dir /absolute/agent-data
+python3 -m agent_collab.node_agent project-bind --data-dir /absolute/agent-data <project_id> /absolute/project-dir
+python3 -m agent_collab.node_agent project-unbind --data-dir /absolute/agent-data <project_id>
+python3 -m agent_collab.node_agent project-bindings --data-dir /absolute/agent-data
 ```
+
+`project-bind/unbind/bindings`（安装后为 `agent-collab agent project-bind ...`）是远端项目写回的本机授权，见下文“远端项目写回”。
 
 自建 CA 使用 `pair --ca-file /absolute/ca.pem`。HTTPS 始终验证证书和主机名；只有
 `localhost` 或字面 loopback IP 允许 HTTP。客户端不跟随重定向，不转发认证到其他源。
@@ -64,6 +69,7 @@ attempt、PID、记录的创建时间、meta.json 路径和可执行的进程查
 | codex_home | 可选，传给 Codex 执行和探测的 CODEX_HOME；不复制认证 |
 | disabled_harnesses | `{harness: 原因}`，撤销对应能力并禁止执行；透出 harness_disabled |
 | workspace_root | 可选，工作区改为 `<workspace_root>/<attempt_id>`；元数据和输出仍在 data 下 |
+| integration_roots | 可选，绝对路径列表；给出时回写目标必须在其中某个目录之内（解析链接后比较），否则该回写上报 conflict 且不写入；未配置时不限制 |
 | codex_windows_sandbox | Windows Codex 的 windows.sandbox，缺省 elevated |
 | auth_probe_s | 认证状态探测周期，缺省 900 秒；启动探测，后续后台探测，不阻塞心跳 |
 | model_catalog_s | 模型目录刷新周期，缺省 21600 秒；后台读取，不阻塞心跳 |
@@ -86,10 +92,10 @@ macOS 上 Claude 的订阅登录存在登录钥匙串里，只有图形登录会
 worker 若运行在读不到钥匙串的上下文里，同样上报 unknown；派到它的 Claude 回合失败且输出是认证错误时，适配器再检查一次钥匙串，
 读不到就以 `capability_missing` 结束（只记本节点该 harness 能力降级），不报 `auth_expired`，
 因为 controller 收到 `auth_expired` 会把共享同一 `provider_account_refs` 的节点都标成 expired。
-Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.sandbox="elevated"`（可配置）。
+Codex 执行增加 `--ignore-user-config` 与 `-c model_provider="openai"`，Windows 显式传入 `-c windows.sandbox="elevated"`（可配置）。
 已有 model、effort、approval_policy、sandbox_workspace_write 隔离参数继续显式传递。
 `--ignore-user-config` 跳过整个用户 config.toml，不只是 MCP 与 notify：模型、effort、沙箱模式、审批策略、工作目录、
-可写根与网络开关全部来自上述受管参数；provider 用 Codex 缺省值，认证用 CODEX_HOME 中的官方本机登录。
+可写根与网络开关全部来自上述受管参数；provider 由上面的 `-c model_provider="openai"` 显式指定，与模型目录探测用的是同一个（见下文“模型目录”），认证用 CODEX_HOME 中的官方本机登录。
 用户配置里的 service_tier、插件和其他键在受管执行中不生效。这个开关不等于隔离全部指引：
 工作区内的 AGENTS.md 与 CODEX_HOME 下的全局指引是否加载取决于 Codex 自身，本项目没有验证，也不对此作保证。
 
@@ -101,6 +107,7 @@ Codex 执行增加 `--ignore-user-config`，Windows 显式传入 `-c windows.san
 ```text
 agent-data/
   agent.json, node.token, agent.lock, agent.log, status.json
+  model-catalog.json              # 最近一次成功取得的 Codex 模型目录（含取得时间、CLI 版本与 provider）
   blobs/<sha256>                  # 不可变的本地上传/下载缓存
   attempts/<attempt_id>/
     meta.json                    # assignment、令牌哈希、checkpoint/complete/publish outbox
@@ -119,7 +126,7 @@ agent-data/
 配置、事件、元数据、agent 日志、doctor 和 HTTP 错误不写节点或租约明文令牌。
 agent 使用 `node.token` 和 `attempts/<id>/lease.token` 保存发起认证所需的 Bearer 原值；
 控制端和元数据中的校验记录只保存 SHA-256，比较用 `hmac.compare_digest`。模型 provider 登录不复制。
-运行日志仅来自本机 harness；本产品不把它们自动上传为事件。
+运行日志仅来自本机 harness；本产品不把它们自动上传为事件。完整输出可以经下文“节点管理操作”的 `log_tail` 按任务、按块取回。
 
 agent 在 complete.report 中上传有限的执行证据：stub 每个已触及步骤的状态、run 退出码及两个各 ≤4 KiB 的输出尾部，
 检查点跳过的步骤标为 skipped_from_checkpoint；Codex 的 result.txt 尾部 ≤16 KiB、实际 session/usage/CLI error；
@@ -140,12 +147,37 @@ lease.token）。检查若导入模型刚写出的工作区代码（如 `{python
 
 ## 模型目录
 
-controller 在注册响应的 `features` 里声明 `node_models` 之后，节点在后台读取 Codex 的模型目录并随注册上报（`capabilities.models`，`docs/protocol.md` §12.5）；连接旧版本 controller 时不读取也不上报。
+controller 在注册响应的 `features` 里声明 `node_models` 之后，节点在后台读取 Codex 的模型目录并随注册上报（`capabilities.models`，`docs/protocol.md` §12.5）；连接旧版本 controller 时不读取也不上报。节点与 controller 断线重连后重新注册，以重新取得 `features`。
 
-- 读取方式：以节点解析出的 codex 命令启动 `codex app-server`，经 stdin/stdout 发送 `initialize` 与 `model/list`，取到应答后结束该进程。不监听端口，不调用模型；进程继承节点服务的用户、`CODEX_HOME` 与登录状态，所以目录是这个节点上这个账户能看到的模型及各自支持的 effort。
-- 取不到（命令缺失、启动失败、20 秒内没有应答、应答格式不符）时上报 `status: unknown` 与原因，controller 不因此排除该节点。名称不符合字段约束的条目不进目录。
-- 目录内容变化时重新注册；没有变化则在下一个周期前不重复读取。Claude CLI 没有目录接口，固定上报 `unknown` / `no_catalog_interface`。
+- 读取方式：以节点解析出的 codex 命令加 `-c model_provider="openai"` 启动 `codex app-server`，经 stdin/stdout 完成握手（`initialize`）后，先发 `config/read` 读回生效的 `model_provider`，再发 `model/list`，取到应答后结束该进程。不监听端口，不调用模型；进程继承节点服务的用户、`CODEX_HOME` 与登录状态，所以目录是这个节点上这个账户能看到的模型及各自支持的 effort。
+- 探测与执行使用同一个 provider：执行的 argv 同样带 `-c model_provider="openai"`，并保留 `--ignore-user-config`（不读用户 config.toml）。`app-server` 没有这个选项，会读用户配置，所以探测要把生效值读回来核对：读不回记 `provider_unverified`，与执行用的不一致记 `provider_mismatch`，两种情况都不采用这份目录。目录的 `provider` 字段记下它对应的 provider。
+- 取不到（命令缺失、启动失败、20 秒内没有应答、应答格式不符，或 provider 未能核实、不一致）时，这次探测的结果是 `status: unknown` 加原因。名称不符合字段约束的条目不进目录。
+- 刷新失败而 CLI 版本与 provider 都没有变时，节点沿用上一次成功的目录并标为 `stale`：`fetched_at` 保留那次成功的取得时间，`reason` 是这次失败的原因；版本或 provider 变了就上报 `unknown`。最近一次成功的目录保存在数据目录的 `model-catalog.json`，节点重启后仍可据此沿用。
+- 按 `model_catalog_s` 周期刷新，每次探测后都重新注册：成功的刷新即使内容没变，也要把新的取得时间更新到 controller，否则目录会按有效期过期。
+- controller 把取得时间早于有效期（`catalog_max_age_s`，缺省 172800 秒）的 `ok`、`stale` 目录按 `expired` 处理。目录未核实（`unknown` 或 `expired`）的节点缺省不承接 codex 任务（调度原因 `model_catalog_unverified:<unknown|expired>`）；只有任务受理时冻结的 `unverified_nodes` 策略为 `allow` 时才可以承接，且排在目录已核实含该组合的节点之后。
+- `provider` 字段与 `stale` 状态只在 controller 的 `features` 含 `catalog_provenance` 时发送；否则节点去掉 `provider`，把沿用的旧目录按 `unknown`（不带模型列表）上报。
+- Claude CLI 没有目录接口，固定上报 `unknown` / `no_catalog_interface`。
 - Codex 的 `--model` 与 `model_reasoning_effort` 取自契约的 `harness_params`，适配器不带默认值；契约缺少其中任何一项时该 attempt 以代码失败结束。
+
+## 节点管理操作
+
+controller 可以向节点下发结构化的管理操作（`docs/protocol.md` §13.6）。节点不监听端口：操作随心跳响应的 `operations` 到达，节点对每一项先上报 `received`，执行后上报 `succeeded` 或 `failed`（`POST /nodes/{id}/operations/{op_id}`，节点凭据）。同一 `op_id` 在一个服务进程里只处理一次；上报被 controller 以终态拒绝（操作已超时或已不存在）时不重发。
+
+操作种类是封闭集合，没有任意命令；不认识的种类回报 `failed`（`unsupported operation`），不执行任何东西。除下面两种外，还有远端项目写回的三种（见下一节）：
+
+- `probe`：在服务进程自己的上下文里重新探测官方 CLI 的登录状态与模型目录，不调用模型。返回探测时间 `at`、每个 harness 的 `auth`（`status`、`reason`、可执行文件路径 `command`、`disabled`）、`harness`（各 harness 的版本）、`catalog.codex`（`status`、`reason`、`provider` 与目录条数 `models`）和 `context`（`user`、`pid`、`ssh`、`tty`、`launchd_label`、`windows_session`、`systemd_unit`、`version`、`version_dir`、`platform`）。探测要调用官方 CLI，可能要几十秒，所以放在后台线程里执行，线程里不发网络请求，结果由主循环在随后的心跳里上报。探测之后节点采用这次的认证状态，并在下一轮刷新模型目录、重新注册。用户在节点本机按官方方式登录后，用它确认后台服务读得到凭据：在终端里能登录不等于服务进程读得到。
+- `log_tail`：按 attempt 目录的固定布局读取原始输出片段。可取的流只有 `harness.stdout|stderr`（attempt 目录下的 `stdout.jsonl`、`stderr.log`）、`check.<n>.stdout|stderr`（`checks/<n>/`）与 `step.<n>.stdout|stderr`（`step-<n>/`），n 至多两位数字；符号链接不取，没有按路径读取的接口。`stream` 为 `index`（缺省）时只列出可取的流及各自的字节数，指定的流不存在时同样返回这份列表并带 `missing: true`。指定流时从 `offset` 起读取至多 `max_bytes`（上限 262144）字节，按 UTF-8 转成文本（无法解码的字节换成替换字符）并经节点脱敏后放在 `data` 里；`next_offset`、`total_bytes` 按原始字节计，`eof` 表示已读到末尾，调用方按 `next_offset` 取下一块。片段转义后超出结果上限时节点减半重取。本机已没有该 attempt 的目录时返回 `retained: false`。
+
+## 远端项目写回
+
+节点可以把任务成果写回它本机为某个项目绑定的目录（`docs/protocol.md` §13.10）。这是节点主人在节点本机做的授权，controller 只知道“这台节点为项目 P 绑定了一个叫某某的目录”，从不下发、保存或接收路径；它与契约指定 `target_path` 的自动回写（§11.10，见下文“执行、恢复与回写”）是两条路径。
+
+- 绑定：`project-bind --data-dir D <project_id> <目录>` 把目录解析链接后记在数据目录的 `project-bindings.json`；`agent.json` 配置了 `integration_roots` 时目录必须在其中，否则拒绝（`outside_integration_roots`）。`project-unbind` 解除，`project-bindings` 列出（含本机路径，只在本机输出）。命令只读写这一个文件，不需要停服务；运行中的服务在下一次心跳后重新注册，controller 随之更新。
+- 上报：controller 的注册响应 `features` 含 `remote_apply` 时，注册的 `capabilities.project_bindings` 带 `[{"project_id", "root_name"}]`；得知该能力后立即带上绑定再注册一次。连接旧 controller 时不上报。手工改坏的条目跳过。
+- 执行：心跳下发的 `project_plan`、`project_apply`、`project_recover` 先落盘到 `operations/<op_id>.json`（`claimed`），再上报 `received`；controller 回答的不是 `received`（例如已到期为 `timed_out`）就放弃，不执行。确认领取后排队，后台线程一次执行一项，开始前记为 `running`。执行前再核对绑定：目录仍存在、仍解析到绑定时那个真实目录（被换成链接时 `binding_changed`）、仍在 `integration_roots` 之内。然后在这个目录上调用 `agent_collab/project.py` 的 plan、apply、recover，写入规则与 CLI、桌面端的本机应用是同一份；应用日志与备份在 `projects/` 里。manifest 与成果内容由执行线程用节点令牌另开的连接取得、核对哈希，暂存在 `operations/<op_id>.blobs/`，操作结束后删除。
+- 上报结果：结果先落盘（`finished`），再由主循环在心跳之后上报；上报失败（网络中断）时留在本地，之后补报，被 controller 以终态拒绝的不再重发（`reported`）。上报的内容只有目录名、相对路径与原因：备份目录不上报，错误文本里的绑定目录换成目录名、数据目录换成 `<node-data>`，并去掉令牌。
+- 重启：见到 `running` 的操作不再执行。写回类按本机应用日志确定结果：没有日志说明第一次写入之前就停了，应用记 `failed`（`interrupted_before_write`）；日志已有最终结果就补报；日志停在写入中，就报告操作失败，controller 上的应用保持 `started`，由客户端发起 recover（查看现状、续写、回滚或按现状结束）。已处理过的 `op_id`（含放弃的）记录保留，不会因 controller 重新下发而再执行一次。
+- 限制：`operations/*.json` 不自动清理（上报后去掉结果正文，每项几百字节）。整个目录的写入不是跨文件事务，目录需由节点主人保证写回期间没有别的程序同时改动；与本机应用相同，写入前再核对每个文件，变了的记为冲突。
 
 ## Claude 受管协调适配器
 
@@ -181,7 +213,7 @@ controller 生成 harness=claude 的协调契约，harness_params 明确给出 m
 证据不足或没有检查点时选择 `escalate`；结构化决策本身不是独立验证，目标契约声明了 checks 时，`passed` 是否成立由 controller
 按节点执行的检查证据核对（protocol §11.7）。
 
-prompt 经 stdin 传入，context.json 全文内嵌在 prompt 末尾，要求仅返回结构化决策；`--tools ""` 不授予任何工具（含读文件）。适配器只解析 stdout JSON 的 structured_output，不从 result 自由文本猜测 JSON。固定 schema 由 controller/adapter 共用并在本地复核：follow_up 只是修复请求 `{title, goal, acceptance, instructions, effort}`，不含完整契约；完整的 codex 修复契约由 controller 基于被验收检查点与目标契约派生。结构化输出通过 schema 即由 agent 原子写入 decision.json，再走已有 final checkpoint 上传和 complete outbox；不合 schema 的结果失败且不写该文件。依赖目标状态的校验（租约归属、检查点、预算、副作用）只在 controller 进行：验收结论合法时一定记录，修复请求无法生成合法契约时写 coordinator.follow_up_rejected 而不是丢弃整个决策。
+prompt 经 stdin 传入，context.json 全文内嵌在 prompt 末尾，要求仅返回结构化决策；`--tools ""` 不授予任何工具（含读文件）。适配器只解析 stdout JSON 的 structured_output，不从 result 自由文本猜测 JSON。固定 schema 由 controller/adapter 共用并在本地复核：follow_up 只是修复请求 `{title, goal, acceptance, instructions, effort}`，不含完整契约；完整的 codex 修复契约由 controller 基于被验收检查点与目标契约派生。适配器接受两份 schema：现行的（`effort` 为字符串或 null，null 表示沿用根工作包冻结的 effort）和此前的（`effort` 必填，限 `high/xhigh/max`），按 controller 随 inputs 下发的那一份写提示并复核，所以节点可以先于 controller 升级；下发的 schema 两者都不是时不启动 Claude，attempt 以 `code_failure` 结束。结构化输出通过 schema 即由 agent 原子写入 decision.json，再走已有 final checkpoint 上传和 complete outbox；不合 schema 的结果失败且不写该文件。依赖目标状态的校验（租约归属、检查点、预算、副作用）只在 controller 进行：验收结论合法时一定记录，修复请求无法生成合法契约时写 coordinator.follow_up_rejected 而不是丢弃整个决策。
 
 进程使用现有 OwnedProcess 生命周期管理；每次协调创建新的 session UUID，不 resume 旧 Claude 会话，不读取任何登录文件或 transcript。runtime.model/effort 记录请求的配置值，runtime.observed 为 null，不将请求值冒充模型实际观测。进程输出包含认证失败时分类 auth_expired，controller 据此标记 claude 的 auth_health 为 expired；本进程读不到凭据存储时例外，记为 capability_missing（见上文认证探测）。认证恢复沿用节点报告 ok/管理员处理的既有机制。
 
@@ -242,6 +274,7 @@ contract.workspace.exclude 缺省为 `__pycache__/**`、`*.pyc`、`.pytest_cache
 目标节点不需要持有原 attempt：下载 base/result manifests 与 blobs，上报 integration_pending，持久化写入意图，
 执行回写并保存固定 request_id 回执，然后上报 integrated/conflict。丢失回执响应可跨重启重放，已完成项不再写入。
 协议条目不含 target_node_id，目标身份由经过认证的心跳路由保证；若条目额外带目标字段，非本节点会忽略。
+agent.json 配置了 `integration_roots` 时，目标路径（解析链接后）不在所列目录之内的回写不写入，上报 conflict（`docs/protocol.md` §13.8）。
 rc4 已有回执/写入意图会导入同一进度路径，避免升级后再次回写同一交付。
 目标目录需由调用者独占；这不是跨文件事务，无法对抗同时修改目标的外部进程。
 回写中途 I/O 失败或重启发现已开始但结果未知，保留备份、上报 conflict、不重复执行，要求人工核对。

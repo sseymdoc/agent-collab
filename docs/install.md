@@ -26,9 +26,10 @@ schema 指纹、每个载荷文件的 SHA-256 与大小。manifest 自身不递�
 ```text
 <prefix>/
   versions/<version>/          # 代码和原始 manifest
+  runtime/<runtime_id>/        # 可选的受管 Python；同 ID 不覆盖
   current -> versions/<version>  # POSIX 原子符号链接
   current.txt                 # Windows 原子替换的版本指针；启动脚本每次读取
-  installation.json           # 安装参数、当前和上一版本；没有令牌内容
+  installation.json           # 安装参数、当前和上一版本、desired；没有令牌内容
   bin/agent-collab            # POSIX 命令入口；Windows 为 agent-collab.ps1
   launcher.py, services/      # 启动器与已渲染的服务定义
 <state-dir>/
@@ -154,6 +155,9 @@ Windows 将入口换为 `.\installer\install.ps1`、路径换为本地磁盘，`
 
    validate 失败时不替换、不 reload；diff 出现其他站点变化时停止并人工处理。`caddy_site.py` 只按完全相同的站点行定位唯一块，块内出现引号中的大括号时拒绝自动处理。
    公开 origin 必须与实际反代入口一致，HTTPS 验证不会关闭。自建 CA 的 worker 配对可加 `--ca-file`。
+   Python 3.13 起缺省按 X.509 严格模式校验：自建 CA 的证书要带关键的 `basicConstraints=CA:TRUE`、`keyUsage`（含 keyCertSign）
+   与 `subjectKeyIdentifier`，它签发的服务器证书要带 `authorityKeyIdentifier` 和与入口地址一致的 `subjectAltName`；
+   缺少时配对以 `TLS certificate verification failed: <原因>` 失败（例如 `Missing Authority Key Identifier`），不会降级。
 
 ## 参数契约（两种脚本相同）
 
@@ -168,12 +172,15 @@ Windows 将入口换为 `.\installer\install.ps1`、路径换为本地磁盘，`
 | `--controller-url <origin>` | worker 控制端地址 / controller 公开源；默认 `http://127.0.0.1:18669`；已有安装沿用保存值 |
 | `--pairing-code <一次性码>` | 只为新 worker 配对；重跑保留旧身份 |
 | `--node-id <节点 ID>` | 默认从本机主机名生成小写 ID；建议显式指定 |
-| `--python <可执行文件>` | Python 3.9+ 的单个程序路径，不接受额外 shell 参数 |
+| `--python <可执行文件>` | Python 3.9+ 的单个程序路径，不接受额外 shell 参数；与 `--runtime` 互斥 |
+| `--runtime <目录或归档>` | 调用方提供的本地 Python 运行时目录、.tar.gz、.tgz 或 .zip；验证后放入 prefix/runtime，不下载 |
+| `--instance <NAME>` | 可选实例名，匹配 `[a-z0-9][a-z0-9-]{0,30}`；缺省空串，已有安装不可更改 |
+| `--discover` | 只读发现；可加 `--prefix`、`--instance`，不需要发行包，stdout 只输出一个 JSON 对象 |
 | `--no-service` | 不注册、不停止、不启动系统服务；渲染模板留在 prefix；安装后 doctor 仅检查离线事实 |
 | `--dry-run` | 验证包并打印步骤，不写文件或调用变更 API |
 | `--rollback` | 回到记录的上一版本；先检查当前 schema，不能单纯换二进制 |
 | `--uninstall` | 移除服务、启动器、current 和当前活动版本；保留数据与其他归档版本 |
-| `--purge-code` | 仅与卸载合用，额外删除整个 versions；仍不删除 state-dir |
+| `--purge-code` | 仅与卸载合用，额外删除整个 versions 和 runtime；仍不删除 state-dir |
 | `--admin-token-file <文件>` | drain 所需管理员令牌文件；只读取，不复制；all-in-one 默认读取本地 controller/admin.token |
 | `--drain` | 只排空并等待，完成后保持 drain=true，供独立维护使用 |
 | `--drain-timeout <秒>` | 默认 300；超时中止升级，旧版本不被停止，尝试恢复原 drain 状态 |
@@ -189,6 +196,65 @@ Windows 将入口换为 `.\installer\install.ps1`、路径换为本地磁盘，`
 从离线演练迁入托管环境需使用单独审查的 prefix，并核对状态目录所有权。
 离线模式要求调用者手工停止所有运行进程；安装器用数据目录锁再次确认，否则拒绝切换。
 
+### 实例与受管运行时
+
+正式安装使用缺省空实例名时，服务名、文件名和命令行保持原样。候选安装可用 `--instance candidate`，
+并指定独立的 `--prefix`、`--state-dir` 和节点身份；实例名只区分系统服务，不自动改变数据目录、节点 ID 或监听端口。
+同机 controller 还需使用不同的 loopback 端口。非空实例的服务名称如下：
+
+| 平台 | 名称 |
+| --- | --- |
+| Windows | 计划任务 `agent-collab-<kind>-<instance>`，prefix/services 下同名 `.xml` |
+| macOS | Label `org.agent-collab.<kind>.<instance>`，同名 `.plist`（包括 prefix/services 和 LaunchAgents） |
+| Linux | `agent-collab-<kind>-<instance>.service` |
+
+`<kind>` 为 controller 或 worker。启停、状态、自启动、归属核对和卸载均使用保存的实例名，`service` 命令无需再次传入。
+同一前缀升级替换同名定义，保留 worker 的 node_id 和 node.token；同名服务属于另一前缀时拒绝接管。
+
+`--runtime` 把运行时放入 `<prefix>/runtime/<runtime_id>/`。归档 ID 为原文件 SHA-256 的前 16 位；
+目录 ID 为按相对路径排序的清单（每项为 `[路径, 大小, 内容 SHA-256]`）的紧凑 JSON 的 SHA-256 前 16 位，
+链接的内容按链接目标文本计算，目录内容为空。归档成员的绝对路径、`..`、跨平台路径别名、文件/目录冲突、
+特殊文件及逃出运行时目录的链接会被拒绝。内部符号链接和指向内部普通文件的硬链接可保留。
+
+安装先写 runtime 下的临时目录，验证成功后原子改名；同 ID 已存在时直接复用，不改写其中任何文件。
+依次查找 `python/bin/python3`、`bin/python3`、`python/python.exe`、`python.exe`、`Scripts/python.exe`，
+执行第一个存在的解释器，确认 Python >= 3.9 且能导入 ssl、sqlite3、ctypes、json；失败不切换版本、不变更服务。
+运行时须由可信来源提供，并适配本机 OS/架构；哈希不代表签名或信任认证。安装器探测不生成字节码。
+`--dry-run` 只检查运行时结构，不解包、不执行归档内解释器；版本和模块探测留待实际安装。
+
+安装记录中的 `config.python` 指向受管解释器绝对路径，并保存
+`config.runtime = {"id": "...", "python": "...", "managed": true}`。
+新安装未指定 `--runtime` 时不保存 runtime 键；升级省略解释器参数时沿用原配置，显式 `--python` 则改用外部解释器并移除 runtime 元数据。
+更换运行时使用新目录，成功后只清理当前和 previous 两条记录均未引用的运行时，清理失败仅警告。
+同版本更换解释器也保留上一解释器记录；`--rollback` 恢复 previous 的 python。失败事务不清理运行时，便于重试。
+不可变指安装器不覆盖已发布目录；运行时目录仍由本机账户管理。
+
+### 只读安装发现
+
+```sh
+python3 -B installer/entry.py --discover --prefix /local/candidate --instance candidate
+# 安装后的入口也支持 agent-collab install --discover --prefix /local/candidate
+```
+
+返回码为 0，stdout 是单个 JSON 对象，不创建前缀、状态目录或安装锁，也不更改服务：
+
+| 字段 | 内容 |
+| --- | --- |
+| prefix、installed、version、previous_version | 查询的绝对前缀、是否存在活动安装、当前与上一记录版本 |
+| role、instance、service | 保存的角色、实例名和是否由服务管理器托管 |
+| desired、desired_source | 各组件期望状态；来源为 recorded 或 inferred |
+| services、autostart | 各组件运行状态、自启动状态（enabled/disabled/unknown） |
+| service_owner | 各组件同名服务归属：this_prefix、other_prefix、none 或 unknown |
+| runtime、python、state_dir | 受管运行时元数据（或 null）、解释器和数据目录 |
+| identity | worker 的 `{node_id, controller, paired}`，或 null；paired 只检查 node.token 是否存在，不读取或输出凭据内容及其哈希 |
+| controller_data | 是否可确认存在 controller/controller.db；无读取权限时为 false |
+| context | 始终为组件名到 `{manager, scope, runs_without_login}` 的映射，单组件和 all-in-one 形状相同 |
+
+没有活动安装时 installed=false，其余安装字段为 null 或空对象；prefix、service_owner、context 仍有值。
+此时检查两个组件的同名服务，以发现其他前缀占用。只读发现不执行 Python、不做在线 doctor，也不校验发行载荷是否损坏。
+旧记录缺少 desired 时按当前自启动状态推断（disabled → stopped，其余 → running），发现和 status 不写回；
+下次安装、回退成功时把推断结果写入新记录。
+
 ## 服务管理与 SSH 管理入口
 
 `service` 是固定的管理命令，本机直接运行和经 SSH 调用是同一条命令；不需要管理员令牌，也不调用 controller 的 API。
@@ -197,9 +263,14 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 
 | 命令 | 行为 |
 | --- | --- |
-| `service status` | 只读：当前版本、服务状态、是否自启动（enabled/disabled/unknown）、worker 的 status.json 与心跳年龄。组件都在运行时返回 0 |
-| `service stop` | 有意停用：先关闭自启动（Windows 禁用计划任务，macOS `launchctl disable`，Linux `disable --now`），再停止进程，状态锁释放后才返回 0。本地有 preparing/running attempt 时拒绝，先排空或加 `--allow-active`。停用后重复触发和重新登录都不会拉起进程，直到 `service start` 或下一次升级、回退 |
-| `service start` | 恢复自启动并启动。worker 以 status.json 中来自当前版本目录、时间不早于本次请求的成功心跳判定就绪；controller 以本机无认证的 `/healthz` 有应答判定就绪；否则返回非零。已在运行时重复执行不会产生第二个实例 |
+| `service status` | 只读：当前版本、服务状态、自启动、desired、desired_source、context，以及 worker 的 status.json 与心跳年龄。组件都在运行时返回 0 |
+| `service stop` | 有意停用：先关闭自启动（Windows 禁用计划任务，macOS `launchctl disable`，Linux `disable --now`），再停止进程，状态锁释放后才返回 0，并把所选组件 desired 记为 stopped。本地有 preparing/running attempt 时拒绝，先排空或加 `--allow-active`。停用后重复触发和重新登录都不会拉起进程，直到 `service start` |
+| `service start` | 恢复自启动并启动。worker 以 status.json 中来自当前版本目录、时间不早于本次请求的成功心跳判定就绪；controller 以本机无认证的 `/healthz` 有应答判定就绪；成功才把所选组件 desired 记为 running，否则返回非零。已在运行时重复执行不会产生第二个实例 |
+
+`start`、`stop` 可加 `--component controller|worker`，缺省作用于全部组件；status 也可按组件查询。
+start/stop 的 JSON 输出含完整 desired 映射，任一步失败不更新保存的 desired，实际服务可能已经部分启停，需用 status 核对。
+`installation.json` 顶层 desired 只含本安装组件；新安装全部为 running。
+它表示用户希望服务运行还是停用，不等同于进程当前是否健康；只有成功的 service stop/start 改变它。
 
 ```sh
 "$PREFIX/bin/agent-collab" service status --prefix "$PREFIX"
@@ -211,10 +282,30 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 
 `service stop` 不通知 controller：要立刻停止派单，先用 API 或 `install --drain` 排空。它对活动 attempt 的检查只是停止前的一次快照，
 与 worker 之间没有同步：未排空的节点在检查之后、停止之前领到的 attempt 会被打断，由 controller 按节点失效处理（满足恢复条件时从最新的 durable 检查点继续；还没有检查点时从 inputs 基线重新开始）。
-要避免这种情况，先排空并等活动 attempt 归零再停。受管服务安装的升级和回退会重新启用并启动服务，
-被 `service stop` 停用的节点也一样：要让它继续停用，升级或回退之后再执行一次 `service stop`。
+要避免这种情况，先排空并等活动 attempt 归零再停。升级、同版本重装、回退和失败后的自动回滚都保留当前 desired，
+不会用 previous 记录里的历史意图覆盖它。切换版本时的临时停止也不改变 desired。
+stopped 组件仍更新服务定义，但 Windows 任务注册为禁用且不 Run，macOS 保持 disable 且不 bootstrap/kickstart，
+Linux 不 enable/start；stdout 写明 `kept stopped: <组件名>`。这些组件不调用 drain、在线 doctor 或等待心跳，只核对 manifest/schema；
+活动 attempt 检查和状态锁仍然有效。running 组件继续按原有健康检查流程验收。
 进程异常退出由服务管理器恢复（Windows 每分钟的时间触发器、launchd KeepAlive、systemd `Restart=on-failure`），
 被 `service stop` 停用的节点不受这些机制影响。
+
+### 界面与系统会话的生命周期
+
+关闭安装界面或退出桌面应用不会发出 service stop；托管进程独立于界面。锁屏通常不结束用户会话，
+服务继续运行；睡眠期间进程和网络通信暂停，心跳会过期，唤醒后恢复运行不代表原任务租约仍有效。
+机器关机时所有服务停止，重启后的行为取决于服务作用域和 desired：
+
+| 平台/组件 | context.manager / scope | 注销、重启与无人登录 |
+| --- | --- | --- |
+| Windows 计划任务（InteractiveToken） | task-scheduler / user-session | 注销后停止；下一次交互登录时，desired=running 的任务启动；不保证无人登录运行 |
+| macOS LaunchAgent | launchd / user-session | 注销后停止；下一次 GUI 登录时，desired=running 的服务启动；不保证无人登录运行 |
+| Linux worker | systemd-user / user-session | 未启用 linger 时随用户会话结束，下一次登录后可启动；启用 linger 时用户管理器可在注销后及开机时运行 |
+| Linux 受管 controller | systemd-system / system | 不依赖登录；desired=running 时随系统启动，注销不停止 |
+
+context.runs_without_login 在 Windows/macOS 为 false，Linux controller 为 true；Linux worker 通过只读 loginctl 查询 linger，
+查不到时为 false。安装器不启用 linger。WSL 的系统进程仍受发行版与 Windows 宿主生命周期约束。
+所有平台的 desired=stopped 组件在注销、登录或重启后仍保持停用。
 
 ### SSH 管理入口（可选）
 
@@ -284,8 +375,8 @@ PREFIX="$HOME/.local/share/agent-collab"
 
 Windows 对应入口为 `& "$Prefix\bin\agent-collab.ps1" doctor ...` / `install ...`，参数相同。
 controller-only 升级不需要远端管理员令牌；离线安装的上述 install/drain/rollback 命令继续加 `--no-service`。
-远端 worker 的 drain API 只接受管理员授权；**节点令牌没有 drain 权限**。本版没有委托式维护凭据接口，
-管理员令牌需由有权限的运维通过已有安全渠道在执行机器准备；委托式凭据要先扩展协议才能接入。安装器不会自行复制它。
+远端 worker 的 drain API 接受管理令牌，或带 `devices` 权限的客户端凭据（`docs/protocol.md` §12.1）；**节点令牌没有 drain 权限**。
+`--admin-token-file` 指向的文件里放其中任意一种持有者令牌，由有权限的运维通过已有安全渠道在执行机器准备；安装器不会自行复制它。
 
 排空使用当前 node version + 新 request_id，等待 `active_attempts=0`，缺失字段不视为空闲。
 drain 不强杀活动 attempt；超时或网络错误在停服务之前中止。升级完成会恢复原 drain 值。
@@ -303,8 +394,8 @@ drain 不强杀活动 attempt；超时或网络错误在停服务之前中止。
 升级/回退首先检查本地 attempts/*/meta.json；有 preparing/running 时提示先排空并拒绝，除非显式 --allow-active。
 停服取得锁后再次检查，防止检查到停服之间新领任务。升级保留 agent.json 自定义键，不重配已有节点身份。
 升级顺序：验证所有包文件和本地活动状态 → 写入新 versions 目录 → 排空 worker → 停服务/确认锁 → controller backup →
-切换指针和固定版本服务定义 → 启动 → 核对 worker status.json → doctor → 恢复 drain → 写成功记录。失败会停止新版本，
-重新验证旧 manifest 与数据库兼容性后切回旧版并启动。失败的新代码和所有备份保留，以便审查。
+切换指针和固定版本服务定义 → 按 desired 启动或保持停用 → 为 running worker 核对 status.json → doctor（stopped 仅离线）→ 恢复 drain → 写成功记录。
+失败会停止新版本，重新验证旧 manifest 与数据库兼容性后切回旧版，仍按原 desired 决定启停。失败的新代码和所有备份保留，以便审查。
 worker 的 status.json 必须来自新版本目录、匹配 version/git_commit，包含有效 PID 与此次启动后的成功心跳时间；
 缺失、旧进程或旧心跳不能通过。60 秒内（或显式更短 health-timeout）不能确认则回退并返回非零。
 --no-service 不启动进程，不要求 status.json，运行健康仍标 unknown。目标版本目录中没有 `agent_collab/release.py`
@@ -351,7 +442,7 @@ worker 部分含 `effective`：不含密钥的最终生效配置，用来在一�
 sh installer/install.sh --prefix "$PREFIX" --uninstall --purge-code
 ```
 
-离线安装继续加 `--no-service`。默认删除活动版本，归档代码保留；`--purge-code` 才删除全部 versions。
+离线安装继续加 `--no-service`。默认删除活动版本，归档代码与 runtime 保留；`--purge-code` 才删除全部 versions 和 runtime。
 任何卸载模式都不删除 state-dir、备份、节点身份、任务历史、业务工作区或官方工具登录配置，
 不删除 Linux 专用账户，不改反向代理。保留最小 installation.json 以支持幂等卸载和重新安装。
 

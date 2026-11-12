@@ -146,6 +146,16 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(probe_auth_detail('codex', dict(argv=None, env=self.env), run, 'Darwin'), ('unknown', 'command_missing'))
 
+    def test_windows_probes_do_not_open_console_windows(self):
+        # Windows 服务由无控制台的 pythonw 运行，探测子进程缺 CREATE_NO_WINDOW 会周期性闪出控制台窗口。
+        run = Mock(return_value=subprocess.CompletedProcess([], 0, '{"loggedIn":true}', ''))
+        probe_auth_detail('claude', dict(argv=['/fixture'], env=self.env), run, 'Windows')
+        detect(commands={name: dict(argv=['/fixture'], env=self.env) for name in ('codex', 'claude')}, runner=run)
+        expected = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else None
+        self.assertTrue(run.call_args_list)
+        for call in run.call_args_list:
+            self.assertEqual(call[1].get('creationflags'), expected, call[0][0])
+
     def test_release_identity_reads_only_requested_code_root_and_falls_back(self):
         self.assertEqual(release_info(self.temp), {'version': VERSION, 'git_commit': None})
         manifest = self.temp / 'release-manifest.json'

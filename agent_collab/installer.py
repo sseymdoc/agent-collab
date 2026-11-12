@@ -10,6 +10,7 @@ import ntpath
 from pathlib import Path
 import platform
 import plistlib
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -232,25 +233,31 @@ def check_schema(state, manifest):
     return version
 
 
+# 同 adapters.commands.NO_WINDOW；这里自己定义，安装器模块不在顶层导入包内其他模块。
+NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+
+
 def run(command, cwd=None, check=True):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
     if cwd is not None:
         env['PYTHONPATH'] = str(cwd)
     # errors='replace'：本地化 Windows 的 schtasks/icacls 按控制台代码页（如 936）输出，不是 UTF-8；
     # 严格解码会让读取线程抛异常、stdout 变成 None（经 SSH 或 cmd 调用时实测）。需要解析的输出都是 ASCII。
+    # 本机部署向导与本机服务面板经无控制台的助手调用这里（schtasks、icacls、whoami、python）：Windows 上不带
+    # CREATE_NO_WINDOW 时每个子进程会各闪一个控制台窗口。
     result = subprocess.run([str(x) for x in command], cwd=str(cwd) if cwd else None, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace')
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace', **NO_WINDOW)
     if check and result.returncode:
         # Commands can contain one-time codes; never echo argv or credential-bearing output.
         raise RuntimeError('{} failed (exit {}); inspect local service logs'.format(Path(command[0]).name, result.returncode))
     return result
 
 
-def package_command(config, directory, module, *args, controller_user=False):
+def package_command(config, directory, module, *args, controller_user=False, check=True):
     command = [config['python'], '-B', '-m', 'agent_collab.' + module] + list(args)
     if controller_user and config['system'] == 'Linux' and config['service']:
         command = controller_identity() + command
-    return run(command, cwd=directory)
+    return run(command, cwd=directory, check=check)
 
 
 def admin_token(config):
@@ -318,6 +325,31 @@ def drain_and_wait(client, node_id, timeout, clock=time.monotonic, sleep=time.sl
 
 def components(config):
     return ['controller', 'worker'] if config['role'] == 'all-in-one' else [config['role']]
+
+
+def service_name(config, kind):
+    instance = config.get('instance', '')
+    if config['system'] == 'Darwin':
+        return 'org.agent-collab.' + kind + ('.' + instance if instance else '')
+    return 'agent-collab-' + kind + ('-' + instance if instance else '')
+
+
+def service_file(config, kind):
+    if config['system'] == 'Darwin':
+        # 缺省实例在 prefix/services 下的旧文件名保持不变。
+        return (service_name(config, kind) if config.get('instance') else 'agent-collab-' + kind) + '.plist'
+    return service_name(config, kind) + ('.service' if config['system'] == 'Linux' else '.xml')
+
+
+def desired_state(record, config, autostart=None):
+    if record and 'desired' in record:
+        desired = record['desired']
+        if (not isinstance(desired, dict) or set(desired) != set(components(config))
+                or any(value not in ('running', 'stopped') for value in desired.values())):
+            raise ValueError('invalid desired service state')
+        return dict(desired), 'recorded'
+    return {kind: 'stopped' if (autostart or {}).get(kind) == 'disabled' else 'running'
+            for kind in components(config)}, 'inferred'
 
 
 def controller_identity():
@@ -397,15 +429,15 @@ def configure_worker_workspace(config, runner=None):
         write_json(identity, data)
 
 
-def render_services(config, directory, user_sid=None):
+def render_services(config, directory, user_sid=None, desired=None):
     """Pure rendering: no service registration and no user/global filesystem writes."""
     prefix, state = Path(config['prefix']), Path(config['state_dir'])
     rendered = {}
     for kind in components(config):
-        name = 'agent-collab-' + kind
+        name = service_file(config, kind)
         argv = [config['python'], '-B', '-m'] + component_argv(config, kind)
         if config['system'] == 'Linux':
-            template = (directory / 'installer/services' / (name + '.service')).read_text(encoding='utf-8')
+            template = (directory / 'installer/services' / ('agent-collab-' + kind + '.service')).read_text(encoding='utf-8')
             # systemd 的 WorkingDirectory= 不做引号解析（带引号会被判为非绝对路径而拒绝加载），
             # 取整行余下部分为路径；只需转义 % 说明符。ECS 实装时发现。
             if '\n' in str(directory):
@@ -415,11 +447,11 @@ def render_services(config, directory, user_sid=None):
                       'CONTROLLER_STATE': systemd_quote(state / 'controller')}
             for key, value in values.items():
                 template = template.replace('@' + key + '@', value)
-            rendered[name + '.service'] = template.encode()
+            rendered[name] = template.encode()
         elif config['system'] == 'Darwin':
             # No UserName: LaunchAgent inherits the logged-in user's identity.
-            rendered[name + '.plist'] = plistlib.dumps(dict(
-                Label='org.agent-collab.' + kind, ProgramArguments=argv, WorkingDirectory=str(directory),
+            rendered[name] = plistlib.dumps(dict(
+                Label=service_name(config, kind), ProgramArguments=argv, WorkingDirectory=str(directory),
                 RunAtLoad=True, KeepAlive={'SuccessfulExit': False}, ThrottleInterval=5,
                 StandardOutPath=str(state / 'logs' / (kind + '.out.log')),
                 StandardErrorPath=str(state / 'logs' / (kind + '.err.log')),
@@ -447,7 +479,8 @@ def render_services(config, directory, user_sid=None):
                 ET.SubElement(principal, key).text = value
             settings = ET.SubElement(task, 'Settings')
             for key, value in [('MultipleInstancesPolicy', 'IgnoreNew'), ('DisallowStartIfOnBatteries', 'false'),
-                               ('StopIfGoingOnBatteries', 'false'), ('ExecutionTimeLimit', 'PT0S'), ('Enabled', 'true')]:
+                               ('StopIfGoingOnBatteries', 'false'), ('ExecutionTimeLimit', 'PT0S'),
+                               ('Enabled', 'false' if (desired or {}).get(kind) == 'stopped' else 'true')]:
                 ET.SubElement(settings, key).text = value
             restart = ET.SubElement(settings, 'RestartOnFailure')
             ET.SubElement(restart, 'Interval').text = 'PT1M'
@@ -458,7 +491,7 @@ def render_services(config, directory, user_sid=None):
             ET.SubElement(action, 'Arguments').text = subprocess.list2cmdline(
                 ['-B', str(prefix / 'launcher.py'), '--service-log', str(state / 'logs' / (kind + '.log'))] + cli)
             ET.SubElement(action, 'WorkingDirectory').text = str(prefix)
-            rendered[name + '.xml'] = ET.tostring(task, encoding='utf-16', xml_declaration=True)
+            rendered[name] = ET.tostring(task, encoding='utf-16', xml_declaration=True)
     return rendered
 
 
@@ -468,6 +501,7 @@ class Services:
         self.enabled = config['service']
         self.system = config['system']
         self.prefix = Path(config['prefix'])
+        self.desired = {}
 
     def privileged(self, command, **kwargs):
         return run(([] if os.getuid() == 0 else ['sudo', '--']) + command, **kwargs)
@@ -492,37 +526,51 @@ class Services:
         for kind in components(self.config):
             if self.system == 'Linux':
                 base = Path('/etc/systemd/system') if kind == 'controller' else Path.home() / '.config/systemd/user'
-                yield kind, base / ('agent-collab-' + kind + '.service')
+                yield kind, base / service_file(self.config, kind)
             elif self.system == 'Darwin':
-                yield kind, Path.home() / 'Library/LaunchAgents' / ('org.agent-collab.' + kind + '.plist')
+                yield kind, Path.home() / 'Library/LaunchAgents' / (service_name(self.config, kind) + '.plist')
             else:
-                yield kind, self.prefix / 'services' / ('agent-collab-' + kind + '.xml')
+                yield kind, self.prefix / 'services' / service_file(self.config, kind)
 
     def check_ownership(self):
         if not self.enabled:
             return
+        for kind, owner in self.ownership(strict=True).items():
+            if owner not in ('none', 'this_prefix'):
+                raise ValueError('service name belongs to another installation or cannot be verified: ' + service_name(self.config, kind))
+
+    def ownership(self, strict=False):
+        owners = {}
         for kind, path in self.destinations():
-            if self.system == 'Windows':
-                result = run(['schtasks', '/Query', '/TN', 'agent-collab-' + kind, '/XML'], check=False)
-                if result.returncode == 0:
+            try:
+                if self.system == 'Windows':
+                    result = run(['schtasks', '/Query', '/TN', service_name(self.config, kind), '/XML'], check=False)
+                    if result.returncode:
+                        owners[kind] = 'none'
+                        continue
                     description = ET.fromstring(result.stdout).find('.//{*}Description')
-                    if description is None or description.text != 'agent-collab prefix: ' + str(self.prefix):
-                        raise ValueError('task name belongs to another installation')
-            elif path.exists():
-                if self.system == 'Darwin':
-                    data = plistlib.loads(path.read_bytes())
-                    owned = Path(data.get('WorkingDirectory', '/')).parent == self.prefix / 'versions'
+                    owned = description is not None and description.text == 'agent-collab prefix: ' + str(self.prefix)
+                elif self.system == 'Darwin':
+                    owned = Path(plistlib.loads(path.read_bytes()).get('WorkingDirectory', '/')).parent == self.prefix / 'versions'
                 else:
                     owned = path.read_text(encoding='utf-8').splitlines()[0] == '# agent-collab prefix: ' + str(self.prefix)
-                if not owned:
-                    raise ValueError('service name belongs to another installation: ' + str(path))
+                owners[kind] = 'this_prefix' if owned else 'other_prefix'
+            except FileNotFoundError:
+                if strict and self.system == 'Windows':
+                    raise
+                owners[kind] = 'unknown' if self.system == 'Windows' else 'none'
+            except (OSError, ValueError, TypeError, IndexError, ET.ParseError):
+                if strict:
+                    raise
+                owners[kind] = 'unknown'
+        return owners
 
     def render(self):
         user_sid = None
         if self.system == 'Windows':
             import csv
             user_sid = next(csv.reader(run(['whoami', '/user', '/fo', 'csv', '/nh']).stdout.splitlines()))[1]
-        result = render_services(self.config, self.directory, user_sid)
+        result = render_services(self.config, self.directory, user_sid, self.desired)
         folder = self.prefix / 'services'
         folder.mkdir(exist_ok=True)
         for name, content in result.items():
@@ -534,22 +582,24 @@ class Services:
             return
         self.check_ownership()
         for kind, target in self.destinations():
-            source = self.prefix / 'services' / ('agent-collab-' + kind + target.suffix)
+            source = self.prefix / 'services' / service_file(self.config, kind)
             if self.system == 'Linux':
                 if kind == 'controller':
                     self.privileged(['install', '-m', '644', str(source), str(target)])
                     self.privileged(['systemctl', 'daemon-reload'])
-                    self.privileged(['systemctl', 'enable', target.name])
+                    self.privileged(['systemctl', 'disable' if self.desired.get(kind) == 'stopped' else 'enable', target.name])
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     atomic_write(target, source.read_bytes(), 0o644)
                     run(['systemctl', '--user', 'daemon-reload'])
-                    run(['systemctl', '--user', 'enable', target.name])
+                    run(['systemctl', '--user', 'disable' if self.desired.get(kind) == 'stopped' else 'enable', target.name])
             elif self.system == 'Darwin':
                 target.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write(target, source.read_bytes(), 0o644)
+                if self.desired.get(kind) == 'stopped':
+                    run(['launchctl', 'disable', 'gui/' + str(os.getuid()) + '/' + service_name(self.config, kind)])
             else:
-                run(['schtasks', '/Create', '/TN', 'agent-collab-' + kind, '/XML', str(source), '/F'])
+                run(['schtasks', '/Create', '/TN', service_name(self.config, kind), '/XML', str(source), '/F'])
 
     def stop(self, disable_autostart=False):
         if not self.enabled:
@@ -562,20 +612,23 @@ class Services:
                 else:
                     run(['systemctl', '--user'] + action + [target.name])
             elif self.system == 'Darwin':
-                label = 'gui/' + str(os.getuid()) + '/org.agent-collab.' + kind
+                label = 'gui/' + str(os.getuid()) + '/' + service_name(self.config, kind)
                 if disable_autostart:
                     run(['launchctl', 'disable', label])
                 run(['launchctl', 'bootout', label], check=False)
             else:
                 # 结束前总是先禁用：否则每分钟的触发器可能在结束进程与安装器取得状态锁之间把它拉起。
-                # start() 与重新注册都会恢复启用。
-                run(['schtasks', '/Change', '/TN', 'agent-collab-' + kind, '/DISABLE'], check=disable_autostart)
-                run(['schtasks', '/End', '/TN', 'agent-collab-' + kind], check=False)
+                # start() 与期望运行的重新注册会恢复启用。
+                run(['schtasks', '/Change', '/TN', service_name(self.config, kind), '/DISABLE'], check=disable_autostart)
+                run(['schtasks', '/End', '/TN', service_name(self.config, kind)], check=False)
 
     def start(self):
-        if not self.enabled:
-            return
         for kind, target in self.destinations():
+            if self.desired.get(kind) == 'stopped':
+                print('kept stopped: ' + kind)
+                continue
+            if not self.enabled:
+                continue
             if self.system == 'Linux':
                 if kind == 'controller':
                     self.privileged(['systemctl', 'enable', '--now', target.name])
@@ -583,15 +636,15 @@ class Services:
                     run(['systemctl', '--user', 'enable', '--now', target.name])
             elif self.system == 'Darwin':
                 domain = 'gui/' + str(os.getuid())
-                label = domain + '/org.agent-collab.' + kind
+                label = domain + '/' + service_name(self.config, kind)
                 run(['launchctl', 'enable', label])
                 if run(['launchctl', 'print', label], check=False).returncode == 0:
                     run(['launchctl', 'kickstart', label])
                 else:
                     run(['launchctl', 'bootstrap', domain, str(target)])
             else:
-                run(['schtasks', '/Change', '/TN', 'agent-collab-' + kind, '/ENABLE'])
-                run(['schtasks', '/Run', '/TN', 'agent-collab-' + kind])
+                run(['schtasks', '/Change', '/TN', service_name(self.config, kind), '/ENABLE'])
+                run(['schtasks', '/Run', '/TN', service_name(self.config, kind)])
 
     def remove(self):
         if not self.enabled:
@@ -610,8 +663,8 @@ class Services:
                     run(['systemctl', '--user', 'daemon-reload'])
             elif self.system == 'Darwin':
                 target.unlink(missing_ok=True)
-            else:
-                run(['schtasks', '/Delete', '/TN', 'agent-collab-' + kind, '/F'])
+            elif self.ownership().get(kind) != 'none':  # 被中断的卸载可能已经删掉了它
+                run(['schtasks', '/Delete', '/TN', service_name(self.config, kind), '/F'])
 
     def status(self):
         result = {}
@@ -622,10 +675,10 @@ class Services:
             if self.system == 'Linux':
                 command = ['systemctl'] + (['--user'] if kind == 'worker' else []) + ['is-active', target.name]
             elif self.system == 'Darwin':
-                command = ['launchctl', 'print', 'gui/' + str(os.getuid()) + '/org.agent-collab.' + kind]
+                command = ['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + service_name(self.config, kind)]
             else:
                 command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                           "(Get-ScheduledTask -TaskName 'agent-collab-" + kind + "' -ErrorAction Stop).State"]
+                           "(Get-ScheduledTask -TaskName '" + service_name(self.config, kind) + "' -ErrorAction Stop).State"]
             try:
                 response = run(command, check=False)
                 text = response.stdout.strip()
@@ -653,7 +706,7 @@ class Services:
                 command = ['launchctl', 'print-disabled', 'gui/' + str(os.getuid())]
             else:
                 command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                           "(Get-ScheduledTask -TaskName 'agent-collab-" + kind + "' -ErrorAction Stop).State"]
+                           "(Get-ScheduledTask -TaskName '" + service_name(self.config, kind) + "' -ErrorAction Stop).State"]
             try:
                 response = run(command, check=False)
                 text = response.stdout.strip()
@@ -666,7 +719,7 @@ class Services:
                 elif response.returncode == 0:
                     if self.system == 'Darwin' and 'disabled services = {' in text:
                         # 旧版 macOS 输出 true/false，新版（实测 27.2）输出 disabled/enabled。
-                        match = re.search(r'"org\.agent-collab\.' + re.escape(kind) + r'"\s*=>\s*(true|false|disabled|enabled)', text)
+                        match = re.search(r'"' + re.escape(service_name(self.config, kind)) + r'"\s*=>\s*(true|false|disabled|enabled)', text)
                         # No override means enabled in this launchd domain.
                         result[kind] = 'disabled' if match and match[1] in ('true', 'disabled') else 'enabled'
                     elif self.system == 'Windows':
@@ -677,6 +730,58 @@ class Services:
             except OSError:
                 pass
         return result
+
+
+def service_context(config):
+    result = {}
+    for kind in components(config):
+        system = config['system']
+        manager = ('task-scheduler' if system == 'Windows' else 'launchd' if system == 'Darwin'
+                   else 'systemd-system' if kind == 'controller' and config['service'] else 'systemd-user')
+        unattended = manager == 'systemd-system'
+        if manager == 'systemd-user':
+            try:
+                response = run(['loginctl', 'show-user', getpass.getuser(), '--property=Linger', '--value'], check=False)
+                unattended = response.returncode == 0 and response.stdout.strip() == 'yes'
+            except OSError:
+                pass
+        result[kind] = dict(manager=manager, scope='system' if manager == 'systemd-system' else 'user-session',
+                            runs_without_login=unattended)
+    return result
+
+
+def discover(config, old):
+    prefix = Path(config['prefix'])
+    installed = bool(old and old.get('version'))
+    # 未安装时同时查看两个组件的名字，候选前缀也能发现与正式服务的冲突。
+    probe_config = config if installed else dict(config, role='all-in-one', service=True)
+    manager = Services(probe_config, prefix / 'versions' / ((old or {}).get('version') or 'pending'))
+    autostart = manager.autostart() if installed else {}
+    desired, source = desired_state(old, config, autostart) if installed else ({}, None)
+    identity = None
+    state = Path(config['state_dir'])
+    if installed and 'worker' in components(config):
+        try:
+            agent = read_json(state / 'worker/agent.json')
+            identity = dict(node_id=agent.get('node_id'), controller=agent.get('controller'),
+                            paired=(state / 'worker/node.token').is_file())
+        except (OSError, ValueError, AttributeError):
+            pass
+    controller_data = None
+    if installed:
+        try:
+            controller_data = (state / 'controller/controller.db').is_file()
+        except OSError:
+            controller_data = False
+    return dict(prefix=str(prefix), installed=installed, version=old['version'] if installed else None,
+                previous_version=(old.get('previous') or {}).get('version') if installed else None,
+                role=config['role'] if installed else None, instance=config.get('instance', '') if installed else None,
+                service=config['service'] if installed else None, desired=desired, desired_source=source,
+                services=manager.status() if installed else {}, autostart=autostart, service_owner=manager.ownership(),
+                runtime=config.get('runtime') if installed else None, python=config['python'] if installed else None,
+                state_dir=str(state) if installed else None, identity=identity,
+                controller_data=controller_data,
+                context=service_context(probe_config))
 
 
 def write_launchers(config):
@@ -728,7 +833,7 @@ def compatible_schema(config, manifest, directory):
     return check_schema(Path(config['state_dir']), manifest)
 
 
-def doctor(config, offline=False):
+def doctor(config, offline=False, desired=None):
     prefix = Path(config['prefix'])
     report = dict(ok=False, current='unknown', manifest='unknown', schema='unknown',
                   services={kind: 'unknown' for kind in components(config)}, components={})
@@ -748,7 +853,7 @@ def doctor(config, offline=False):
         report['services'] = services.status() if not offline else report['services']
         healthy = True
         for kind in components(config):
-            if offline:
+            if offline or (desired or {}).get(kind) == 'stopped':
                 report['components'][kind] = 'unknown'
                 continue
             try:
@@ -765,16 +870,19 @@ def doctor(config, offline=False):
             except Exception as exc:
                 report['components'][kind] = {'status': 'unknown', 'error_type': type(exc).__name__}
                 healthy = False
-        report['ok'] = healthy and (offline or not config['service'] or all(s == 'active' for s in report['services'].values()))
+        report['ok'] = healthy and (offline or not config['service'] or all(
+            state == 'active' or (desired or {}).get(kind) == 'stopped'
+            for kind, state in report['services'].items()))
     except Exception as exc:
         report['error_type'] = type(exc).__name__
     return report
 
 
-def wait_doctor(config, timeout):
+def wait_doctor(config, timeout, desired=None):
     deadline = time.monotonic() + timeout
     while True:
-        report = doctor(config, offline=not config['service'])
+        report = doctor(config, offline=not config['service'] or all(
+            (desired or {}).get(kind) == 'stopped' for kind in components(config)), desired=desired)
         if report['ok'] or time.monotonic() >= deadline:
             print(json.dumps(report, ensure_ascii=False))
             if not report['ok']:
@@ -924,7 +1032,14 @@ def pair_worker(config, directory, pairing_code):
     for key in ('ca_file', 'physical_host_id', 'failure_domain'):
         if config.get(key):
             args += ['--' + key.replace('_', '-'), config[key]]
-    package_command(config, directory, 'node_agent', *args)
+    result = package_command(config, directory, 'node_agent', *args, check=False)
+    if result.returncode:
+        # 参数里有一次性配对码，不能回显命令行；节点侧给出的错误体已经过筛选，只取其中的 message。
+        try:
+            reason = json.loads(result.stdout)['error']['message']
+        except (ValueError, KeyError, TypeError):
+            reason = 'exit {}'.format(result.returncode)
+        raise RuntimeError('worker pairing failed: {}'.format(reason))
 
 
 def install_version(prefix, manifest, files):
@@ -954,6 +1069,201 @@ def install_version(prefix, manifest, files):
     return directory
 
 
+RUNTIME_PYTHONS = ('python/bin/python3', 'bin/python3', 'python/python.exe', 'python.exe', 'Scripts/python.exe')
+
+
+def read_runtime(source):
+    """先检查完整目录树与链接关系，拒绝路径穿越后才允许写入 staging。"""
+    entries = {}
+
+    def add(name, kind, mode, content=b''):
+        while name.startswith('./'):
+            name = name[2:]
+        name = name.rstrip('/') if kind == 'dir' else name
+        if name in ('', '.') and kind == 'dir':
+            return
+        safe_name(name)
+        if name in entries:
+            raise ValueError('duplicate runtime member: ' + name)
+        entries[name] = (kind, mode & 0o777, content)
+
+    if source.is_dir():
+        for path in sorted(source.rglob('*')):
+            mode = path.lstat().st_mode
+            name = path.relative_to(source).as_posix()
+            if stat.S_ISLNK(mode):
+                add(name, 'link', mode, os.readlink(str(path)).encode())
+            elif stat.S_ISDIR(mode):
+                add(name, 'dir', mode)
+            elif stat.S_ISREG(mode):
+                add(name, 'file', mode, path.read_bytes())
+            else:
+                raise ValueError('unsupported runtime file type')
+        inventory = [[name, len(content), hashlib.sha256(content).hexdigest()]
+                     for name, (kind, mode, content) in sorted(entries.items())]
+        digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
+    else:
+        # 对同一份字节求 ID 并解包，避免归档在两次读取之间被替换。
+        archive_bytes = source.read_bytes()
+        digest = hashlib.sha256(archive_bytes).hexdigest()
+        import io
+        if source.name.endswith('.zip'):
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                for info in archive.infolist():
+                    mode = info.external_attr >> 16
+                    if info.is_dir():
+                        add(info.filename, 'dir', mode or 0o755)
+                    elif stat.S_ISLNK(mode):
+                        add(info.filename, 'link', mode, archive.read(info))
+                    elif stat.S_IFMT(mode) in (0, stat.S_IFREG):
+                        add(info.filename, 'file', mode or 0o644, archive.read(info))
+                    else:
+                        raise ValueError('unsupported runtime archive member')
+        elif source.name.endswith(('.tar.gz', '.tgz')):
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode='r:gz') as archive:
+                for info in archive:
+                    if info.isdir():
+                        add(info.name, 'dir', info.mode)
+                    elif info.isfile():
+                        add(info.name, 'file', info.mode, archive.extractfile(info).read())
+                    elif info.issym() or info.islnk():
+                        add(info.name, 'link' if info.issym() else 'hardlink', info.mode, info.linkname.encode())
+                    else:
+                        raise ValueError('unsupported runtime archive member')
+        else:
+            raise ValueError('--runtime requires a directory, .tar.gz, .tgz or .zip')
+    aliases = {}
+    for name in entries:
+        parts = name.split('/')
+        for index in range(1, len(parts) + 1):
+            parent = '/'.join(parts[:index])
+            folded = unicodedata.normalize('NFC', parent).casefold()
+            if aliases.setdefault(folded, parent) != parent:
+                raise ValueError('case-colliding runtime paths')
+            if index < len(parts) and parent in entries and entries[parent][0] != 'dir':
+                raise ValueError('runtime file/directory collision')
+
+    def resolve(name, seen=()):
+        parts = name.split('/')
+        for index in range(1, len(parts) + 1):
+            parent = '/'.join(parts[:index])
+            entry = entries.get(parent)
+            if entry and entry[0] in ('link', 'hardlink'):
+                if parent in seen:
+                    raise ValueError('cyclic runtime link')
+                target = entry[2].decode('utf-8')
+                if not target or '\\' in target or ':' in target or '\x00' in target or target.startswith('/'):
+                    raise ValueError('unsafe runtime link')
+                base = posixpath.dirname(parent) if entry[0] == 'link' else ''
+                target = posixpath.normpath(posixpath.join(base, target, *parts[index:]))
+                if target == '..' or target.startswith('../'):
+                    raise ValueError('runtime link escapes runtime directory')
+                return resolve(target, seen + (parent,))
+        return name
+
+    for name, (kind, mode, content) in entries.items():
+        if kind in ('link', 'hardlink'):
+            target = resolve(name)
+            if kind == 'hardlink' and (target not in entries or entries[target][0] != 'file'):
+                raise ValueError('runtime hardlink must target a regular file')
+    python = next((name for name in RUNTIME_PYTHONS if name in entries), None)
+    if python is None or entries.get(resolve(python), ('missing',))[0] != 'file':
+        raise ValueError('runtime Python interpreter is missing')
+    return digest[:16], entries, python
+
+
+def probe_python(python, managed=False):
+    script = 'import sys; print("%d.%d" % sys.version_info[:2]); sys.exit(sys.version_info < (3,9))'
+    if managed:
+        script = 'import ssl, sqlite3, ctypes, json; ' + script
+    return run([python, '-B', '-c', script])
+
+
+def install_runtime(config, payload):
+    runtime_id, entries, python = payload
+    root = Path(config['prefix']) / 'runtime'
+    target = root / runtime_id
+    if target.is_symlink():
+        raise ValueError('runtime directory must not be a symlink')
+    if target.exists():
+        executable = target / python
+        if target.resolve() not in executable.resolve().parents:
+            raise ValueError('runtime interpreter escapes runtime directory')
+        probe_python(str(executable), managed=True)
+        return
+    root.mkdir(exist_ok=True)
+    stage = root / ('.staging-' + uuid.uuid4().hex)
+    stage.mkdir(mode=0o755)
+    try:
+        for name, (kind, mode, content) in entries.items():
+            path = stage / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if kind == 'dir':
+                path.mkdir(exist_ok=True)
+            elif kind == 'file':
+                atomic_write(path, content, mode)
+        # 所有普通文件先落盘，写文件时绝不跟随归档内链接。
+        for name, (kind, mode, content) in entries.items():
+            if kind == 'link':
+                (stage / name).symlink_to(content.decode('utf-8'))
+        pending = {name: content for name, (kind, mode, content) in entries.items() if kind == 'hardlink'}
+        while pending:
+            completed = []
+            for name, content in pending.items():
+                source = (stage / content.decode('utf-8')).resolve()
+                if stage.resolve() not in source.parents:
+                    raise ValueError('runtime hardlink escapes runtime directory')
+                if source.is_file():
+                    os.link(str(source), str(stage / name))
+                    completed.append(name)
+            if not completed:
+                raise ValueError('unresolved runtime hardlink')
+            for name in completed:
+                del pending[name]
+        for name, (kind, mode, content) in entries.items():
+            if kind == 'link':
+                resolved = (stage / name).resolve()
+                if resolved != stage.resolve() and stage.resolve() not in resolved.parents:
+                    raise ValueError('runtime link escapes runtime directory')
+        if os.name != 'nt':
+            # systemd controller 以专用账户运行，不能继承安装者的私有目录 umask。
+            for path in [stage] + [path for path in stage.rglob('*') if path.is_dir() and not path.is_symlink()]:
+                path.chmod(0o755)
+        probe_python(str(stage / python), managed=True)
+        os.replace(str(stage), str(target))
+        try:
+            probe_python(str(target / python), managed=True)
+        except Exception:
+            shutil.rmtree(str(target))
+            raise
+    finally:
+        if stage.exists():
+            shutil.rmtree(str(stage))
+        if not any(root.iterdir()):
+            root.rmdir()
+
+
+def cleanup_runtimes(prefix, record):
+    retained = set()
+    for item in (record, record.get('previous')):
+        if item:
+            config = item['config']
+            runtime = config.get('runtime') or {}
+            if runtime.get('managed'):
+                retained.add(runtime['id'])
+            # 即使旧记录没有 runtime 元数据，也保留解释器实际所在的受管目录。
+            try:
+                retained.add(Path(config['python']).relative_to(prefix / 'runtime').parts[0])
+            except (ValueError, IndexError):
+                pass
+    try:
+        for path in (prefix / 'runtime').glob('*'):
+            if re.fullmatch('[0-9a-f]{16}', path.name) and path.name not in retained and not path.is_symlink():
+                shutil.rmtree(str(path))
+    except OSError:
+        print('Warning: unused runtime cleanup failed; retained for later review.', file=sys.stderr)
+
+
 def transaction(config, old, manifest, files, args):
     prefix = Path(config['prefix'])
     version, previous = manifest['version'], old.get('version') if old else None
@@ -967,9 +1277,14 @@ def transaction(config, old, manifest, files, args):
     old_config = old['config'] if previous else config
     old_directory = prefix / 'versions' / previous if previous else directory
     old_manager = Services(old_config, old_directory)
+    desired, source = desired_state(old, config, old_manager.autostart()
+                                    if previous and 'desired' not in old else None)
+    manager.desired = old_manager.desired = desired
+    if old:
+        old = dict(old, desired=desired)
     drain, drained, started, switched, stopped = None, None, False, False, False
     try:
-        if previous and (changing or config['service']) and 'worker' in components(config) and (Path(config['state_dir']) / 'worker/agent.json').exists():
+        if previous and (changing or config['service']) and desired.get('worker') == 'running' and (Path(config['state_dir']) / 'worker/agent.json').exists():
             drain = drain_client(config)
             drained = drain_and_wait(*drain, timeout=args.drain_timeout)
         if previous and config['service']:
@@ -990,35 +1305,43 @@ def transaction(config, old, manifest, files, args):
             manager.register()
         # all-in-one needs a listening controller before the node can pair.
         code = args.pairing_code
-        if config['role'] == 'all-in-one' and config['service']:
+        if config['role'] == 'all-in-one' and config['service'] and desired['controller'] == 'running':
             Services(dict(config, role='controller'), directory).start()
             started = True
-            if not (Path(config['state_dir']) / 'worker/agent.json').exists():
+            if desired['worker'] == 'running' and not (Path(config['state_dir']) / 'worker/agent.json').exists():
                 if not code:
                     code = package_command(config, directory, 'controller', 'pairing-code', '--data-dir',
                         str(Path(config['state_dir']) / 'controller'), '--node-id', config['node_id'], controller_user=True).stdout.strip()
                 controller_only = dict(config, role='controller')
                 wait_doctor(controller_only, args.health_timeout)
-        pair_worker(config, directory, code)
+        if desired.get('worker') == 'running':
+            pair_worker(config, directory, code)
         configure_worker_workspace(config)
         started_at = time.time()
         if config['role'] == 'all-in-one' and config['service']:
-            Services(dict(config, role='worker'), directory).start()
+            worker_manager = Services(dict(config, role='worker'), directory)
+            worker_manager.desired = desired
+            worker_manager.start()
+            if desired['controller'] == 'stopped':
+                print('kept stopped: controller')
         else:
             manager.start()
         started = config['service']
-        if config['service'] and 'worker' in components(config):
+        if config['service'] and desired.get('worker') == 'running':
             if (Path(directory) / 'agent_collab/release.py').is_file():
                 wait_worker_status(config, directory, manifest, started_at, timeout=min(60, args.health_timeout))
             else:
                 # rc4 及更早的 worker 不写 status.json：回退到这些版本时只能用服务管理器与 doctor 确认，
                 # 不能证明实际进程来自该版本目录（主控验收时另行核对进程）。
                 print('Note: target worker version predates status.json; health confirmed by service manager and doctor only.')
-        wait_doctor(config, args.health_timeout if config['service'] else 0)
+        health_options = {'desired': desired} if 'stopped' in desired.values() else {}
+        wait_doctor(config, args.health_timeout if config['service'] else 0, **health_options)
         if drain is not None:
             set_drain(*drain, drained)
             drain = None
-        record = dict(version=version, config=config, previous=old if changing else (old or {}).get('previous'))
+        interpreter_changed = previous and old_config['python'] != config['python']
+        record = dict(version=version, config=config, desired=desired,
+                      previous=old if changing or interpreter_changed else (old or {}).get('previous'))
         # Retain one previous record, not an ever-growing nested history.
         if record['previous']:
             record['previous'] = {k: v for k, v in record['previous'].items() if k != 'previous'}
@@ -1057,11 +1380,39 @@ def transaction(config, old, manifest, files, args):
                 print('Node may remain drained; restore its prior drain setting after review.', file=sys.stderr)
 
 
+def remove_tree(path, attempts=40, delay=0.25):
+    """删除目录；Windows 上被刚结束的进程占用（WinError 32/5）时稍等再试。
+
+    计划任务的进程在 schtasks /End 之后还要一小会儿才真正退出，期间它的工作目录与已打开的文件仍被占用；
+    状态锁先于这些句柄释放，所以拿到锁之后立即删除仍可能失败（卸载时实测）。
+    """
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(str(path))
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if os.name != 'nt' or attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def uninstall(config, old, purge_code):
     prefix = Path(config['prefix'])
+    # 经安装后的启动器运行时，工作目录就是当前版本目录（launcher.py 会 chdir 进去）；Windows 不能删除进程自己的
+    # 工作目录（WinError 32，重试也没用），先离开代码目录。
+    try:
+        here = Path.cwd().resolve()
+        if here == prefix.resolve() / 'versions' or prefix.resolve() / 'versions' in here.parents:
+            os.chdir(str(prefix))
+    except OSError:
+        os.chdir(str(prefix))
     if not old or not old.get('version'):
         if old and purge_code and (prefix / 'versions').exists():
-            shutil.rmtree(str(prefix / 'versions'))
+            remove_tree(prefix / 'versions')
+        if old and purge_code and (prefix / 'runtime').exists():
+            remove_tree(prefix / 'runtime')
         print('No managed installation; state directory is retained.')
         return
     directory = prefix / 'versions' / old['version']
@@ -1070,12 +1421,14 @@ def uninstall(config, old, purge_code):
     with stopped_locks(config):
         switch_current(prefix, None, config['system'])
         if purge_code:
-            shutil.rmtree(str(prefix / 'versions'))
+            remove_tree(prefix / 'versions')
+            if (prefix / 'runtime').exists():
+                remove_tree(prefix / 'runtime')
         elif directory.exists():
-            shutil.rmtree(str(directory))
+            remove_tree(directory)
         for name in ('bin', 'services'):
             if (prefix / name).exists():
-                shutil.rmtree(str(prefix / name))
+                remove_tree(prefix / name)
         (prefix / 'launcher.py').unlink(missing_ok=True)
         write_json(prefix / 'installation.json', dict(version=None, previous=None, config=config))
     print('Uninstalled; all state, backups, workspaces and tool login configuration are retained.')
@@ -1085,9 +1438,9 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument('--role', choices=ROLES)
     for name in ('release', 'version', 'prefix', 'state-dir', 'controller-url', 'pairing-code',
-                 'node-id', 'python', 'admin-token-file', 'ca-file', 'bind', 'physical-host-id', 'failure-domain', 'workspace-root'):
+                 'node-id', 'python', 'runtime', 'admin-token-file', 'ca-file', 'bind', 'physical-host-id', 'failure-domain', 'workspace-root', 'instance'):
         result.add_argument('--' + name)
-    for name in ('no-service', 'dry-run', 'uninstall', 'purge-code', 'rollback', 'drain', 'allow-active'):
+    for name in ('no-service', 'dry-run', 'uninstall', 'purge-code', 'rollback', 'drain', 'allow-active', 'discover'):
         result.add_argument('--' + name, action='store_true')
     result.add_argument('--drain-timeout', type=float, default=300)
     result.add_argument('--health-timeout', type=float, default=60)
@@ -1095,10 +1448,14 @@ def parser():
 
 
 def configuration(args, old, system):
+    if args.runtime and args.python:
+        raise ValueError('--runtime and --python cannot be combined')
     saved = dict(old['config']) if old else {}
+    if args.python:
+        saved.pop('runtime', None)
     role = args.role or saved.get('role') or 'worker'
     managed_linux_controller = system == 'Linux' and role != 'worker' and not args.no_service
-    defaults = dict(role=role, system=system, service=not args.no_service,
+    defaults = dict(role=role, instance='', system=system, service=not args.no_service,
                     prefix=str(Path('/opt/agent-collab') if managed_linux_controller else Path.home() / '.local/share/agent-collab'),
                     state_dir=str(Path('/var/lib/agent-collab') if managed_linux_controller else Path.home() / '.local/state/agent-collab'),
                     python=sys.executable, controller_url='http://127.0.0.1:18669', bind='127.0.0.1:18669',
@@ -1107,6 +1464,8 @@ def configuration(args, old, system):
                     workspace_root=default_windows_workspace() if system == 'Windows' and role != 'controller' else None)
     defaults.update(saved)
     for key in defaults:
+        if key == 'runtime':
+            continue
         value = getattr(args, key, None)
         if value is not None:
             defaults[key] = value
@@ -1118,7 +1477,13 @@ def configuration(args, old, system):
                 value = shutil.which(value) or value
             path = Path(value).expanduser()
             # 令牌文件只取绝对路径、不跟随链接：/dev/stdin 经 /proc/self/fd/0 会解析成不存在的 pipe:[N]。
-            defaults[key] = str(path.absolute() if key == 'admin_token_file' else path.resolve())
+            defaults[key] = str(path.absolute() if key == 'admin_token_file' or
+                                (key == 'python' and defaults.get('runtime', {}).get('managed')) else path.resolve())
+    instance = defaults['instance']
+    if instance and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,30}', instance):
+        raise ValueError('invalid instance: use 1-31 lowercase letters, digits or hyphens')
+    if old and instance != saved.get('instance', ''):
+        raise ValueError('instance cannot be changed on an existing installation')
     return defaults
 
 
@@ -1129,7 +1494,7 @@ def validate_paths(config, old):
     for value in config.values():
         if isinstance(value, str) and any(ord(c) < 32 for c in value):
             raise ValueError('control characters are not allowed in paths/options')
-    for base, names in ((prefix, ('versions', 'bin', 'services', 'installation.json', 'launcher.py', 'current.txt')),
+    for base, names in ((prefix, ('versions', 'runtime', 'bin', 'services', 'installation.json', 'launcher.py', 'current.txt')),
                         (state, ('controller', 'worker', 'logs', 'backups'))):
         for name in names:
             if (base / name).is_symlink():
@@ -1175,8 +1540,9 @@ def preflight(config, args, old, operation):
             raise ValueError('--node-id differs from the existing identity')
         if args.controller_url and validate_url(identity['controller']) != validate_url(args.controller_url):
             raise ValueError('--controller-url differs from the existing identity')
-    probe = run([config['python'], '-B', '-c', 'import sys; print("%d.%d" % sys.version_info[:2]); sys.exit(sys.version_info < (3,9))'])
-    print('Environment: {} {} / Python {}'.format(config['system'], platform.machine(), probe.stdout.strip()))
+    if not args.runtime:
+        probe = probe_python(config['python'], managed=config.get('runtime', {}).get('managed', False))
+        print('Environment: {} {} / Python {}'.format(config['system'], platform.machine(), probe.stdout.strip()))
     Services(config, Path(config['prefix']) / 'versions' / ((old or {}).get('version') or 'pending')).check_ownership()
 
 
@@ -1208,6 +1574,7 @@ def service_command(argv):
     ap.add_argument('action', choices=('start', 'stop', 'status'))
     ap.add_argument('--prefix', default=str(Path.home() / '.local/share/agent-collab'))
     ap.add_argument('--allow-active', action='store_true')
+    ap.add_argument('--component', choices=('controller', 'worker'))
     ap.add_argument('--timeout', type=float, default=60)
     args = ap.parse_args(argv)
     report = dict(action=args.action)
@@ -1219,6 +1586,13 @@ def service_command(argv):
         prefix = Path(args.prefix).expanduser().resolve()
         old = read_json(prefix / 'installation.json')
         config = old['config']
+        full_config = config
+        if args.component:
+            if args.component not in components(config):
+                reason = 'component is not part of this installation'
+                raise ValueError(reason)
+            config = dict(config, role=args.component)
+        report['desired'] = dict(old.get('desired', {}))
         if not old.get('version') or config.get('service') is not True:
             raise ValueError(reason)
         if config['system'] != platform.system() or Path(config['prefix']).resolve() != prefix:
@@ -1237,6 +1611,9 @@ def service_command(argv):
         if args.action == 'status':
             reason = 'could not read managed service state'
             report.update(services=manager.status(), autostart=manager.autostart(), worker=None)
+            inferred = report['autostart'] if not args.component else Services(full_config, directory).autostart()
+            desired, source = desired_state(old, full_config, inferred)
+            report.update(desired=desired, desired_source=source, context=service_context(config))
             if 'worker' in components(config):
                 try:
                     worker = read_json(Path(config['state_dir']) / 'worker/status.json')
@@ -1261,6 +1638,9 @@ def service_command(argv):
                 if args.action == 'stop':
                     reason = 'worker has preparing/running attempts; drain first or pass --allow-active'
                     refuse_active_worker(config, args.allow_active)
+                desired, source = desired_state(old, full_config, Services(full_config, directory).autostart()
+                                                if args.component and 'desired' not in old else None)
+                if args.action == 'stop':
                     reason = 'could not disable autostart and stop managed services; inspect local service logs'
                     manager.stop(disable_autostart=True)
                     reason = 'process state locks were not released before the stop timeout'
@@ -1293,6 +1673,9 @@ def service_command(argv):
                             raise RuntimeError(reason)
                         time.sleep(min(1, max(0, deadline - time.monotonic())))
                     report.update(ready=True, services=states)
+                desired.update({kind: 'stopped' if args.action == 'stop' else 'running' for kind in components(config)})
+                write_json(prefix / 'installation.json', dict(old, desired=desired))
+                report['desired'] = desired
                 success = True
             finally:
                 lock.rmdir()
@@ -1335,6 +1718,11 @@ def main(argv=None):
         prefix = Path(provisional['prefix'])
         old = read_json(prefix / 'installation.json') if (prefix / 'installation.json').is_file() else None
         config = configuration(args, old, system)
+        if args.discover:
+            if old:
+                config['service'] = old['config']['service']
+            print(json.dumps(discover(config, old), ensure_ascii=False))
+            return 0
         if checking:
             if old:
                 config['service'] = old['config']['service']
@@ -1346,6 +1734,8 @@ def main(argv=None):
         if args.purge_code and not args.uninstall:
             raise ValueError('--purge-code requires --uninstall')
         operation = 'uninstall' if args.uninstall else 'rollback' if args.rollback else 'drain' if args.drain else 'install'
+        if args.runtime and operation != 'install':
+            raise ValueError('--runtime is only valid for installation; rollback uses the previous runtime')
         manifest, files = None, None
         if operation == 'install':
             if not args.release:
@@ -1368,8 +1758,16 @@ def main(argv=None):
                 raise ValueError('previous directory and manifest versions differ')
             # Preserve the previous interpreter/configuration, plus this invocation's admin credential path.
             config = dict(old['previous']['config'], admin_token_file=config.get('admin_token_file'))
-        if old and current_version(prefix, system) != old['version']:
+        pointer = current_version(prefix, system) if old else None
+        # 卸载先删当前指针再删代码：指针已不在、记录仍有版本，是一次被中断的卸载，可以由再次卸载接着完成。
+        interrupted_uninstall = operation == 'uninstall' and pointer is None
+        if old and pointer != old['version'] and not interrupted_uninstall:
             raise ValueError('current pointer and installation record differ; inspect interrupted installation')
+        runtime_payload = read_runtime(Path(args.runtime).expanduser()) if args.runtime else None
+        if runtime_payload:
+            runtime_id, entries, python = runtime_payload
+            config['python'] = str(prefix / 'runtime' / runtime_id / python)
+            config['runtime'] = dict(id=runtime_id, python=config['python'], managed=True)
         preflight(config, args, old, operation)
         steps = ['Validate platform, Python, archive paths and every manifest hash (read-only)',
                  'Acquire prefix install lock; keep code and state separate']
@@ -1394,6 +1792,8 @@ def main(argv=None):
         print('Review placeholders and validate the complete proxy configuration before an operator reload. '
               'Provider login must be completed locally by the user.')
         if args.dry_run:
+            if runtime_payload:
+                print('Runtime structure verified; Python version/import probe runs after staging on installation.')
             print('Dry run complete: no filesystem writes or API mutations were performed.')
             return 0
         if operation == 'drain':
@@ -1409,7 +1809,7 @@ def main(argv=None):
             if subprocess.call(['sudo', '-v']) != 0:
                 raise ValueError('administrator authorization is needed for the system controller service')
         if manifest and 'controller' in components(config) and old and old.get('version'):
-            compatible_schema(config, manifest, prefix / 'versions' / old['version'])
+            compatible_schema(old['config'] if runtime_payload else config, manifest, prefix / 'versions' / old['version'])
         create_root(prefix, config)
         lock = prefix / '.install-lock'
         try:
@@ -1421,20 +1821,29 @@ def main(argv=None):
             latest = read_json(prefix / 'installation.json') if (prefix / 'installation.json').is_file() else None
             if latest != old:
                 raise ValueError('installation changed concurrently; rerun')
+            if runtime_payload:
+                install_runtime(config, runtime_payload)
             if operation == 'uninstall':
                 uninstall(config, old, args.purge_code)
-            elif (old and manifest['version'] == old['version'] and config == old['config']
+            elif (old and not config['service'] and 'desired' in old
+                  and manifest['version'] == old['version'] and config == old['config']
                   and (not args.pairing_code or 'worker' not in components(config)
                        or (Path(config['state_dir']) / 'worker/agent.json').is_file())):
                 if read_installed(prefix / 'versions' / old['version']) != manifest:
                     raise ValueError('version already exists with different contents')
-                wait_doctor(config, args.health_timeout if config['service'] else 0)
+                health_options = {'desired': old['desired']} if 'stopped' in old['desired'].values() else {}
+                wait_doctor(config, args.health_timeout if config['service'] else 0, **health_options)
+                for kind, state in old['desired'].items():
+                    if state == 'stopped':
+                        print('kept stopped: ' + kind)
                 print('Already installed; identity and data were preserved.')
             else:
                 create_root(Path(config['state_dir']), config)
                 if old is None:
                     write_json(prefix / 'installation.json', dict(version=None, previous=None, config=config))
                 transaction(config, old, manifest, files, args)
+            if operation != 'uninstall':
+                cleanup_runtimes(prefix, read_json(prefix / 'installation.json'))
         finally:
             lock.rmdir()
         return 0

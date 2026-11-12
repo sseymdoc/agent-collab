@@ -56,7 +56,20 @@ OS_NAMES = ('windows', 'linux', 'macos')
 NODE_EVENT_TYPES = ('attempt.started', 'attempt.progress', 'attempt.log', 'attempt.side_effect')
 
 # §12：客户端授权、模型策略与统一入口。
-FEATURES = ('clients', 'model_settings', 'node_models', 'contract_draft', 'baselines')
+FEATURES = ('clients', 'model_settings', 'node_models', 'contract_draft', 'baselines',
+            # catalog_provenance：节点目录可带 provider 与 stale 状态（§12.5）；节点看到它才发送这两项。
+            'catalog_provenance',
+            # §13：项目与项目默认值、成果下载与应用记录、节点管理（配对码、维护、退役、管理操作）、协调设置、原始日志取回。
+            'projects', 'applications', 'node_admin', 'coordination_settings', 'raw_logs',
+            # §13.10：经目标节点的受限操作把成果写回该节点本机绑定的项目目录；节点看到它才上报 project_bindings。
+            'remote_apply')
+# 项目应用操作（§13.4）的状态：started 是写入前登记的意图；其余是客户端（或远端写回的目标节点）如实上报的结果。
+APPLICATION_FINAL = ('applied', 'partial', 'conflict', 'failed', 'unknown')
+# 远端项目写回（§13.10）的操作：参数只由 controller 按任务记录填写，不经通用的节点操作端点下发。
+PROJECT_OPERATIONS = ('project_plan', 'project_apply', 'project_recover')
+# 节点管理操作（§13.6）：种类是封闭集合，不是远程命令通道。
+NODE_OPERATIONS = ('probe', 'log_tail') + PROJECT_OPERATIONS
+NODE_OPERATION_STATUSES = ('requested', 'received', 'succeeded', 'failed', 'timed_out')
 SCOPES = ('read', 'tasks', 'settings', 'devices', 'maintain')
 ROLES = {'owner': SCOPES, 'operator': ('read', 'tasks'), 'viewer': ('read',)}
 CLIENT_KINDS = ('desktop', 'cli', 'agent')
@@ -73,6 +86,12 @@ DEFAULTS = {
     'max_blob_bytes': 64 * 1024 * 1024,
     'max_json_bytes': 2 * 1024 * 1024,
     'sse_ping_s': 15,
+    # 节点模型目录的有效期：取得时间早于它的目录按“未核实”处理（§12.5）。节点缺省每 6 小时刷新一次。
+    'catalog_max_age_s': 172800,
+    # 节点管理操作从请求到完成的时限；超时记 timed_out，不重发（§13.6）。
+    'node_operation_timeout_s': 120,
+    # 远端项目写回（§13.10）的操作时限：读目录、取成果内容、逐文件写入都可能很久，与写回安全对齐给得更长。
+    'project_operation_timeout_s': 1800,
 }
 
 _HEX64 = re.compile(r'[0-9a-f]{64}')

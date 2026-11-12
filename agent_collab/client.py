@@ -103,6 +103,11 @@ class Client:
                 raise OSError('injected partition')
             status, response_headers, data = self._send(
                 method, self.controller + p.API_PREFIX + path, headers, body)
+        except ssl.SSLCertVerificationError as exc:
+            # 校验失败的原因（自签、缺少扩展、地址不匹配）只描述服务器出示的证书，不含凭据；
+            # 原样给出，否则入口证书的问题和“连不上”无法区分。
+            raise ConnectionFailure('TLS certificate verification failed: {}'.format(
+                exc.verify_message or 'certificate rejected')) from None
         except (OSError, http.client.HTTPException, ConnectionFailure) as exc:
             # Transport exceptions may contain headers, URLs, or credentials.
             raise ConnectionFailure('controller unavailable or TLS verification failed') from None

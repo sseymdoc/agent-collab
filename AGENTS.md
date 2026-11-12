@@ -24,6 +24,7 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 | controller 的认证、配置、协调租约、受管协调者、备份恢复、事件保留 | [docs/controller.md](docs/controller.md) |
 | 节点 agent：领取、进程托管、重启对账、检查点、契约检查、回写、harness 适配器 | [docs/agent.md](docs/agent.md) |
 | 桌面端外壳、页面在浏览器与桌面端的传输层 | [docs/desktop.md](docs/desktop.md) |
+| 项目：本机扫描、基线、应用与取消、回执补报、远端写回 | [docs/protocol.md](docs/protocol.md) §13、[ADR 0003](docs/adr/0003-projects-local-helper-and-node-management.md) |
 | CLI 客户端子命令、给 Claude 与其他 Agent 的集成方式 | [docs/integration.md](docs/integration.md) |
 | 迁移预检与升级预演 | [docs/migration.md](docs/migration.md) |
 | 安装器、服务模板、升级与回退、发行包 | [docs/install.md](docs/install.md) |
