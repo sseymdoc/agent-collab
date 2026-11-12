@@ -79,7 +79,7 @@ export function Wizard({ info, begin, openFor, onConnect }: { info: any; begin: 
     setOut(r.output ?? null)
     if (!r.ok) throw new Error('安装没有完成，安装器输出见下方')
     if (args.role === 'worker') setOk('这台机器已作为节点安装并加入 controller。它出现在该 controller 的“设备”页后，可在那里重新探测登录与模型目录。')
-    if (args.role === 'all-in-one') await openFor(g, await invoke('local_pair'))
+    if (args.role === 'all-in-one') await openFor(g, () => invoke('local_pair'))
   })
   const has = installed(d?.install)
   const helper = d ? d.helper : info?.helper
@@ -96,7 +96,7 @@ export function Wizard({ info, begin, openFor, onConnect }: { info: any; begin: 
     {mode === 'local' && d && (has
       ? <p className="muted">已有安装时只报告现状，不提供替换它的选项。{/all-in-one|controller/.test(String(d.install?.role)) && '它包含 controller 时，可以把桌面端连接到它：'}
         {/all-in-one|controller/.test(String(d.install?.role)) && <button disabled={!!busy} onClick={() => void run('配对中…', async () => {
-          const g = begin(); await openFor(g, await invoke('local_pair')) })}>连接本机 controller</button>}</p>
+          const g = begin(); await openFor(g, () => invoke('local_pair')) })}>连接本机 controller</button>}</p>
       : <p className="actions"><button className="primary" disabled={!!busy || !helper} onClick={() => void setup({ role: 'all-in-one' })}>创建本机部署（controller + 节点）</button>
         <small className="muted">完成后自动把桌面端配对到本机 controller。</small></p>)}
     {mode === 'worker' && d && (has ? <p className="muted">这台机器已有安装，不会被替换；如需改为加入别的 controller，请先在命令行处理现有安装。</p>

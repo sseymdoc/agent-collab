@@ -14,7 +14,8 @@ const ERR: Record<string, string> = {
 // 原生桥的错误带 controller 给出的具体原因（如配对码过期）时优先显示它。
 export const bridgeText = (e: any) => e?.message ? (ERR[e.code] && e.code !== 'unauthorized' ? ERR[e.code] : e.message) : ERR[e?.code] ?? String(e)
 
-export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (opened: any, connection: any) => Promise<void> }) {
+// onOpen 的第三个参数报告这个流程是否仍是最新的：进入主界面之前（身份请求返回之后）还要再核对一次。
+export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (opened: any, connection: any, live: () => boolean) => Promise<void> }) {
   const [list, setList] = useState<any[] | null>(null)
   const [info, setInfo] = useState<any>(null)
   const [err, setErr] = useState<string | null>(reason ? ERR[reason] ?? reason : null)
@@ -36,10 +37,17 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
   const flow = useRef(0)
   const begin = () => ++flow.current
   const current = (g: number) => g === flow.current
+  // c 可以是连接，也可以是取得连接的函数（例如向导的 local_pair）：被取代的流程连这一步也不做。
   const openFor = async (g: number, c: any) => {
     if (!current(g)) return
+    if (typeof c === 'function') {
+      c = await c()
+      if (!current(g)) return
+    }
     const opened = await invoke('connection_open', { id: c.id })
-    if (current(g)) await onOpen(opened, c)
+    if (current(g)) return onOpen(opened, c, () => current(g))
+    // 打开期间被别的流程取代：页面不进入它，原生侧也不留着这条活动连接。
+    await invoke('connection_close', { epoch: opened.epoch }).catch(() => {})
   }
   useEffect(() => () => { flow.current++ }, [])
   // 等身份确认（GET /client）完成再解除 busy：期间再点一次会换掉连接代次，先发的确认随后失败会把新连接关掉。

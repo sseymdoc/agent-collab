@@ -48,8 +48,13 @@ function App() {
   // 每次建立连接 generation 加一，主界面按它整体重建：上一条连接留下的弹窗、表单和在途请求的结果随之丢弃。
   const [phase, setPhase] = useState<{ at: 'boot' | 'login' | 'ready'; generation: number; reason: string | null; error: string | null }>(
     { at: 'boot', generation: 0, reason: null, error: null })
-  const enter = async () => {
+  const enter = async (live?: () => boolean, epoch?: number) => {
     const who = await api.whoami()
+    if (live && !live()) {
+      // 等身份请求期间用户换了流程：不进入这条连接，也不让它在外壳里留着。
+      if (epoch !== undefined) void invoke('connection_close', { epoch }).catch(() => {})
+      return
+    }
     // 换了 controller 才丢弃协调令牌，重连同一个不必重新接管自己的租约。
     bindCoordinators(who.controller.controller_id)
     setSession(who)
@@ -83,10 +88,10 @@ function App() {
       <div className="actions"><button onClick={() => void boot()}>重试</button><button className="link" onClick={() => leave(null)}>改用令牌登录</button></div></div>
     : <p className="muted">连接 controller…</p>}</main>
   if (phase.at === 'login') return isDesktop
-    ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={async opened => {
+    ? <Connect key={phase.reason ?? phase.error ?? ''} reason={phase.reason ?? phase.error} onOpen={async (opened, _c, live) => {
       setEpoch(opened.epoch)
       // 只在失败的仍是当前这条连接时离开：期间若已换了连接，旧身份请求的失败不能关掉新连接。
-      await enter().catch(e => { if (currentEpoch() === opened.epoch) leave(errText(e)) })
+      await enter(live, opened.epoch).catch(e => { if (currentEpoch() === opened.epoch && live()) leave(errText(e)) })
     }} />
     : <Login onDone={() => void enter().catch(e => setPhase(p => ({ ...p, at: 'boot', error: errText(e) })))} />
   // 浏览器退出要等 DELETE /session 答复后再显示登录页：否则马上重新登录时，迟到的旧答复会清掉新会话的 Cookie 和 CSRF 令牌。

@@ -496,6 +496,10 @@ def _read_log(journal):
             raise ProjectError('journal_corrupt', '应用日志中间有损坏的记录，不能据它判断写到了哪里：%s' % path) from None
         good.append(line)
         (started if entry.get('started') else done).add(name)
+    else:
+        if good and not lines[-1] == b'':
+            # 最后一条完整、只差换行符：补上，之后的追加才不会和它连在一起。
+            atomic_write(path, b''.join(item + b'\n' for item in good))
     return done, started
 
 
@@ -547,15 +551,6 @@ def apply(root, base_manifest, result_manifest, fetch, state_dir, application_id
         raise ProjectError('insufficient_space', '磁盘空间不足：需要约 %d 字节，可用 %d 字节' % (needed, free), needed=needed, free=free)
     if cancelled and cancelled():
         raise ProjectError('cancelled', '已取消，没有写入任何文件')
-    if before_write:
-        before_write(outline)
-    # 先独占地占住这个目录（O_EXCL），再建日志：两次同时开始的应用只有一次能继续，另一次按“有未完成的应用”拒绝。
-    marker = _root_marker(state_dir, root)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.close(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-    except FileExistsError:
-        raise ProjectError('unfinished_application', '这个目录上有另一次应用正在进行或没有完成，先用 recover 查看并处理它') from None
     journal = _journal_dir(state_dir, application_id)
     backup = journal / 'backup'
     backup.mkdir(parents=True, exist_ok=False)
@@ -564,8 +559,36 @@ def apply(root, base_manifest, result_manifest, fetch, state_dir, application_id
               'base_manifest_sha256': outline['base_manifest_sha256'], 'manifest_sha256': outline['manifest_sha256'],
               'files': {c['path']: after.get(c['path']) for c in todo}}
     _save(journal / 'journal.json', record)
-    _save(_root_marker(state_dir, root), {'application_id': application_id, 'root': str(root), 'started_at': record['started_at'],
-                                         'journal': str(journal)})
+    # 日志写好之后再独占地占住这个目录（O_EXCL，内容经同一个描述符写入）：两次同时开始的应用只有一次能继续；
+    # 任何一步之后崩溃，留下的标记都指向一份 writing 日志，可以用 recover 处理，不会变成解不开的锁。
+    marker = _root_marker(state_dir, root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    # 标记先完整写进旁边的临时文件，再用硬链接原子地放到位（已存在则失败）：标记一出现就带着完整内容，
+    # 任何时刻被终止都不会留下空标记。
+    pending = journal / 'marker.json'
+    _save(pending, {'application_id': application_id, 'root': str(root), 'started_at': record['started_at'], 'journal': str(journal)})
+    try:
+        try:
+            os.link(str(pending), str(marker))
+        except FileExistsError:
+            raise
+        except OSError:
+            # 文件系统不支持硬链接（FAT、部分网络盘）：退回独占创建再写入，被终止时可能留下空标记。
+            with os.fdopen(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'wb') as out:
+                out.write(pending.read_bytes())
+                out.flush()
+                os.fsync(out.fileno())
+    except FileExistsError:
+        shutil.rmtree(str(journal), ignore_errors=True)  # 这次没有开始：不留日志
+        raise ProjectError('unfinished_application', '这个目录上有另一次应用正在进行或没有完成，先用 recover 查看并处理它') from None
+    # 占住目录之后才登记应用意图：两次同时开始的应用只有占到目录的那次会在 controller 上留下记录。登记失败就释放目录。
+    if before_write:
+        try:
+            before_write(outline)
+        except BaseException:
+            marker.unlink()
+            shutil.rmtree(str(journal), ignore_errors=True)
+            raise
     result['backup'] = str(backup)
     return _run(root, record, todo, after, fetch, journal, state_dir, result, progress, cancelled, before_file)
 

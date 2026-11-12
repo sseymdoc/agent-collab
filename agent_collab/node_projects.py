@@ -192,8 +192,12 @@ class ProjectOps:
                     ack = None
                 received = (ack or {}).get('status') == 'received'
                 if record['state'] == 'replay':
-                    # 已经执行过：不再执行，补报本机日志里的结果。
-                    self.save(dict(record, state='finished', outcome=self.interrupted(record)) if received else dict(record, state='reported'))
+                    if received and record['kind'] == 'project_recover' and record['params'].get('action') == 'status':
+                        self.save(dict(record, state='queued'))  # 只读的现状核对：再做一次，得到当前的 report
+                        continue
+                    # 写入类操作已经执行过：不再执行，补报本机日志里的结果。
+                    replayed = record.get('outcome') or self.interrupted(record)
+                    self.save(dict(record, state='finished', outcome=replayed) if received else dict(record, state='reported'))
                     continue
                 # 只有 controller 确认“已领取”才执行；已到期（timed_out）或不存在的放弃，绝不再执行（§13.10）。
                 self.save(dict(record, state='queued' if received else 'abandoned'))
@@ -219,7 +223,8 @@ class ProjectOps:
                             continue
                     if exc.status not in (400, 404, 409, 413):
                         raise
-                self.save(dict(record, state='reported', outcome=None))
+                # 写回与恢复的结果留着：controller 从备份恢复后再次下发时原样补报（有的结果无法从本机日志重建）。
+                self.save(dict(record, state='reported', outcome=record['outcome'] if record['kind'] in ('project_apply', 'project_recover') else None))
 
     def run(self, record):
         stage = self.folder / (record['op_id'] + '.blobs')

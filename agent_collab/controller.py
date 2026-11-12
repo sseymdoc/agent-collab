@@ -1568,7 +1568,7 @@ class App:
                 self.store.put('node_op', op['op_id'], op)
                 self.emit('node.operation', {k: op[k] for k in ('op_id', 'node_id', 'kind', 'status')}, now, node=op['node_id'])
                 record = self.store.get('application', op['params'].get('application_id')) if op['kind'] == 'project_apply' else None
-                if record and record['status'] == 'started' and not op['received_at']:
+                if record and record['status'] == 'started' and not op['received_at'] and not op.get('restored'):
                     # 节点从未领取：一个文件都没写。节点之后上报 received 会得到 timed_out，按约定放弃、不再执行（§13.10）。
                     # 已领取而没在时限内给出结果的，应用记录保持 started（结果待确认），等节点之后的上报对账。
                     self._settle_application(record, 'failed', {'reason': 'not_received', 'written': [], 'operation_id': op['op_id']}, now)
@@ -2962,8 +2962,13 @@ def revoke_execution(store, generation, clock, void_unclaimed=False):
             store.event('job.updated', job, d.timestamp(clock()), job_id=job['job_id'])
     # 屏障（void_unclaimed）作废还没被领取的操作。恢复不这样做：备份里 requested 的写回可能在备份之后
     # 已被节点执行，记成“失败、没写”就与目录不符；保持 requested，节点之后的上报或 recover 照常对账。
-    for op in store.all('node_op') if void_unclaimed else ():
-        if op['status'] != 'requested':
+    # 通用操作（probe、log_tail）没有这个问题，但备份之后节点可能已确认领取过它们，恢复后不会再领：两种情况都作废。
+    for op in store.all('node_op'):
+        if op['status'] == 'requested' and not void_unclaimed and op['kind'] in p.PROJECT_OPERATIONS:
+            # 恢复后保留的写回：到期时不能再推断为“节点没领取、一个文件都没写”（备份之后可能已经写过），应用保持待确认。
+            store.put('node_op', op['op_id'], dict(op, restored=True))
+            continue
+        if op['status'] != 'requested' or (not void_unclaimed and op['kind'] in p.PROJECT_OPERATIONS):
             continue  # 已领取的操作节点可能正在执行：结果照常对账（远端写回保持待确认，用 recover 处理）
         # 还没被领取的操作作废：屏障之后它们不会再下发，节点晚到的领取得到终态拒绝。
         at = d.timestamp(clock())

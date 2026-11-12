@@ -350,6 +350,7 @@ class RemoteTimeoutTests(RemoteCase):
         self.bind()
         job = self.published()
         started = self.apply(job)  # 备份时操作还是 requested
+        probe = self.call('POST', '/nodes/target/operations', {'request_id': uid(), 'kind': 'probe'}, status=201)
         self.app.close()
         backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
         self.app = App(self.temp / 'data', clock=self.clock)
@@ -359,9 +360,16 @@ class RemoteTimeoutTests(RemoteCase):
         restore(self.temp / 'data', self.temp / 'backup', clock=self.clock)
         self.app = App(self.temp / 'data', clock=self.clock)
         self.assertEqual(self.application(started)['status'], 'started')  # 恢复不把它记成“失败、没写”
-        # 节点再次拿到这项操作：不重新执行，按本机日志补报当时的结果。
-        again = self.settled(started)
-        self.assertEqual((again['status'], tree(self.folder)), ('applied', OUTPUTS))
+        # 通用操作作废：备份之后节点可能已领取过它，不会再领。
+        self.assertEqual((self.op(probe['op_id'])['status'], self.op(probe['op_id'])['error']), ('failed', 'stale_generation'))
+        # 恢复时原操作已经到期：照样不推断为“没写”，应用保持待确认，可以用 recover 处理。
+        self.clock.advance(self.app.config['project_operation_timeout_s'] + 1)
+        self.app.tick()
+        self.assertEqual((self.op(started['operation_id'])['status'], self.application(started)['status']), ('timed_out', 'started'))
+        recover = self.call('POST', '/projects/%s/applications/%s/recover' % (self.pid, started['application_id']),
+                            {'request_id': uid(), 'action': 'abandon'}, status=201)
+        self.drive(lambda: self.op(recover['op_id'])['status'] in ('succeeded', 'failed'))
+        self.assertEqual((self.application(started)['status'], tree(self.folder)), ('unknown', OUTPUTS))  # 按现状结束：如实记为未知
 
     def test_unsettled_application_blocks_retirement_counts_as_activity_and_unreceived_ones_end_at_the_barrier(self):
         self.bind()

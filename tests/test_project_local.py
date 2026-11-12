@@ -354,7 +354,8 @@ class ApplyTests(ApplyCase):
             self.apply(result, before_write=refuse)
         self.assertEqual((mismatch.exception.code, space.exception.code, tree(self.root), project.unfinished(self.state)),
                          ('blob_mismatch', 'insufficient_space', before, []))
-        self.assertFalse((self.state / 'applies').exists())  # 三种情况都没有开始写，也没有留下操作记录
+        left = [x for x in (self.state / 'applies').rglob('*') if x.is_file()] if (self.state / 'applies').exists() else []
+        self.assertEqual(left, [])  # 三种情况都没有开始写，也没有留下操作记录（日志与目录标记都已清掉）
 
     def test_a_file_changed_between_review_and_write_is_not_overwritten(self):
         result = self.result({'a.txt': 'a1', 'b.txt': 'b1'})
@@ -402,6 +403,12 @@ class SafetyTests(ApplyCase):
         with self.assertRaises(project.ProjectError) as caught:
             self.apply(self.result({'a.txt': 'a1'}))
         self.assertEqual((caught.exception.code, (self.root / 'a.txt').read_text()), ('unfinished_application', 'a0'))
+        # 没占到目录就没有开始：不向 controller 登记，也不留下日志。
+        registered = []
+        with self.assertRaises(project.ProjectError):
+            self.apply(self.result({'a.txt': 'a1'}), before_write=registered.append)
+        self.assertEqual(registered, [])
+        self.assertEqual([d.name for d in (Path(self.state) / 'applies').iterdir() if d.name != 'roots'], [])
 
     def test_rollback_keeps_a_file_edited_after_the_status_check(self):
         real, calls = project._write_one, []
@@ -622,6 +629,16 @@ class InterruptionTests(ApplyCase):
         resumed = project.recover(self.state, application, 'resume', fetch=self.fetch)
         self.assertIn({'path': '.git/hooks/pre-commit', 'reason': 'protected_path'}, resumed['conflicts'])
         self.assertFalse((self.root / '.git').exists())
+
+    def test_complete_last_log_line_without_its_newline_is_terminated_before_appending(self):
+        result, application = self.interrupted()
+        log = project._journal_dir(self.state, application) / 'done.log'
+        log.write_bytes(log.read_bytes().rstrip(b'\n'))  # 最后一条完整，换行符没来得及写
+        project.recover(self.state, application)
+        self.assertTrue(log.read_bytes().endswith(b'\n'))
+        resumed = project.recover(self.state, application, 'resume', fetch=self.fetch)
+        self.assertEqual(resumed['status'], 'applied')
+        project.recover(self.state, application)  # 续写追加的记录没有和旧的连在一起
 
     def test_delete_recreated_as_a_directory_is_not_reported_as_done(self):
         result = self.result({'a.txt': 'a1', 'old.txt': None})
