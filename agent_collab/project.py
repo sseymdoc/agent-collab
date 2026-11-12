@@ -474,28 +474,21 @@ def _claim(pending, marker):
     except FileExistsError:
         raise
     except OSError:
-        # 文件系统不支持硬链接（FAT、部分网络盘）：退回独占创建再写入；被终止时可能留下空标记，由 _stale_marker 识别。
+        # 文件系统不支持硬链接（FAT、部分网络盘）：退回独占创建再写入。被终止时可能留下空标记；
+        # 它是否过时无法可靠判断（进程也可能只是暂停），不自动清除，由占位失败时的报错指给人处理。
         with os.fdopen(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'wb') as out:
             out.write(pending.read_bytes())
             out.flush()
             os.fsync(out.fileno())
 
 
-STALE_MARKER_S = 60  # 写完整个标记只要几毫秒：超过这个时间仍不完整，就是写入时进程被终止留下的
-
-
-def _stale_marker(marker):
-    """内容为空或不完整、且超过 STALE_MARKER_S 没变化的标记：它不指向任何日志，也不会再被写完。"""
+def _marker_owner(marker):
+    """目录标记指向的应用；标记为空或不完整时返回 None。"""
     try:
         entry = json.loads(marker.read_text(encoding='utf-8'))
-        if isinstance(entry, dict) and isinstance(entry.get('application_id'), str):
-            return False
     except (OSError, ValueError):
-        pass
-    try:
-        return time.time() - marker.stat().st_mtime > STALE_MARKER_S
-    except OSError:
-        return False
+        return None
+    return entry.get('application_id') if isinstance(entry, dict) and isinstance(entry.get('application_id'), str) else None
 
 
 def _log(journal, entry):
@@ -601,15 +594,14 @@ def apply(root, base_manifest, result_manifest, fetch, state_dir, application_id
     try:
         _claim(pending, marker)
     except FileExistsError:
-        if not _stale_marker(marker):
-            shutil.rmtree(str(journal), ignore_errors=True)  # 这次没有开始：不留日志
-            raise ProjectError('unfinished_application', '这个目录上有另一次应用正在进行或没有完成，先用 recover 查看并处理它') from None
-        marker.unlink()  # 崩溃留下的空标记或残缺标记：不指向任何日志，删掉再占一次
-        try:
-            _claim(pending, marker)
-        except FileExistsError:
-            shutil.rmtree(str(journal), ignore_errors=True)
-            raise ProjectError('unfinished_application', '这个目录上有另一次应用正在进行或没有完成，先用 recover 查看并处理它') from None
+        shutil.rmtree(str(journal), ignore_errors=True)  # 这次没有开始：不留日志
+        owner = _marker_owner(marker)
+        if owner:
+            raise ProjectError('unfinished_application', '这个目录上有另一次应用正在进行或没有完成，先用 recover 查看并处理它',
+                               application_id=owner) from None
+        # 只在不支持硬链接的文件系统上可能出现：占位时进程被终止留下的空标记。确认没有应用在进行之后删除它即可。
+        raise ProjectError('unfinished_application', '这个目录的占用标记是空的或不完整（上一次应用在占位时被中断）；'
+                           '确认没有应用正在进行之后，删除这个文件再重试：%s' % marker, marker=str(marker)) from None
     # 占住目录之后才登记应用意图：两次同时开始的应用只有占到目录的那次会在 controller 上留下记录。登记失败就释放目录。
     if before_write:
         try:

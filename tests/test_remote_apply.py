@@ -367,10 +367,9 @@ class RemoteTimeoutTests(RemoteCase):
         self.clock.advance(self.app.config['project_operation_timeout_s'] + 1)
         self.app.tick()
         self.assertEqual((self.op(started['operation_id'])['status'], self.application(started)['status']), ('timed_out', 'started'))
-        # 节点再次拿到它（恢复后的心跳下发了到期前的 requested）：不重新执行，补报本机日志里的结果，已知的写入结果照样落到记录上。
-        op = self.op(started['operation_id'])
-        self.agent.projects.offer(op['op_id'], op['kind'], op['params'])
-        self.drive(lambda: self.application(started)['status'] != 'started')
+        # 恢复后节点第一次心跳就已到期：心跳仍下发它，节点不重新执行（执行即失败），补报本机保存的结果，已知的写入结果照样落到记录上。
+        with mock.patch.object(project, 'apply', side_effect=AssertionError('must not run again')):
+            self.drive(lambda: self.application(started)['status'] != 'started')
         self.assertEqual((self.application(started)['status'], tree(self.folder)), ('applied', OUTPUTS))
 
     def test_unsettled_application_blocks_retirement_counts_as_activity_and_unreceived_ones_end_at_the_barrier(self):
@@ -485,10 +484,12 @@ class RemoteRestartTests(RemoteCase):
         restore(self.temp / 'data', self.temp / 'backup', clock=self.clock)
         self.app = App(self.temp / 'data', clock=self.clock)
         self.assertEqual(self.application(started)['status'], 'started')
-        # 再次下发：没有本机日志可以推断，补报的是第一次上报时保存的结果。
-        self.drive(lambda: self.application(started)['status'] != 'started')
-        done = self.application(started)
-        self.assertEqual((done['status'], done['detail']['reason'], self.op(recover['op_id'])['status']), ('unknown', 'no_local_record', 'succeeded'))
+        # 再次下发：没有本机日志可以推断，补报的是第一次上报时保存的结果；恢复操作不会再执行。
+        with mock.patch.object(node_projects.ProjectOps, 'recover', side_effect=AssertionError('must not run again')):
+            self.drive(lambda: self.application(started)['status'] != 'started')
+        done, op = self.application(started), self.op(recover['op_id'])
+        # 补报可能在到期之前（succeeded），也可能在到期之后按迟到结果对账（timed_out，补报的状态记在 reported_status）。
+        self.assertEqual((done['status'], done['detail']['reason'], op.get('reported_status') or op['status']), ('unknown', 'no_local_record', 'succeeded'))
 
     def test_interrupted_write_stays_started_and_is_recovered_on_the_node(self):
         self.bind()

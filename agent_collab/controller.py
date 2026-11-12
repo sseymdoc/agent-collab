@@ -1584,6 +1584,14 @@ class App:
             if expires <= now:
                 self._failure(attempt, 'node_lost', 'lease or claim deadline expired', now, 'lost')
 
+    def _replayable(self, op):
+        """从备份恢复后保留、恢复后已到期、结果还没补报上来的写回：继续下发，已经执行过的节点据此补报（不会重新执行：
+        领取得到的是 timed_out，没执行过的节点放弃它）。应用有了结果就不再下发。"""
+        if op['status'] != 'timed_out' or not op.get('restored') or op.get('reported_late_at') or op['kind'] not in p.PROJECT_OPERATIONS:
+            return False
+        record = self.store.get('application', op['params'].get('application_id'))
+        return bool(record and record['status'] == 'started')
+
     def _awaiting_report(self, op):
         """远端写回超时后应用仍待确认：保留这项操作，节点晚到的结果还要靠它对账。"""
         if op['kind'] not in ('project_apply', 'project_recover'):
@@ -1897,7 +1905,7 @@ class App:
                                           if r['target_node_id'] == node_id and r.get('pending')] if not reconcile else [],
                          # §13.6：尚未被节点收到的管理操作。不认识这一项的旧节点会忽略它，操作到期后记 timed_out。
                          'operations': [{k: op[k] for k in ('op_id', 'kind', 'params')} for op in self.store.all('node_op')
-                                        if op['node_id'] == node_id and op['status'] == 'requested']})
+                                        if op['node_id'] == node_id and (op['status'] == 'requested' or self._replayable(op))]})
 
     def _claim(self, node_id, identity):
         self.node(identity, node_id)

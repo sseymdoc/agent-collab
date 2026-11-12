@@ -177,7 +177,8 @@ controller 可以向节点下发结构化的管理操作（`docs/protocol.md` §
 - 执行：心跳下发的 `project_plan`、`project_apply`、`project_recover` 先落盘到 `operations/<op_id>.json`（`claimed`），再上报 `received`；controller 回答的不是 `received`（例如已到期为 `timed_out`）就放弃，不执行。确认领取后排队，后台线程一次执行一项，开始前记为 `running`。执行前再核对绑定：目录仍存在、仍解析到绑定时那个真实目录（被换成链接时 `binding_changed`）、仍在 `integration_roots` 之内。然后在这个目录上调用 `agent_collab/project.py` 的 plan、apply、recover，写入规则与 CLI、桌面端的本机应用是同一份；应用日志与备份在 `projects/` 里。manifest 与成果内容由执行线程用节点令牌另开的连接取得、核对哈希，暂存在 `operations/<op_id>.blobs/`，操作结束后删除。
 - 上报结果：结果先落盘（`finished`），再由主循环在心跳之后上报；上报失败（网络中断）时留在本地，之后补报，被 controller 以终态拒绝的不再重发（`reported`）。上报的内容只有目录名、相对路径与原因：备份目录不上报，错误文本里的绑定目录换成目录名、数据目录换成 `<node-data>`，并去掉令牌。
 - 重启：见到 `running` 的操作不再执行。写回类按本机应用日志确定结果：没有日志说明第一次写入之前就停了，应用记 `failed`（`interrupted_before_write`）；日志已有最终结果就补报；日志停在写入中，就报告操作失败，controller 上的应用保持 `started`，由客户端发起 recover（查看现状、续写、回滚或按现状结束）。已处理过的 `op_id`（含放弃的）记录保留，不会因 controller 重新下发而再执行一次。
-- 限制：`operations/*.json` 不自动清理（上报后去掉结果正文，每项几百字节）。整个目录的写入不是跨文件事务，目录需由节点主人保证写回期间没有别的程序同时改动；与本机应用相同，写入前再核对每个文件，变了的记为冲突。
+- 保留：`operations/*.json` 在已上报或已放弃 30 天后，节点启动时删除。写回与恢复上报之后保留原结果，controller 从备份恢复后再次下发时原样补报；从早于 30 天的备份恢复时，这些操作在节点上已没有记录，结果待确认的写回用 recover 处理。
+- 限制：整个目录的写入不是跨文件事务，目录需由节点主人保证写回期间没有别的程序同时改动；与本机应用相同，写入前再核对每个文件，变了的记为冲突。
 
 ## Claude 受管协调适配器
 

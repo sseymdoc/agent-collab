@@ -404,11 +404,11 @@ class SafetyTests(ApplyCase):
         with self.assertRaises(project.ProjectError) as caught:
             self.apply(self.result({'a.txt': 'a1'}))
         self.assertEqual((caught.exception.code, (self.root / 'a.txt').read_text()), ('unfinished_application', 'a0'))
-        # 进程在写标记时被终止留下的空标记：过了时限不再挡住目录。
-        old = time.time() - project.STALE_MARKER_S - 5
-        os.utime(str(marker), (old, old))
+        # 空标记无法判断是否过时（占位的进程可能只是暂停）：不自动清除，报错给出它的位置；人确认后删除即可。
+        self.assertEqual(caught.exception.detail['marker'], str(marker))
+        marker.unlink()
         self.assertEqual(self.apply(self.result({'a.txt': 'a1'}))['status'], 'applied')
-        marker.write_text('', encoding='utf-8')  # 刚出现的空标记仍视为另一次应用正在占用
+        marker.write_text('', encoding='utf-8')
         # 没占到目录就没有开始：不向 controller 登记，也不留下日志。
         registered, current = [], project.scan(self.root, exclude=[])['manifest']
         journals = lambda: sorted(d.name for d in (Path(self.state) / 'applies').iterdir() if d.name != 'roots')
