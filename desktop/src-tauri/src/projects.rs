@@ -77,10 +77,10 @@ struct Binding {
 }
 
 impl Binding {
-    /// 返回给页面的 binding；`exists` 是目录此刻是否还在。
+    /// 返回给页面的 binding：只有目录名，不给绝对路径（页面只显示名字）；`exists` 是目录此刻是否还在。
     fn view(&self, project_id: &str) -> Value {
-        let name = Some(dir_name(&self.path)).filter(|name| !name.is_empty()).unwrap_or_else(|| self.path.clone());
-        json!({ "project_id": project_id, "path": self.path, "name": name, "bound_at": self.bound_at, "exists": Path::new(&self.path).is_dir() })
+        let name = Some(dir_name(&self.path)).filter(|name| !name.is_empty()).unwrap_or_else(|| "root".into());
+        json!({ "project_id": project_id, "name": name, "bound_at": self.bound_at, "exists": Path::new(&self.path).is_dir() })
     }
 }
 
@@ -521,6 +521,7 @@ fn unfinished_view(entries: &[Value], controller_id: &str, context: impl Fn(&str
 fn recover_view(report: &Value) -> Value {
     let mut view = report.clone();
     if let Some(fields) = view.as_object_mut() {
+        fields.remove("backup"); // 助手状态目录里的绝对路径，页面不需要
         let root = fields.remove("root");
         fields.insert("root_name".into(), json!(dir_name(root.as_ref().and_then(Value::as_str).unwrap_or_default())));
     }
@@ -1219,8 +1220,15 @@ pub async fn result_apply(
         "device": device_name(), "plan": plan["summary"],
     });
     ctx.stage("register");
-    ctx.post(&format!("/projects/{}/applications", published.project_id), &registration, "登记应用").await?;
     let failed = |error: &BridgeError| json!({ "errors": [{ "reason": error.code, "error": error.message }] });
+    if let Err(error) = ctx.post(&format!("/projects/{}/applications", published.project_id), &registration, "登记应用").await {
+        // 应答可能丢了而 controller 已经登记：按同一个 application_id 补报“失败、一个文件都没写”（持久回执，送不到下次再报；
+        // controller 上没有这条记录时被拒绝，回执随之结束），不让它永远停在 started。
+        let journal = ctx.state.join("applies").join(&application_id);
+        ctx.report(&published.project_id, &application_id, "failed", failed(&error)).await;
+        clear_if_settled(&journal);
+        return Err(error);
+    }
     if let Err(stopped) = ctx.check() {
         // 登记期间被取消或连接切换：一个文件都还没写，把刚登记的记录结束为 failed。
         let journal = ctx.state.join("applies").join(&application_id);

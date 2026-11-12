@@ -701,7 +701,7 @@ class App:
             elif kind == 'job.integration' and payload.get('status') == 'integrated':
                 counts['integrated'] = counts.get('integrated', 0) + 1
             elif kind == 'project.application':
-                if payload.get('status') in ('applied', 'partial'):
+                if payload.get('status') in ('applied', 'partial', 'unknown'):  # 结果未知也可能写了文件
                     counts['applications_written'] = counts.get('applications_written', 0) + 1
                 started[payload.get('application_id')] = payload.get('status') == 'started'
         # 协调回合跟随它协调的目标：目标是验收运行，它也算验收运行。
@@ -833,6 +833,9 @@ class App:
         if data is not None and kind in p.PROJECT_OPERATIONS:
             # 远端写回的参数只能由 controller 按任务记录填写（§13.10），通用端点不接受客户端给的路径或哈希。
             raise ValueError('project operations are requested through the project endpoints')
+        if data is not None and kind == 'log_tail':
+            # 原始输出按任务取：POST /jobs/{id}/logs 核对 attempt 属于该任务、流名与大小上限（§13.6）。
+            raise ValueError('log_tail is requested through POST /jobs/{job_id}/logs')
         return response(self._new_operation(node, kind, params, identity), 201)
 
     def _new_operation(self, node, kind, params, identity):
@@ -2932,11 +2935,11 @@ def backup(data_dir, dest, clock=time.time):
     return manifest
 
 
-def revoke_execution(store, generation, clock):
+def revoke_execution(store, generation, clock, void_unclaimed=False):
     """把恢复代次推进到 generation 并撤销此前签发的全部执行权。调用方负责事务。
 
     之后：所有 attempt 的租约令牌作废，进行中的 attempt 记为失联；未结束的任务停在待对账；协调租约因代次不同而失效；
-    派单暂停；每个节点下次心跳被要求对账，带旧代次的心跳、检查点、完成与发布请求以 stale_generation 被拒绝。
+    派单暂停；每个节点下次心跳被要求对账（心跳照常返回 reconcile_required 与 revoked），对账前的领取与旧代次的检查点、完成、发布以 stale_generation 被拒绝。
     节点凭据、客户端凭据、管理令牌与已结束任务的历史不受影响。
     """
     meta = store.get('meta', 'controller')
@@ -2957,7 +2960,9 @@ def revoke_execution(store, generation, clock):
             job = d.transition(job, clock(), status='cancel_requested' if job['cancel']['requested_at'] else 'waiting_reconcile', status_reason='stale_generation')
             store.put('job', job['job_id'], job)
             store.event('job.updated', job, d.timestamp(clock()), job_id=job['job_id'])
-    for op in store.all('node_op'):
+    # 屏障（void_unclaimed）作废还没被领取的操作。恢复不这样做：备份里 requested 的写回可能在备份之后
+    # 已被节点执行，记成“失败、没写”就与目录不符；保持 requested，节点之后的上报或 recover 照常对账。
+    for op in store.all('node_op') if void_unclaimed else ():
         if op['status'] != 'requested':
             continue  # 已领取的操作节点可能正在执行：结果照常对账（远端写回保持待确认，用 recover 处理）
         # 还没被领取的操作作废：屏障之后它们不会再下发，节点晚到的领取得到终态拒绝。
@@ -2999,7 +3004,7 @@ def barrier(data_dir, request_id, reason, clock=time.time):
                     raise ValueError('barrier requires dispatch to be paused and intake to be closed or restricted first')
                 before = meta['authority_generation']
                 active = sum(a['status'] in p.ATTEMPT_ACTIVE for a in store.all('attempt'))
-                meta = revoke_execution(store, before + 1, clock)
+                meta = revoke_execution(store, before + 1, clock, void_unclaimed=True)
                 record = {'request_id': request_id, 'reason': reason.strip(), 'at': d.timestamp(clock()),
                           'generation_before': before, 'authority_generation': meta['authority_generation'], 'revoked_active_attempts': active}
                 store.put('barrier', request_id, record)

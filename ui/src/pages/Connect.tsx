@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { invoke } from '../transport'
 import { short } from '../ui'
 import { BuildMark, LocalService, Wizard } from './Wizard'
@@ -31,8 +31,19 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
     setBusy(true); setErr(null)
     try { await f() } catch (e) { setErr(bridgeText(e)) } finally { setBusy(false) }
   }
+  // 连接流程的代次：这里打开已有连接、配对新连接、向导打开本机连接，谁后开始谁有效。先开始的流程在每次等待之后
+  // 核对代次，已被取代就停下，不再调用 connection_open 或 onOpen，不会把用户刚选的连接换回去。
+  const flow = useRef(0)
+  const begin = () => ++flow.current
+  const current = (g: number) => g === flow.current
+  const openFor = async (g: number, c: any) => {
+    if (!current(g)) return
+    const opened = await invoke('connection_open', { id: c.id })
+    if (current(g)) await onOpen(opened, c)
+  }
+  useEffect(() => () => { flow.current++ }, [])
   // 等身份确认（GET /client）完成再解除 busy：期间再点一次会换掉连接代次，先发的确认随后失败会把新连接关掉。
-  const open = (c: any) => run(async () => { await onOpen(await invoke('connection_open', { id: c.id }), c) })
+  const open = (c: any) => { const g = begin(); return run(() => openFor(g, c)) }
   return <main className="connect">
     <h1>Agent Collab</h1>
     {err && <p className="err" role="alert">{err}</p>}
@@ -60,9 +71,10 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
           </td>
         </tr>)}</tbody></table>
     </section>}
-    {guide && <Wizard info={info} onOpen={onOpen} onConnect={() => setGuide(false)} />}
+    {guide && <Wizard info={info} begin={begin} openFor={openFor} onConnect={() => { begin(); setGuide(false) }} />}
     {guide === false && <form className="card" onSubmit={e => {
       e.preventDefault()
+      const g = begin()
       void run(async () => {
         const c = await invoke('connection_pair', { url: url.trim(), code: code.trim(), name: name.trim(), custom_ca: customCa })
         // 取消选取 CA 证书：没有配对，配对码也没有消耗。
@@ -70,7 +82,7 @@ export function Connect({ reason, onOpen }: { reason: string | null; onOpen: (op
         setCode('')
         // 配对码已用掉：先刷新列表，接下来打开失败时这条连接仍在列表里可以重试。
         await reload()
-        await onOpen(await invoke('connection_open', { id: c.id }), c)
+        await openFor(g, c)
       })
     }}>
       <header><h2>配对新的 controller</h2></header>

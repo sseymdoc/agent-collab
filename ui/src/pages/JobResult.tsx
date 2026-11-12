@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { bridge, isDesktop } from '../transport'
 import { Capped, Section, bytes, errText, short, when } from '../ui'
 import { ApplyBadge } from './ProjectDetail'
@@ -131,14 +131,19 @@ export function Unfinished() {
   const [list, setList] = useState<any[]>([])
   const [reports, setReports] = useState<any[]>([])
   const [failed, setFailed] = useState<string | null>(null)
-  const load = () => bridge('result_unfinished').then(r => { setFailed(null); setList(r.unfinished ?? []); setReports(r.unreported ?? []) },
-    e => setFailed(errText(e)))
+  // 查询可能并发（挂载时一次、应用结束后又一次）：只采用最新一次的应答，卸载后的应答都丢弃。
+  const gen = useRef(0)
+  const load = () => {
+    const g = ++gen.current
+    return bridge('result_unfinished').then(r => { if (g !== gen.current) return; setFailed(null); setList(r.unfinished ?? []); setReports(r.unreported ?? []) },
+      e => { if (g === gen.current) setFailed(errText(e)) })
+  }
   useEffect(() => {
     if (!isDesktop) return
     void load()
     const again = () => void load()
     window.addEventListener(UNFINISHED_CHANGED, again)
-    return () => window.removeEventListener(UNFINISHED_CHANGED, again)
+    return () => { window.removeEventListener(UNFINISHED_CHANGED, again); gen.current++ }
   }, [])
   // 本机已有结果、等 controller 确认的应用：属于这条连接的在查询时已按原 request_id 补报（reported 为补报后的状态）。
   const waiting = reports.filter(r => !r.reported)

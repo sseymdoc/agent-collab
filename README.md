@@ -48,7 +48,7 @@
 | `agent_collab/artifacts.py` | 快照、物化、回写 |
 | `agent_collab/backup.py` | 互斥原子的本地定时备份与实例外拉取 |
 | `agent_collab/installer.py`、`installer/` | 安装、升级、回退、卸载与服务模板 |
-| `agent_collab/project.py`、`project_cli.py`、`node_projects.py` | 项目：本机扫描与基线、应用与取消、远端节点写回 |
+| `agent_collab/project.py`、`agent_collab/project_cli.py`、`agent_collab/node_projects.py` | 项目：本机扫描与基线、应用与取消、远端节点写回 |
 | `agent_collab/credstore.py` | CLI 与自动化客户端的凭据后端（系统凭据存储等） |
 | `desktop/` | Tauri 桌面端外壳（Rust）与随包本机助手 |
 | `ui/` | React + TypeScript 控制台源码，构建到 `agent_collab/static/` |
@@ -107,7 +107,7 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
 | controller（Linux） | systemd system unit，独立低权限用户，只监听 loopback |
 | worker（Linux/WSL） | systemd 用户单元（建议开启 linger） |
 | worker（macOS） | LaunchAgent（模型登录在钥匙串中，需要图形登录会话） |
-| worker（Windows） | 当前用户登录触发的计划任务（pythonw，5 分钟重复触发以拉起退出的进程） |
+| worker（Windows） | 当前用户登录触发的计划任务（pythonw，每分钟重复触发以拉起退出的进程） |
 
 在 controller 所在主机上升级时，先对控制服务做一次本地一致备份；只装 worker 的主机升级时不备份远端 controller。升级后核对新进程确实来自新版本目录并已成功心跳，否则自动回到旧版本。回退前会重新检查旧版本能否支持当前数据库 schema，不支持时拒绝回退，并保留指针、记录与备份，由运维核对后处理。完整参数、回退与卸载见 [docs/install.md](docs/install.md)，日常运维见 [docs/operations.md](docs/operations.md)。
 
@@ -128,7 +128,7 @@ cd ui && npm ci && node build.mjs   # 产物写入 agent_collab/static/
 
 ## 验证情况（0.1.0rc6 / rc7）
 
-- **自动化测试**：Windows（Python 3.15）、WSL（3.14）、macOS（系统 3.9.6）全量运行无失败。部分用例按平台条件跳过（如仅适用于 POSIX、或需要 Node 的用例），例如公开候选在 Windows 上 393 项中 382 项通过、11 项跳过。测试含本机多进程 HTTP 端到端场景（崩溃承接、分区下旧 epoch 迟到发布被拒）。CI 覆盖 Ubuntu（3.9、3.13）、Windows、macOS。
+- **自动化测试**：Windows（Python 3.15）、WSL（3.14）、macOS（系统 3.9.6）全量运行无失败。部分用例按平台条件跳过（如仅适用于 POSIX、或需要 Node 的用例），跳过的数量见各 PR 的验证说明。测试含本机多进程 HTTP 端到端场景（崩溃承接、分区下旧 epoch 迟到发布被拒）。CI 覆盖 Ubuntu（3.9、3.13）、Windows、macOS。
 - **真实环境演练**（云主机控制服务 + 两台物理主机上的三个常驻节点）：
   - 两个方向的完整续作：一侧节点失效 → 另一侧从检查点接管 → Claude 判定 rework → Codex 修复 → 节点执行检查 → Claude accept，验收绑定执行证据；
   - 源机不可达时工件照常保存、回写待处理，恢复后按基线回写，人工改动判冲突不覆盖；

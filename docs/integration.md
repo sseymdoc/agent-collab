@@ -50,7 +50,7 @@ agent-collab submit --template codex-change-accept \
 - `--dry-run` 只输出将提交的契约和解析后的模型，不创建任务。
 - `--project <项目 ID>` 在项目里提交：用项目的默认值与它最近登记的输入，见下文“项目”。
 
-成功时输出 `{"http_status": 201, "body": {...}, "request_id": "..."}`，任务标识是 `body.job_id`。提交现成的契约文件用 `agent-collab submit 任务.json`。
+不带 `--wait` 时，成功输出 `{"http_status": 201, "body": {...}, "request_id": "..."}`，任务标识是 `body.job_id`；带 `--wait` 时等任务有结论后输出等待摘要（与 `job wait` 相同，含 `job_id`、`outcome` 等，不含 `request_id`）。提交现成的契约文件用 `agent-collab submit 任务.json`。
 
 ### 提交没有得到答复时
 
@@ -108,7 +108,7 @@ agent-collab project push <项目 ID>                 # 扫描、上传缺的内
 agent-collab submit --project <项目 ID> --template codex-change --goal "<目标>" --wait
 agent-collab project plan <job_id>                  # 成果相对本机目录的变更与冲突；不写入
 agent-collab project apply <job_id> [--skip-conflicts]
-agent-collab project recover [<application_id>] [--resume | --rollback | --abandon]
+agent-collab project recover [<application_id>] [--resume | --rollback | --abandon | --report]   # --report：本机已写完、上报没得到答复时按原 request_id 补报
 ```
 
 - 默认值的优先级：任务上的 `--model`、`--effort` > 项目默认值 > 工作区默认值。草拟之后项目默认值或工作区设置变了，提交被拒绝（`version_mismatch`），重新运行即可。

@@ -268,7 +268,7 @@ stdout 是一个 JSON 对象，退出码 0 表示其中所述状态已被证实�
 | `service start` | 恢复自启动并启动。worker 以 status.json 中来自当前版本目录、时间不早于本次请求的成功心跳判定就绪；controller 以本机无认证的 `/healthz` 有应答判定就绪；成功才把所选组件 desired 记为 running，否则返回非零。已在运行时重复执行不会产生第二个实例 |
 
 `start`、`stop` 可加 `--component controller|worker`，缺省作用于全部组件；status 也可按组件查询。
-start/stop 的 JSON 输出含完整 desired 映射，任一步失败不更新保存的 desired，实际服务可能已经部分启停，需用 status 核对。
+start/stop 成功时 JSON 输出含完整 desired 映射；任一步失败时输出的是保存的记录值（没有 desired 的旧安装可能为空），且不更新保存的 desired，实际服务可能已经部分启停，需用 status 核对。
 `installation.json` 顶层 desired 只含本安装组件；新安装全部为 running。
 它表示用户希望服务运行还是停用，不等同于进程当前是否健康；只有成功的 service stop/start 改变它。
 

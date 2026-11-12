@@ -14,7 +14,7 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 from agent_collab import cli, node_agent, node_projects, project, project_cli, protocol as p
-from agent_collab.controller import App, barrier
+from agent_collab.controller import App, backup, barrier, restore
 from agent_collab.node_agent import Agent, pair
 from fake_controller import no_auth
 from helpers import ControllerCase, contract, uid
@@ -346,6 +346,23 @@ class RemoteTimeoutTests(RemoteCase):
         self.assertEqual((done['status'], done['detail'].get('rolled_back'), done['detail']['operation_id'], tree(self.folder)),
                          ('failed', True, rollback['op_id'], INPUTS))
 
+    def test_restore_does_not_void_a_write_back_the_node_ran_after_the_backup(self):
+        self.bind()
+        job = self.published()
+        started = self.apply(job)  # 备份时操作还是 requested
+        self.app.close()
+        backup(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        self.app = App(self.temp / 'data', clock=self.clock)
+        done = self.settled(started)  # 备份之后节点领取并写完
+        self.assertEqual((done['status'], tree(self.folder)), ('applied', OUTPUTS))
+        self.app.close()
+        restore(self.temp / 'data', self.temp / 'backup', clock=self.clock)
+        self.app = App(self.temp / 'data', clock=self.clock)
+        self.assertEqual(self.application(started)['status'], 'started')  # 恢复不把它记成“失败、没写”
+        # 节点再次拿到这项操作：不重新执行，按本机日志补报当时的结果。
+        again = self.settled(started)
+        self.assertEqual((again['status'], tree(self.folder)), ('applied', OUTPUTS))
+
     def test_unsettled_application_blocks_retirement_counts_as_activity_and_unreceived_ones_end_at_the_barrier(self):
         self.bind()
         job = self.published()
@@ -530,10 +547,11 @@ class LocalReportTests(unittest.TestCase):
     def test_server_errors_keep_the_receipt_and_explicit_refusals_end_it(self):
         with mock.patch.dict('os.environ', {}), mock.patch.object(cli, 'client_home', return_value=Path(self.id_dir())):
             record = project_cli.queue_report(type('C', (), {'controller_id': 'c', 'url': 'u'})(), uid(), uid(), {'status': 'applied'})
-            answers = iter([(503, {}), (409, {})])
+            answers = iter([(503, {}), (302, {}), (409, {})])
             conn = type('C', (), {'controller_id': 'c', 'url': 'u', 'send': lambda self, *a: next(answers)})()
-            self.assertIsNone(project_cli.send_report(conn, record))
-            self.assertTrue(project_cli.report_path(record['application_id']).is_file())
+            for _ in range(2):  # 5xx 与 3xx 都保留回执
+                self.assertIsNone(project_cli.send_report(conn, record))
+                self.assertTrue(project_cli.report_path(record['application_id']).is_file())
             self.assertEqual(project_cli.send_report(conn, record), 'not_recorded (HTTP 409)')
             self.assertFalse(project_cli.report_path(record['application_id']).exists())
 

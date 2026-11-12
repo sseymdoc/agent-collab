@@ -141,13 +141,24 @@ class BarrierTests(CutoverCase):
         before = self.call('GET', '/overview')['controller']['authority_generation']
         data = self.temp / 'data'
 
-        # 前置条件不满足时拒绝：没有暂停派单、没有关闭普通提交。
+        # 前置条件逐项检查：没暂停派单、提交闸门仍为 open，任一项不满足都拒绝。
         self.app.close()
         with self.assertRaises(ValueError):
             barrier(data, uid(), '切换', clock=self.clock)
         self.app = App(data, clock=self.clock)
         self.pause()
+        self.app.close()
+        with self.assertRaises(ValueError):  # 已暂停、闸门仍为 open
+            barrier(data, uid(), '切换', clock=self.clock)
+        self.app = App(data, clock=self.clock)
+        self.call('POST', '/dispatch', {'request_id': uid(), 'paused': False,
+                                        'expected_version': self.call('GET', '/overview')['controller']['metadata_version']})
         self.set_intake('closed', reason='切换')
+        self.app.close()
+        with self.assertRaises(ValueError):  # 闸门已关、没暂停派单
+            barrier(data, uid(), '切换', clock=self.clock)
+        self.app = App(data, clock=self.clock)
+        self.pause()
         self.app.close()
         request_id = uid()
         done = barrier(data, request_id, '切换到新版本', clock=self.clock)

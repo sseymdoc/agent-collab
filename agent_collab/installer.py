@@ -378,9 +378,12 @@ def worker_python(python, exists=None):
 
 def login_name():
     # 容器里的 uid 可能没有 passwd 条目（getuser 在 3.9 抛 KeyError、3.13 起抛 OSError）；loginctl 也接受 uid。
+    # Windows 上 getuser 读 USERNAME 等环境变量，都没有时（3.9 抛 ImportError）没有 uid 可退：明确报错。
     try:
         return getpass.getuser()
-    except (KeyError, OSError):
+    except (KeyError, OSError, ImportError):
+        if os.name == 'nt':
+            raise ValueError('cannot determine the current Windows user name (USERNAME is not set)') from None
         return str(os.getuid())
 
 
@@ -554,7 +557,13 @@ class Services:
                 if self.system == 'Windows':
                     result = run(['schtasks', '/Query', '/TN', service_name(self.config, kind), '/XML'], check=False)
                     if result.returncode:
-                        owners[kind] = 'none'
+                        # “不存在”与查询出错的退出码相同、文字随系统语言变化：列出全部任务确认确实没有它，否则算无法确认。
+                        listed = run(['schtasks', '/Query', '/FO', 'CSV', '/NH'], check=False)
+                        name = '"\\' + service_name(self.config, kind).lower() + '"'
+                        absent = listed.returncode == 0 and not any(line.lower().startswith(name) for line in listed.stdout.splitlines())
+                        if not absent and strict:
+                            raise ValueError('cannot verify scheduled task ' + service_name(self.config, kind))
+                        owners[kind] = 'none' if absent else 'unknown'
                         continue
                     description = ET.fromstring(result.stdout).find('.//{*}Description')
                     owned = description is not None and description.text == 'agent-collab prefix: ' + str(self.prefix)
@@ -1107,7 +1116,8 @@ def read_runtime(source):
                 add(name, 'file', mode, path.read_bytes())
             else:
                 raise ValueError('unsupported runtime file type')
-        inventory = [[name, len(content), hashlib.sha256(content).hexdigest()]
+        # 种类与权限位也参与 ID：同名同内容、但链接/目录或可执行位不同的两棵树不能共用一个已安装的运行时。
+        inventory = [[name, kind, mode, len(content), hashlib.sha256(content).hexdigest()]
                      for name, (kind, mode, content) in sorted(entries.items())]
         digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
     else:
@@ -1734,7 +1744,8 @@ def main(argv=None):
         if checking:
             if old:
                 config['service'] = old['config']['service']
-            report = doctor(config, offline=args.no_service)
+            # 有意停用的组件不算不健康：与服务管理命令用同一份期望状态。
+            report = doctor(config, offline=args.no_service, desired=old.get('desired') if old else None)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report['ok'] else 1
         if sum(bool(v) for v in (args.rollback, args.uninstall, args.drain)) > 1:

@@ -540,7 +540,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
  "requested_by", "requested_at", "received_at", "finished_at", "deadline_at", "result", "error"}
 ```
 
-- `POST /nodes/{id}/operations`（devices）`{"request_id", "kind", "params"?}` → 201 op。`GET /nodes/{id}/operations`（read）列出最近 50 项（不带 `result`），`GET /operations/{op_id}`（read）读取单项。写 `node.operation` 事件。
+- `POST /nodes/{id}/operations`（devices）`{"request_id", "kind", "params"?}` → 201 op。这里只接受 `probe`；`log_tail` 经 `POST /jobs/{id}/logs`，三种项目操作经项目端点，在这里返回 400。`GET /nodes/{id}/operations`（read）列出最近 50 项（不带 `result`），`GET /operations/{op_id}`（read）读取单项。写 `node.operation` 事件。
 - 节点在心跳响应的 `operations` 里领取状态为 `requested` 的操作，`POST /nodes/{id}/operations/{op_id}`（节点凭据）上报 `received`，执行后上报 `succeeded` 或 `failed`（带 `result` 或 `error`，结果 ≤768 KiB）。超过 `node_operation_timeout_s`（缺省 120 秒；远端项目写回的三种操作用 `project_operation_timeout_s`，见 §13.10）没有完成记 `timed_out`，不重发；结果已定后的上报不改变它（远端写回的对账例外，见 §13.10）。不认识 `operations` 的旧节点不会领取，操作到期后记 `timed_out`。记录在完成一天后清除。
 - `probe`：节点在自己的服务进程上下文里重新运行官方 CLI 的登录状态探测与模型目录探测（不调用模型），返回 `{"at", "auth": {"codex": {"status", "reason", "command", "disabled"}, "claude": {...}}, "harness", "catalog": {"codex": {"status", "reason", "provider", "models"}}, "context": {"user", "pid", "ssh", "tty", "launchd_label", "windows_session", "systemd_unit", "version", "version_dir", "platform"}}`。用户在节点本机按官方方式登录后，用它确认后台服务读得到凭据；探测之后节点刷新并重新上报认证状态与目录。
 - 远程提供的节点管理是暂停与恢复接单（`POST /nodes/{id}/drain`）、排空并迁移、维护状态、退役与上述操作，它们都不中断节点与 controller 之间的连接。停止或启动整个节点服务不经 controller 下发：服务停下后心跳通道随之断开，无法再经它启动；这两个动作在节点本机进行（`agent-collab service stop|start`，或该设备上桌面端的本机服务面板）。
@@ -550,7 +550,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - 产品事件（`GET /events`、`GET /jobs/{id}/events`）：controller 记录的状态变化与节点上报的进度，不是 CLI 的完整输出。
 - 检查摘要（attempt 的 `report.checks`）：每项检查的退出码与标准输出、标准错误的尾部，各 ≤4 KiB。
 - 原始输出：harness 与检查进程的完整标准输出与标准错误，只保存在执行节点的 attempt 目录里。
-- `POST /jobs/{id}/logs`（read）`{"request_id", "attempt_id", "stream"?, "offset"?, "max_bytes"?}` → 201 op（`kind: log_tail`），客户端随后读取 `GET /operations/{op_id}`。`attempt_id` 必须属于该任务；`stream` 为 `index`（缺省，列出可取的输出）、`harness.stdout`、`harness.stderr`、`check.<n>.stdout|stderr`、`step.<n>.stdout|stderr`（n 为 0–99）；`max_bytes` 为 1–262144。节点只按 attempt 目录的固定布局取这些文件，没有按路径读取的接口。结果为 `{"retained", "streams": [{"stream", "bytes"}], "stream", "offset", "next_offset", "total_bytes", "eof", "data"}`：`retained: false` 表示该节点上已没有这个 attempt 的本地文件；`data` 是经节点脱敏的文本，按 `next_offset` 继续读取下一块。
+- `POST /jobs/{id}/logs`（read）`{"request_id", "attempt_id", "stream"?, "offset"?, "max_bytes"?}` → 201 op（`kind: log_tail`），客户端随后读取 `GET /operations/{op_id}`。`attempt_id` 必须属于该任务；`stream` 为 `index`（缺省，列出可取的输出）、`harness.stdout`、`harness.stderr`、`check.<n>.stdout|stderr`、`step.<n>.stdout|stderr`（n 为 0–99）；`max_bytes` 为 1–262144。节点只按 attempt 目录的固定布局取这些文件，没有按路径读取的接口。`stream` 为 `index` 时结果为 `{"retained", "streams": [{"stream", "bytes"}]}`（取不存在的流另带 `missing: true`）；取具体的流时结果为 `{"retained", "streams", "stream", "offset", "next_offset", "total_bytes", "eof", "data"}`：`retained: false` 表示该节点上已没有这个 attempt 的本地文件；`data` 是经节点脱敏的文本，按 `next_offset` 继续读取下一块。
 
 **13.7 协调设置**（`coordination_settings` 能力）
 
@@ -566,11 +566,11 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - 提交闸门：`POST /intake`（maintain）`{"request_id", "expected_version", "mode": "open|acceptance|closed", "reason"?}` → meta；`expected_version` 是 `GET /overview` 的 `controller.metadata_version`，`mode` 不是 `open` 时必须给原因。`GET /overview` 带 `intake: {"mode", "reason", "by", "at"}`。写 `controller.intake` 事件。
   - `closed`：`POST /jobs` 对任何凭据（含管理令牌）返回 409 `intake_closed`。读取、对已有任务的操作、节点上报与 controller 自己创建的协调回合和修复不受影响。
-  - `acceptance`：只接受验收运行，即请求带 `acceptance_run: true`、提交者具备 `maintain` 权限、不带 `project_id` 也不是项目任务的修订（`work_package_id` 指向属于项目的根）、契约没有回写目标节点、`recovery.side_effects` 为 `none`；不满足形状的返回 400，没带标记的返回 409 `intake_closed`。
+  - `acceptance`：只接受验收运行，即请求带 `acceptance_run: true`、提交者具备 `maintain` 权限、不属于项目（既不带 `project_id`，`work_package_id` 也不指向属于项目的根：项目任务的修订同样被拒绝）、契约没有回写目标节点、`recovery.side_effects` 为 `none`；不满足形状的返回 400，没带标记的返回 409 `intake_closed`。
   - 任意模式下都可以提交验收运行；job 带 `acceptance_run`，`GET /jobs?acceptance_run=1` 列出它们。
 - 备份清单（`backup-manifest.json`）带 `event_seq`：快照里最后一条事件的序号。
-- `GET /activity?after=<seq>`（read）→ `{"after", "last_seq", "jobs": [{"job_id", "title", "acceptance_run", "coordinates", "project_id"}], "ordinary_jobs", "acceptance_jobs", "counts", "disposable"}`：序号大于 `after` 的事件里受理的任务与各类事实的数量（确认的检查点、发布、验收、下载、基线、项目、节点写回 `integrated`、已写入的应用 `applications_written`、其间开始且仍没有最终结果的应用 `applications_unsettled` 等）。协调回合随它协调的任务归类。`disposable` 为 true 表示其间没有普通任务，也没有任何写回、已写入或结果未定的应用。
-- 切换屏障：`agent-collab controller barrier --data-dir D --request-id <UUID> --reason R`，在已停止的 controller 上运行。要求派单已暂停、提交闸门不是 `open`。它把恢复代次加一并撤销此前签发的全部执行权（与 `restore` 相同的处理，但数据不回退）：attempt 的租约令牌作废、进行中的 attempt 记为失联、未结束的任务停在 `waiting_reconcile`（`stale_generation`）、协调租约失效、节点下次心跳被要求对账；尚未被节点领取（`requested`）的管理操作记 `failed`（`error: stale_generation`），对应的远端写回记 `failed`（`reason: stale_generation`，`written` 为空）；已领取的照常对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果。普通的停止再启动保留恢复代次、租约与协调租约。
+- `GET /activity?after=<seq>`（read）→ `{"after", "last_seq", "jobs": [{"job_id", "title", "acceptance_run", "coordinates", "project_id"}], "ordinary_jobs", "acceptance_jobs", "counts", "disposable"}`：序号大于 `after` 的事件里受理的任务与各类事实的数量（确认的检查点、发布、验收、下载、基线、项目、节点写回 `integrated`、已写入或结果未知的应用 `applications_written`、其间开始且仍没有最终结果的应用 `applications_unsettled` 等）。协调回合随它协调的任务归类。`disposable` 为 true 表示其间没有普通任务，也没有任何写回、已写入或结果未定的应用。
+- 切换屏障：`agent-collab controller barrier --data-dir D --request-id <UUID> --reason R`，在已停止的 controller 上运行。要求派单已暂停、提交闸门不是 `open`。它把恢复代次加一并撤销此前签发的全部执行权（与 `restore` 相同的处理，但数据不回退）：attempt 的租约令牌作废、进行中的 attempt 记为失联、未结束的任务停在 `waiting_reconcile`（`stale_generation`）、协调租约失效、节点下次心跳被要求对账；尚未被节点领取（`requested`）的管理操作记 `failed`（`error: stale_generation`；只有屏障这样做，从备份恢复不作废它们，因为备份之后节点可能已经执行过）；其中未领取的 `project_apply` 对应的远端写回记 `failed`（`reason: stale_generation`，`written` 为空），未领取的 `project_recover` 不改变应用记录（仍为 `started`，可以再次 recover）；已领取的照常对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果。普通的停止再启动保留恢复代次、租约与协调租约。
 
 **13.10 远端项目写回**（`remote_apply` 能力）
 
@@ -585,6 +585,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - `POST /projects/{id}/applications/{application_id}/recover` `{"request_id", "action": "status|resume|rollback|abandon"}` → 201 op（`kind: project_recover`）。只用于远端写回、且记录仍为 `started`，否则 409。`status` 以外的动作在这次应用的 `project_apply` 或另一个非 status 的 `project_recover` 仍为 `requested` 或 `received` 时返回 409（`details.operation_id` 是那项操作）；受理后应用记录带 `recovery_operation_id`，此后只认这项操作的结果，超时后晚到的原应用结果不再结束记录。
   - 校验：任务属于该项目且有已发布检查点（409）；节点在册（404）、未退役（409 `node_retired`）、声明了该项目的绑定（409 `not_bound`）；项目未归档（写回，409 `project_archived`）。
   - 操作参数全部由 controller 按任务记录填写：`project_id`、`job_id`、`checkpoint_id` 与 `manifest_sha256`（已发布检查点）、`base_manifest_sha256`（任务的输入基线，可为 null）、`exclude`（契约的 `workspace.exclude`）；写回另有 `application_id`、`skip_conflicts`，恢复另有 `application_id`、`action`。通用的 `POST /nodes/{id}/operations` 不接受这三种操作（400）。远端写回的结果只由目标节点上报：经 `POST /projects/{id}/applications/{application_id}` 上报远端写回返回 403。
+- 已上报过结果的 `project_apply` 或 `project_recover` 又被下发（controller 没有它的结果，例如从备份恢复回到了领取之前）时，节点不重新执行，确认领取后按本机应用日志补报当时的结果。
 - 节点执行：只在绑定目录上调用 `agent_collab/project.py` 的 plan、apply、recover（§13.4 的规则：三方比较、冲突缺省不写、`skip_conflicts` 时部分写入、逐文件备份与日志、中断后续写、回滚或按现状结束）；应用日志与备份在节点数据目录的 `projects/` 里。manifest 与成果内容用节点令牌经 `GET /blobs/<sha256>` 取得并核对哈希（节点令牌此前就可读 blob，没有新增权限）。节点同一时间只执行一项这类操作。
 - 结果：
   - `project_plan`：`result` 为计划（`changes`、`summary`、`base_manifest_sha256`、`manifest_sha256`、`root_name`），没有 `root`。过长时截断：冲突排在前面保留，带 `truncated` 与原条数 `counts`。
@@ -597,7 +598,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - 已上报 `received` 但到期没有结果：操作 `timed_out`，应用保持 `started`（结果待确认），不当作失败。节点之后上报的结果仍更新应用记录（这是对账，不是重复执行）；操作状态仍为 `timed_out`，另带 `reported_status`、`reported_late_at` 与结果。应用待确认期间这项操作不被清除，对账之后再保留一天。
   - 节点离线时不会有任何一项显示为成功。
 - 不重复执行：节点在确认领取之前把操作落盘到 `<节点数据目录>/operations/<op_id>.json`，开始执行之前记为 `running`。进程重启后见到 `running` 的操作不再执行：写回类按本机应用日志补报能确定的结果（没有日志说明一个文件都没写，应用记 `failed`、`reason: interrupted_before_write`；日志已有最终结果就补报它；日志停在写入中就报告操作失败，应用保持 `started`）。结果上报失败时留在本地，之后补报；见过的 `op_id` 不再处理。管理请求超时、客户端重试与节点重启都不会让同一次写回写第二次。
-- 已知限制：节点退役后不能再上报，已开始而没有结果的远端写回会一直停在 `started`（退役检查不包含它）。节点重启后第一次注册不带绑定，紧接着的那次注册带上，其间指向该节点的请求得到 `not_bound`。
+- 已知限制：节点重启后第一次注册不带绑定，紧接着的那次注册带上，其间指向该节点的请求得到 `not_bound`。
 
 ## 14. 不在 v1 承诺范围
 

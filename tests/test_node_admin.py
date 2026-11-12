@@ -103,7 +103,9 @@ class RetirementTests(NodeAdminCase):
     def test_retirement_waits_for_work_and_dependants_to_be_settled(self):
         self.app.config.update(copy.deepcopy(tc.CONFIG))  # 协调 profile 的节点列表里有 mac
         worker = self.node('worker')
-        job = self.job(contract(coordination={'policy': 'none'}, harness_params={'steps': [{'sleep': 60}]}))
+        # 不自动恢复：节点失联后任务停在待对账，而不是接管到别的节点。
+        job = self.job(contract(coordination={'policy': 'none'}, recovery={'auto': False, 'side_effects': 'none'},
+                                harness_params={'steps': [{'sleep': 60}]}))
         assignment = worker.claim()
         self.node('mac', capabilities=tc.CAPS)
         blocked = self.retire('worker', status=409)['error']
@@ -114,11 +116,9 @@ class RetirementTests(NodeAdminCase):
         # 节点失联、任务停在待对账：仍不能退役，先把任务处理掉。
         self.clock.advance(self.app.config['lease_ttl_s'] + 1)
         self.app.tick()
-        stuck = self.current(job)
-        self.assertEqual(stuck['status'], 'waiting_reconcile' if stuck['status'] == 'waiting_reconcile' else stuck['status'])
-        if stuck['status'] in ('waiting_reconcile', 'recovering', 'cancel_requested'):
-            self.assertEqual(self.retire('worker', status=409)['error']['details']['blockers'], {'unsettled_jobs': [job['job_id']]})
-            self.mutate(job, 'cancel')
+        self.assertEqual(self.current(job)['status'], 'waiting_reconcile')
+        self.assertEqual(self.retire('worker', status=409)['error']['details']['blockers'], {'unsettled_jobs': [job['job_id']]})
+        self.mutate(job, 'cancel')
         self.assertTrue(self.retire('worker')['retired_at'])
 
     def test_retired_node_keeps_history_and_leaves_scheduling_catalogs_and_statistics(self):
@@ -234,6 +234,8 @@ class OperationTests(NodeAdminCase):
             self.call('POST', path, dict(bad, request_id=uid(), attempt_id=assignment['attempt_id']), status=400)
         self.call('POST', '/nodes/n/operations', {'request_id': uid(), 'kind': 'log_tail', 'params': {'attempt_id': uid()}},
                   token=viewer, status=403)  # 直接对节点下发操作需要 devices
+        # 有 devices 权限也不行：原始输出只能经按任务绑定的接口取，绕不过 attempt 归属与流名、大小的检查。
+        self.call('POST', '/nodes/n/operations', {'request_id': uid(), 'kind': 'log_tail', 'params': {'attempt_id': uid()}}, status=400)
 
 
 class CoordinationSettingsTests(NodeAdminCase):
@@ -395,12 +397,18 @@ class AgentOperationTests(ControllerCase):
             joined = ''.join(part['data'] for part in parts)
             self.assertEqual((parts[0]['next_offset'], parts[1]['eof']), (cut, True))
             self.assertNotIn(token, joined)
-            for piece in (token[:8], token[-8:]):
-                self.assertNotIn(piece, joined, cut)
+            for start in range(len(token) - 7):  # 凭据的任何连续 8 字节都不出现
+                self.assertNotIn(token[start:start + 8], joined, cut)
             self.assertTrue(joined.startswith('before ') and joined.endswith(' after\n'), (cut, joined))
         self.assertEqual(self.agent.log_tail({'attempt_id': uid()}), {'retained': False, 'streams': []})
         # 固定布局之外的文件、符号链接都不在可取范围里。
         (attempt_dir / 'lease.copy').write_text('secret', encoding='utf-8')
+        linked = attempt_dir / 'step-1'
+        linked.mkdir()
+        try:  # 布局合法、但文件是指向别处的链接：不算可取的输出（Windows 普通用户可能不能建链接）
+            (linked / 'stdout.jsonl').symlink_to(self.directory / 'agent.json')
+        except OSError:
+            linked.rmdir()
         self.assertEqual(set(log_streams(attempt_dir)), {'harness.stdout', 'step.0.stdout', 'step.0.stderr'})
 
 

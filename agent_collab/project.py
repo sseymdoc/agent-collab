@@ -31,7 +31,12 @@ PROJECT_EXCLUDES = DEFAULT_EXCLUDES + [
     '.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx', 'id_rsa', 'id_ed25519', '.netrc', '.npmrc', '.pypirc', '*.token',
     'Thumbs.db']
 # 应用成果时始终不写的路径，不论任务契约的排除规则：版本库元数据里有会被执行的钩子与配置。
-PROTECTED = ['.git/**', '.hg/**', '.svn/**']
+# 任何一级目录名都算（子模块也有自己的 .git），不分大小写（Windows 与 macOS 的文件系统缺省不区分）。
+PROTECTED = ('.git', '.hg', '.svn')
+
+
+def protected(*paths):
+    return any(part.lower() in PROTECTED for path in paths if path for part in path.split('/'))
 CHUNK = 1024 * 1024
 REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT：Windows 的目录联接、符号链接与其他重解析点
 
@@ -256,6 +261,9 @@ def local_path(root, name, locations=None, must_exist=False):
     p.check_rel_path(name)
     root = Path(root)
     mapped = (locations or {}).get(name)
+    if mapped is not None:
+        # 映射来自保存的快照或命令行：与 manifest 路径同样校验结构，不能逃出 root（映射记的是磁盘上的真实名字，可以不是 NFC）。
+        p.check_rel_path(unicodedata.normalize('NFC', mapped))
     parts, current = (mapped or name).split('/'), root
     nfc = lambda value: unicodedata.normalize('NFC', value)
     for index, part in enumerate(parts):
@@ -364,14 +372,14 @@ def plan(root, base_manifest, result_manifest, exclude=None, locations=None):
     root = resolve_root(root)
     base = p.validate_manifest(base_manifest or {'version': 1, 'base': None, 'files': [], 'deleted': []})
     result = p.validate_manifest(result_manifest)
-    patterns = validate_excludes(list(DEFAULT_EXCLUDES if exclude is None else exclude) + PROTECTED)
+    patterns = validate_excludes(list(DEFAULT_EXCLUDES if exclude is None else exclude))
     before, after = {f['path']: f for f in base['files']}, {f['path']: f for f in result['files']}
     diff = p.manifest_diff(base, result)
     changes = []
     for action, names in (('add', diff['added']), ('modify', diff['modified']), ('delete', diff['deleted'])):
         for name in names:
-            if workspace_excluded(name, patterns):
-                continue  # 被排除的路径不属于任务的输入输出范围：既不写也不删
+            if workspace_excluded(name, patterns) or protected(name, (locations or {}).get(name)):
+                continue  # 被排除的路径不属于任务的输入输出范围：既不写也不删；版本库元数据始终不写
             change = {'path': name, 'action': action, 'size': after[name]['size'] if name in after else 0}
             try:
                 state, digest = _state(local_path(root, name, locations), before.get(name), after.get(name))
@@ -419,7 +427,7 @@ def unfinished(state_dir, root=None):
             continue
         try:
             status = json.loads((_journal_dir(state_dir, entry['application_id']) / 'journal.json').read_text(encoding='utf-8'))['status']
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, TypeError):
             status = 'writing'
         if status != 'writing':
             # 日志已有最终结果、只是标记当时没删掉：不算未完成，不挡住这个目录的下一次应用。
@@ -428,7 +436,7 @@ def unfinished(state_dir, root=None):
             except OSError:
                 pass
             continue
-        if root is None or entry['root'] == str(resolve_root(root)):
+        if root is None or entry.get('root') == str(resolve_root(root)):
             found.append(entry)
     return found
 
@@ -440,6 +448,9 @@ def _write_one(root, change, after, fetch, journal, backup, locations):
     current = file_hash(path) if path.is_file() else None
     if current != change.get('expect'):
         return 'changed_since_plan'
+    # 先记下“开始写这个文件”：恢复时只把有这条记录（或有备份）的文件当作可能由本次应用写过，
+    # 不会把之后才出现的同内容文件当成本次新建的而在回滚时删掉。
+    _log(journal, {'path': name, 'started': True})
     if current is not None:
         saved = backup / name
         saved.parent.mkdir(parents=True, exist_ok=True)
@@ -452,11 +463,40 @@ def _write_one(root, change, after, fetch, journal, backup, locations):
         if len(data) != entry['size'] or p.sha256_bytes(data) != entry['sha256']:
             raise ProjectError('blob_mismatch', '成果内容的哈希不符：%s' % name, path=name)
         atomic_write(path, data, 0o755 if entry['executable'] else 0o644)
+    _log(journal, {'path': name, 'action': change['action']})
+    return None
+
+
+def _log(journal, entry):
     with open(str(journal / 'done.log'), 'a', encoding='utf-8') as log:
-        log.write(json.dumps({'path': name, 'action': change['action']}, ensure_ascii=False) + '\n')
+        log.write(json.dumps(entry, ensure_ascii=False) + '\n')
         log.flush()
         os.fsync(log.fileno())
-    return None
+
+
+def _read_log(journal):
+    """逐文件日志：返回 (已写完的路径, 开始写过的路径)。追加写到一半被打断的最后一行不算数，并从文件里去掉，
+    之后的追加不会接在残行后面；中间的行损坏说明日志不可信，报错而不是猜。"""
+    path = journal / 'done.log'
+    try:
+        lines = path.read_bytes().split(b'\n')
+    except FileNotFoundError:
+        return set(), set()
+    done, started, good = set(), set(), []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line.decode('utf-8'))
+            name = entry['path']
+        except (ValueError, KeyError, TypeError):
+            if index == len(lines) - 1:
+                atomic_write(path, b''.join(item + b'\n' for item in good))
+                break
+            raise ProjectError('journal_corrupt', '应用日志中间有损坏的记录，不能据它判断写到了哪里：%s' % path) from None
+        good.append(line)
+        (started if entry.get('started') else done).add(name)
+    return done, started
 
 
 def apply(root, base_manifest, result_manifest, fetch, state_dir, application_id, exclude=None, locations=None,
@@ -509,6 +549,13 @@ def apply(root, base_manifest, result_manifest, fetch, state_dir, application_id
         raise ProjectError('cancelled', '已取消，没有写入任何文件')
     if before_write:
         before_write(outline)
+    # 先独占地占住这个目录（O_EXCL），再建日志：两次同时开始的应用只有一次能继续，另一次按“有未完成的应用”拒绝。
+    marker = _root_marker(state_dir, root)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        raise ProjectError('unfinished_application', '这个目录上有另一次应用正在进行或没有完成，先用 recover 查看并处理它') from None
     journal = _journal_dir(state_dir, application_id)
     backup = journal / 'backup'
     backup.mkdir(parents=True, exist_ok=False)
@@ -578,16 +625,13 @@ def recover(state_dir, application_id, action='status', fetch=None, progress=Non
         raise ProjectError('no_application', '本机没有这次应用操作的记录：%s' % application_id) from None
     root, backup, locations = Path(record['root']), journal / 'backup', record.get('locations')
     files, written, remaining, diverged = record['files'], [], [], []
-    try:
-        with open(str(journal / 'done.log'), encoding='utf-8') as log:
-            logged = {json.loads(line)['path'] for line in log if line.strip()}
-    except FileNotFoundError:
-        logged = set()
+    logged, started = _read_log(journal)
     for change in record['changes']:
         name, entry = change['path'], files.get(change['path'])
         try:
             path = local_path(root, name, locations)
             current = file_hash(path) if path.is_file() else None
+            present = os.path.lexists(str(path))  # 删除要求路径确实不在：被重建成目录不算删掉了
             mode = None if current is None or os.name == 'nt' else bool(os.stat(str(path)).st_mode & 0o111)
         except (ProjectError, OSError):
             diverged.append(name)
@@ -595,12 +639,12 @@ def recover(state_dir, application_id, action='status', fetch=None, progress=Non
         if entry and change['action'] != 'delete':
             at_target = current == entry['sha256'] and (mode is None or mode == entry['executable'])
         else:
-            at_target = current is None
+            at_target = not present
         # 内容与成果一致不等于已写入（只改可执行位时成果与输入的哈希相同）：以逐文件日志为准。没有日志、
         # 但已是成果内容的，只在写入确实开始过（有备份，或这是新建文件）时算已写入，即写完到记日志之间被打断。
         if name in logged:
             (written if at_target else diverged).append(name)
-        elif at_target and (change['action'] == 'add' or (backup / name).is_file()):
+        elif at_target and (name in started or (backup / name).is_file()):
             written.append(name)
         elif current == change.get('expect'):
             remaining.append(name)
@@ -614,10 +658,13 @@ def recover(state_dir, application_id, action='status', fetch=None, progress=Non
     if action == 'resume':
         if fetch is None:
             raise ProjectError('invalid', 'resume 需要成果内容')
-        todo = [c for c in record['changes'] if c['path'] in remaining]
+        # 续写不经过 plan：旧版本留下的日志里可能有版本库元数据的路径，这里同样不写，记为冲突。
+        blocked = [c['path'] for c in record['changes'] if c['path'] in remaining and protected(c['path'], (locations or {}).get(c['path']))]
+        todo = [c for c in record['changes'] if c['path'] in remaining and c['path'] not in blocked]
         after = {name: entry for name, entry in files.items() if entry}
         result = {'application_id': application_id, 'root': str(root), 'status': None, 'changed': list(written), 'pending': [],
-                  'already': [], 'conflicts': [{'path': name, 'reason': 'changed_since_plan'} for name in diverged] + record.get('conflicts', []),
+                  'already': [], 'conflicts': [{'path': name, 'reason': 'changed_since_plan'} for name in diverged] + record.get('conflicts', [])
+                  + [{'path': name, 'reason': 'protected_path'} for name in blocked],
                   'errors': [], 'backup': str(backup)}
         if not marker.exists():
             _save(marker, {'application_id': application_id, 'root': str(root), 'started_at': record['started_at'], 'journal': str(journal)})
@@ -630,11 +677,17 @@ def recover(state_dir, application_id, action='status', fetch=None, progress=Non
                 continue
             path, saved = local_path(root, name, locations), backup / name
             try:
+                # 紧挨着还原再核对一次：开头核对之后用户又改了它，就保留现状，不用备份覆盖。
+                entry = files.get(name)
+                target = entry['sha256'] if entry and change['action'] != 'delete' else None
+                if (file_hash(path) if path.is_file() else None) != target:
+                    kept.append(name)
+                    continue
                 if saved.is_file():
                     atomic_write(path, saved.read_bytes(), stat.S_IMODE(os.lstat(str(saved)).st_mode) if os.name != 'nt' else 0o644)
-                elif change['action'] == 'add':
+                elif change['action'] == 'add' and (name in logged or name in started):
                     if path.is_file():
-                        path.unlink()  # 这次应用新建的文件
+                        path.unlink()  # 这次应用新建的文件（日志证明是它写的）
                 else:
                     kept.append(name)  # 没有备份就无法还原，不删除原有文件
                     continue

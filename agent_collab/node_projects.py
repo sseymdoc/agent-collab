@@ -160,29 +160,43 @@ class ProjectOps:
                 record = dict(record, state='finished', outcome=self.interrupted(record))
                 self.save(record)
             self.records[record['op_id']] = record
+        # 上一个进程执行到一半退出时留下的成果暂存目录：这时没有在执行的操作，全部清掉。
+        for stage in self.folder.glob('*.blobs'):
+            shutil.rmtree(str(stage), ignore_errors=True)
 
     def save(self, record):
         atomic_write(self.folder / (record['op_id'] + '.json'), p.canonical_json(record))
         self.records[record['op_id']] = record
 
     def offer(self, op_id, kind, params):
-        """心跳下发的操作：先在本地落盘再确认领取。见过的 op_id（含已执行、已放弃的）不再处理。"""
-        if op_id not in self.records:
+        """心跳下发的操作：先在本地落盘再确认领取。见过的 op_id（含已执行、已放弃的）绝不再执行。
+
+        例外是已上报过的写回与恢复又被下发：controller 没有它的结果（例如从备份恢复回到了领取之前）。
+        这时不重新执行，确认领取后按本机应用日志补报当时的结果。"""
+        record = self.records.get(op_id)
+        if record is None:
             self.save({'op_id': op_id, 'kind': kind, 'params': params, 'state': 'claimed', 'outcome': None, 'at': time.time()})
+        elif record['state'] == 'reported' and record['kind'] in ('project_apply', 'project_recover'):
+            self.save(dict(record, state='replay'))
 
     def pump(self):
         """确认领取、按顺序启动执行、补报结果。网络失败向上抛出，下次心跳重来；本地状态不变。"""
         path = '/nodes/%s/operations/' % self.agent.config['node_id']
         for record in sorted(self.records.values(), key=lambda r: r.get('at', 0)):
-            if record['state'] == 'claimed':
+            if record['state'] in ('claimed', 'replay'):
                 try:
                     ack = self.agent.client.json('POST', path + record['op_id'], {'status': 'received'})
                 except APIError as exc:
                     if exc.status not in (400, 404, 409):
                         raise
                     ack = None
+                received = (ack or {}).get('status') == 'received'
+                if record['state'] == 'replay':
+                    # 已经执行过：不再执行，补报本机日志里的结果。
+                    self.save(dict(record, state='finished', outcome=self.interrupted(record)) if received else dict(record, state='reported'))
+                    continue
                 # 只有 controller 确认“已领取”才执行；已到期（timed_out）或不存在的放弃，绝不再执行（§13.10）。
-                self.save(dict(record, state='queued' if (ack or {}).get('status') == 'received' else 'abandoned'))
+                self.save(dict(record, state='queued' if received else 'abandoned'))
         if not (self.thread and self.thread.is_alive()):
             queued = sorted((r for r in self.records.values() if r['state'] == 'queued'), key=lambda r: r.get('at', 0))
             if queued:

@@ -388,7 +388,18 @@ def _client_command(argv):
                     revoked = request(a.url, body['client_token'], 'DELETE', '/client', None, a.ca_file, body['controller_id'])[0] == 200
                     raise SystemExit('凭据没能写入系统凭据存储（%s）；%s' % (exc, '已在 controller 上撤销它' if revoked else
                                      '撤销它也没有成功，请在另一客户端撤销客户端 ' + body['client_id'])) from None
-            secret.save(json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'))
+            try:
+                secret.save(json.dumps(saved, ensure_ascii=False, indent=2).encode('utf-8'))
+            except OSError as exc:
+                # profile 没写成：系统存储里的凭据没人找得到，删掉它并在 controller 上撤销，不留下无人保管的有效凭据。
+                if a.credential_store == 'system':
+                    try:
+                        credstore.delete(credential_account(saved))
+                    except credstore.StoreError:
+                        pass
+                revoked = request(a.url, body['client_token'], 'DELETE', '/client', None, a.ca_file, body['controller_id'])[0] == 200
+                raise SystemExit('profile 没能保存（%s）；%s' % (exc, '已在 controller 上撤销这份凭据' if revoked else
+                                 '撤销它也没有成功，请在另一客户端撤销客户端 ' + body['client_id'])) from None
         # 输出存放位置，不输出凭据值。
         out(dict({k: saved[k] for k in ('client_id', 'name', 'kind', 'scopes', 'controller_id', 'url')},
                  profile=a.profile, credential_store=a.credential_store, credential_location=place, credential_file=str(path)))

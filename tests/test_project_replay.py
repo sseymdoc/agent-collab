@@ -115,7 +115,8 @@ class ProjectReplay(test_project_e2e.ProjectE2E):
         self.assertEqual({name: (folder / name).stat().st_mtime_ns for name in written}, written)
         self.assertEqual(self.run_cli('project', 'recover')[1]['unreported'], [])
         done_log = self.tmp / 'cli-home' / 'projects' / 'applies' / application_id / 'done.log'
-        self.assertEqual(len(done_log.read_text(encoding='utf-8').splitlines()), 2)  # 每个文件只写了一次
+        entries = [json.loads(line) for line in done_log.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(len([e for e in entries if not e.get('started')]), 2)  # 每个文件只写了一次
 
     def test_report_that_never_arrived_is_recorded_on_the_retry(self):
         """controller 根本没收到结果（不可达）：记录停在 started，补报时才第一次记下。"""

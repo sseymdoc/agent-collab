@@ -193,8 +193,8 @@ class ScanTests(Case):
         self.assertIsNone(plain['git'])  # 普通文件夹
         env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
         subprocess.run(['git', 'init', '-q', '-b', 'trunk', str(self.root)], check=True, env=env, capture_output=True)
-        with patch('subprocess.run', wraps=subprocess.run) as run:
-            result = project.scan(self.root)
+        with patch('subprocess.run', wraps=subprocess.run) as run, patch.dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull):
+            result = project.scan(self.root)  # 不读调用者的 Git 配置（例如 status.showUntrackedFiles=no）
         self.assertEqual((result['git']['available'], result['git']['branch'], result['git']['uncommitted']), (True, 'trunk', 1))
         # 桌面端的助手没有控制台：每次 git 查询都要带 CREATE_NO_WINDOW，否则 Windows 上各闪一个窗口。
         git_calls = [c for c in run.call_args_list if 'git' in Path(c[0][0][0]).name.lower()]
@@ -389,11 +389,55 @@ class ApplyTests(ApplyCase):
         self.assertEqual(project.unfinished(self.state), [])  # 有了明确结果，不算中断
 
 
+class SafetyTests(ApplyCase):
+    def test_mapped_locations_cannot_leave_the_root(self):
+        for mapped in ('../outside.txt', '/etc/passwd', 'C:/Windows/win.ini', 'a/../../x'):
+            with self.assertRaises(ValueError, msg=mapped):
+                project.local_path(self.root, 'a.txt', {'a.txt': mapped})
+
+    def test_only_one_application_at_a_time_claims_a_directory(self):
+        marker = project._root_marker(self.state, project.resolve_root(self.root))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('', encoding='utf-8')  # 另一次应用刚占住目录、还没写进内容
+        with self.assertRaises(project.ProjectError) as caught:
+            self.apply(self.result({'a.txt': 'a1'}))
+        self.assertEqual((caught.exception.code, (self.root / 'a.txt').read_text()), ('unfinished_application', 'a0'))
+
+    def test_rollback_keeps_a_file_edited_after_the_status_check(self):
+        real, calls = project._write_one, []
+
+        def crash(root, change, *rest):
+            if calls:
+                raise KeyboardInterrupt()
+            calls.append(change['path'])
+            return real(root, change, *rest)
+        application = str(uuid.uuid4())
+        with patch.object(project, '_write_one', side_effect=crash), self.assertRaises(KeyboardInterrupt):
+            project.apply(self.root, self.base, self.result({'a.txt': 'a1', 'b.txt': 'b1'}), self.fetch, self.state, application, exclude=[])
+        real_hash = project.file_hash
+
+        def edited_meanwhile(path):
+            value = real_hash(path)
+            if Path(path).name == 'a.txt':
+                edited_meanwhile.calls += 1
+                if edited_meanwhile.calls == 2:  # 第一次是开头的现状核对，第二次是还原前的复核：用户恰在两者之间改了它
+                    write(self.root, {'a.txt': 'edited during rollback'})
+                    value = real_hash(path)
+            return value
+        edited_meanwhile.calls = 0
+        with patch.object(project, 'file_hash', side_effect=edited_meanwhile):
+            rolled = project.recover(self.state, application, 'rollback')
+        self.assertEqual((rolled['restored'], rolled['kept'], (self.root / 'a.txt').read_text()), ([], ['a.txt'], 'edited during rollback'))
+
+
 class ProtectedPathTests(ApplyCase):
     def test_results_never_write_version_control_metadata_whatever_the_contract_excludes(self):
-        result = self.result({'.git/hooks/pre-commit': 'echo owned', 'a.txt': 'a1'})
+        result = self.result({'.GIT/hooks/pre-commit': 'echo owned', 'sub/.Hg/hgrc': 'x', 'mod/.git/config': 'x', 'a.txt': 'a1'})
         outline = project.plan(self.root, self.base, result, exclude=[])
-        self.assertEqual([c['path'] for c in outline['changes']], ['a.txt'])
+        self.assertEqual([c['path'] for c in outline['changes']], ['a.txt'])  # 任何一级、不分大小写
+        # 映射到版本库目录的路径同样不写。
+        mapped = project.plan(self.root, self.base, self.result({'b.txt': 'b1'}), exclude=[], locations={'b.txt': '.git/b.txt'})
+        self.assertEqual(mapped['changes'], [])
         self.assertEqual(self.apply(result)['status'], 'applied')
         self.assertFalse((self.root / '.git').exists())
 
@@ -419,7 +463,8 @@ class CancelTests(ApplyCase):
         self.assertEqual(((self.root / 'a.txt').read_text(), (self.root / 'b.txt').read_text()), ('a1', 'b0'))  # 第二个文件未动
         # 第一个文件可追踪：日志记了它，备份里是原内容；这次应用已有最终结果，目录可以开始下一次应用。
         journal = Path(self.state) / 'applies' / application
-        self.assertEqual([json.loads(line)['path'] for line in (journal / 'done.log').read_text().splitlines()], ['a.txt'])
+        finished = [json.loads(line) for line in (journal / 'done.log').read_text().splitlines()]
+        self.assertEqual([e['path'] for e in finished if not e.get('started')], ['a.txt'])  # 只有写完的那一个
         self.assertEqual((journal / 'backup' / 'a.txt').read_text(), 'a0')
         self.assertEqual(json.loads((journal / 'journal.json').read_text())['status'], 'partial')
         self.assertEqual(project.unfinished(self.state), [])
@@ -551,6 +596,66 @@ class InterruptionTests(ApplyCase):
         rolled = project.recover(self.state, application, 'rollback')
         self.assertEqual((rolled['status'], rolled['restored'], rolled['kept']), ('rolled_back', ['a.txt'], []))
         self.assertEqual(((self.root / 'a.txt').read_text(), (self.root / 'b.txt').read_text()), ('a0', 'b0'))
+        self.assertEqual([os.stat(str(self.root / n)).st_mode & 0o111 for n in ('a.txt', 'b.txt')], [0, 0])  # 权限位也没被改
+
+    def test_truncated_last_log_line_is_dropped_and_a_corrupt_middle_line_is_refused(self):
+        result, application = self.interrupted()
+        log = project._journal_dir(self.state, application) / 'done.log'
+        log.write_bytes(log.read_bytes() + b'{"path": "b.t')  # 追加写到一半被打断
+        self.assertEqual(project.recover(self.state, application)['written'], ['a.txt'])
+        self.assertTrue(log.read_bytes().endswith(b'\n'))  # 残行已去掉，之后的追加不会接在它后面
+        log.write_bytes(b'not json\n' + log.read_bytes())
+        with self.assertRaises(project.ProjectError) as caught:
+            project.recover(self.state, application)
+        self.assertEqual(caught.exception.code, 'journal_corrupt')
+
+    def test_resume_of_an_old_journal_never_writes_version_control_metadata(self):
+        result, application = self.interrupted()
+        journal = project._journal_dir(self.state, application)
+        record = json.loads((journal / 'journal.json').read_text(encoding='utf-8'))
+        data = b'echo owned'
+        self.blobs[p.sha256_bytes(data)] = data
+        hook = {'path': '.git/hooks/pre-commit', 'sha256': p.sha256_bytes(data), 'size': len(data), 'executable': True}
+        record['changes'].append({'path': hook['path'], 'action': 'add', 'size': len(data), 'state': 'clean', 'expect': None})
+        record['files'][hook['path']] = hook  # 旧版本写下的日志：计划里有版本库元数据
+        (journal / 'journal.json').write_text(json.dumps(record), encoding='utf-8')
+        resumed = project.recover(self.state, application, 'resume', fetch=self.fetch)
+        self.assertIn({'path': '.git/hooks/pre-commit', 'reason': 'protected_path'}, resumed['conflicts'])
+        self.assertFalse((self.root / '.git').exists())
+
+    def test_delete_recreated_as_a_directory_is_not_reported_as_done(self):
+        result = self.result({'a.txt': 'a1', 'old.txt': None})
+        real, calls = project._write_one, []
+
+        def crash(root, change, *rest):
+            if calls:
+                raise KeyboardInterrupt()
+            calls.append(change['path'])
+            return real(root, change, *rest)
+        application = str(uuid.uuid4())
+        with patch.object(project, '_write_one', side_effect=crash), self.assertRaises(KeyboardInterrupt):
+            project.apply(self.root, self.base, result, self.fetch, self.state, application, exclude=[])
+        (self.root / 'old.txt').unlink()
+        (self.root / 'old.txt').mkdir()
+        self.assertEqual(project.recover(self.state, application)['diverged'], ['old.txt'])
+
+    def test_same_content_file_that_appeared_without_a_write_record_is_not_deleted(self):
+        result = self.result({'a.txt': 'a1', 'new.txt': 'n'})
+        real, calls = project._write_one, []
+
+        def crash(root, change, *rest):
+            if calls:
+                raise KeyboardInterrupt()
+            calls.append(change['path'])
+            return real(root, change, *rest)
+        application = str(uuid.uuid4())
+        with patch.object(project, '_write_one', side_effect=crash), self.assertRaises(KeyboardInterrupt):
+            project.apply(self.root, self.base, result, self.fetch, self.state, application, exclude=[])
+        write(self.root, {'new.txt': 'n'})  # 用户自己建了内容相同的文件；本次应用没开始写它
+        status = project.recover(self.state, application)
+        self.assertNotIn('new.txt', status['written'])
+        project.recover(self.state, application, 'rollback')
+        self.assertEqual((self.root / 'new.txt').read_text(), 'n')
 
     def test_written_file_without_backup_is_kept_not_deleted_on_rollback(self):
         result, application = self.interrupted()

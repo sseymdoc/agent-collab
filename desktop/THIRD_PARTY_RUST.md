@@ -2,7 +2,7 @@
 
 由 `desktop/src-tauri/Cargo.lock` 经 `cargo metadata --filter-platform` 生成，列出进入各目标构建的 crate（含间接依赖）与 Cargo.toml 里声明的许可证。目标：Windows x64、macOS arm64。共 324 个。
 
-MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上对应版本；分发安装包时随附本清单与各 crate 的许可证文本。
+MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上对应版本。目前的开发候选安装包没有随附本清单与各 crate 的许可证文本；正式分发之前要把它们放进安装包（见 `docs/release-checklist.md`）。
 
 | crate | 版本 | 许可证 | 目标 |
 | --- | --- | --- | --- |

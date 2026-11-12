@@ -202,8 +202,8 @@ def send_report(conn, record):
                                  {'request_id': record['request_id'], 'status': record['status'], 'detail': record['detail']})
     except cli.Unreachable:
         return None
-    if status in (401, 403) or status >= 500:
-        return None  # 授权问题或服务端暂时故障：之后用同一份回执补报，不改用别的身份
+    if not (200 <= status < 300 or 400 <= status < 500) or status in (401, 403):
+        return None  # 授权问题、重定向或服务端暂时故障：之后用同一份回执补报，不改用别的身份；只有成功或明确拒绝才结束回执
     report_path(record['application_id']).unlink()
     if 200 <= status < 300:
         return body['status']
@@ -305,6 +305,11 @@ def _apply(a, conn):
 
 
 def _recover(a, conn):
+    if a.application:
+        try:
+            p.check_uuid(a.application, 'application_id')
+        except ValueError as exc:
+            cli.fail('invalid', str(exc), 2)
     pending = local.unfinished(state_dir())
     if not a.application:
         # unfinished：写入中途中断、还没有本机结果的；unreported：本机已有结果、还没得到 controller 确认的。
@@ -344,9 +349,8 @@ def _recover(a, conn):
 OP_DONE = ('succeeded', 'failed', 'timed_out')
 
 
-def wait_operation(conn, op_id, timeout):
-    """轮询管理操作直到有结果或到期；controller 暂时不可达时重试。返回最后一次读到的记录。"""
-    deadline = time.monotonic() + timeout
+def wait_operation(conn, op_id, deadline):
+    """轮询管理操作直到有结果或到期（deadline 是整条命令的截止时刻）；controller 暂时不可达时重试。返回最后一次读到的记录。"""
     while True:
         op = cli.retrying(deadline, lambda: conn.call('GET', '/operations/' + op_id))
         if op['status'] in OP_DONE or time.monotonic() >= deadline:
@@ -367,7 +371,7 @@ def _remote(a, conn):
     project_id, deadline = job['project_id'], time.monotonic() + a.timeout
     if a.action == 'plan':
         body = {'request_id': str(uuid.uuid4()), 'job_id': job['job_id'], 'node_id': a.node}
-        op = wait_operation(conn, cli.retrying(deadline, lambda: conn.call('POST', '/projects/%s/plans' % project_id, body))['op_id'], a.timeout)
+        op = wait_operation(conn, cli.retrying(deadline, lambda: conn.call('POST', '/projects/%s/plans' % project_id, body))['op_id'], deadline)
         if op['status'] == 'succeeded':
             cli.out(dict(op['result'], job_id=job['job_id'], checkpoint_id=op['params']['checkpoint_id'], node_id=a.node, op_id=op['op_id']))
             return 0
@@ -381,7 +385,7 @@ def _remote(a, conn):
             'checkpoint_id': job['delivery_checkpoint_id'], 'node_id': a.node,
             'expected_base_manifest_sha256': job['inputs_manifest_sha256'], 'skip_conflicts': a.skip_conflicts}
     record = cli.retrying(deadline, lambda: conn.call('POST', '/projects/%s/applications' % project_id, body))
-    return _remote_outcome(conn, record, wait_operation(conn, record['operation_id'], a.timeout))
+    return _remote_outcome(conn, record, wait_operation(conn, record['operation_id'], deadline))
 
 
 def _remote_outcome(conn, record, op, report=None):
@@ -422,7 +426,7 @@ def _remote_recover(a, conn):
     action = 'resume' if a.resume else 'rollback' if a.rollback else 'abandon' if a.abandon else 'status'
     deadline, body = time.monotonic() + a.timeout, {'request_id': str(uuid.uuid4()), 'action': action}
     op = cli.retrying(deadline, lambda: conn.call('POST', '/projects/%s/applications/%s/recover' % (record['project_id'], a.application), body))
-    op = wait_operation(conn, op['op_id'], a.timeout)
+    op = wait_operation(conn, op['op_id'], deadline)
     if op['status'] == 'failed' and not (op.get('result') or {}).get('application'):
         cli.fail((op['error'] or 'failed').split(':', 1)[0], '节点没能处理：%s' % op['error'], 2)
     report = (op.get('result') or {}).get('report')

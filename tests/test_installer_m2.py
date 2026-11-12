@@ -72,8 +72,8 @@ class InstallerM2Tests(unittest.TestCase):
             self.calls.append(argv)
             if argv[0] == 'whoami':
                 text = '"user","S-1-5-21-1-2-3-4"'
-            elif '/Query' in argv:
-                return subprocess.CompletedProcess(argv, 1, '', '')
+            elif '/Query' in argv:  # 按名字查询失败、列出全部任务成功且其中没有它：确实不存在
+                return subprocess.CompletedProcess(argv, 1 if '/TN' in argv else 0, '', '')
             elif 'is-enabled' in argv:
                 text = autostart
             elif 'print-disabled' in argv:
@@ -250,13 +250,28 @@ class InstallerM2Tests(unittest.TestCase):
             self.assertFalse(list((self.prefix / 'runtime').glob('*')))
             self.assertIsNone(ins.current_version(self.prefix))
 
-    def test_runtime_invalid_probe_preserves_pointer_services_and_record(self):
+    def test_login_name_falls_back_to_the_uid_only_on_posix(self):
+        with patch.object(ins.getpass, 'getuser', side_effect=OSError('no passwd entry')):
+            with patch.object(ins.os, 'name', 'nt'):
+                with self.assertRaises(ValueError):
+                    ins.login_name()
+            if os.name != 'nt':
+                self.assertEqual(ins.login_name(), str(os.getuid()))
+
+    def test_scheduled_task_that_cannot_be_queried_is_not_treated_as_missing(self):
+        config, directory = self.installation('Windows')
+        with self.managers('Windows'), patch.object(ins, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'access denied')):
+            services = ins.Services(config, directory)
+            self.assertEqual(set(services.ownership().values()), {'unknown'})
+            with self.assertRaises(ValueError):
+                services.check_ownership()
+
+    def test_runtime_invalid_probe_preserves_pointer_and_record_offline(self):
         self.invoke(self.offline_args('--release', str(self.v1)))
         before = (self.prefix / 'installation.json').read_bytes()
         source = self.runtime_source('broken')
         (source / 'bin/python3').write_text('#!/bin/sh\nexit 1\n')
-        with patch.object(ins.Services, 'stop', side_effect=AssertionError('must not stop')):
-            self.invoke(self.offline_args('--release', str(self.v2), '--runtime', str(source)), 1)
+        self.invoke(self.offline_args('--release', str(self.v2), '--runtime', str(source)), 1)
         self.assertEqual((self.prefix / 'installation.json').read_bytes(), before)
         self.assertEqual(ins.current_version(self.prefix), '1.0.0')
         self.assertFalse(list((self.prefix / 'runtime').glob('*')))
@@ -481,13 +496,17 @@ class InstallerM2Tests(unittest.TestCase):
         inventory = []
         for path in sorted(source.rglob('*')):
             data = path.read_bytes() if path.is_file() else b''
-            inventory.append([path.relative_to(source).as_posix(), len(data), hashlib.sha256(data).hexdigest()])
+            kind = 'dir' if path.is_dir() else 'file'
+            inventory.append([path.relative_to(source).as_posix(), kind, path.lstat().st_mode & 0o777, len(data), hashlib.sha256(data).hexdigest()])
         self.assertEqual(first, hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()[:16])
         copied = self.temp / 'same-content'
         shutil.copytree(source, copied)
         self.assertEqual(ins.read_runtime(copied)[0], first)
+        (copied / 'marker').chmod(0o755)  # 内容不变、只改可执行位：ID 也变
+        moded = ins.read_runtime(copied)[0]
+        self.assertNotEqual(moded, first)
         (copied / 'marker').write_text('new content')
-        self.assertNotEqual(ins.read_runtime(copied)[0], first)
+        self.assertNotIn(ins.read_runtime(copied)[0], (first, moded))
         before = self.snapshot(self.temp)
         self.invoke(self.offline_args('--release', str(self.v1), '--runtime', str(source), '--dry-run'))
         self.assertFalse(self.prefix.exists())

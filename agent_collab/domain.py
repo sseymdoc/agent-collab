@@ -358,7 +358,7 @@ def validate_project_defaults(value):
     value = {} if value is None else value
     if not isinstance(value, dict) or set(value) - {'codex', 'exclude'}:
         raise ValueError('project defaults may only set codex and exclude')
-    codex = value.get('codex') or {}
+    codex = {} if value.get('codex') is None else value['codex']
     if not isinstance(codex, dict) or set(codex) - {'model', 'effort', 'unverified_nodes'}:
         raise ValueError('project codex defaults may only set model, effort and unverified_nodes')
     pair = _model_pair({'model': codex.get('model'), 'effort': codex.get('effort')}, 'project codex default')

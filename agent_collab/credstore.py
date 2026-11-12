@@ -142,7 +142,9 @@ def _linux_get(account):
 
 
 def _linux_delete(account):
-    _run([_secret_tool(), 'clear', 'service', SERVICE, 'account', account])
+    done = _run([_secret_tool(), 'clear', 'service', SERVICE, 'account', account])
+    if done.returncode:
+        raise StoreError('secret-tool clear failed: ' + (done.stderr or '').strip()[:200])
 
 
 # ---------------------------------------------------------------- 统一入口
@@ -186,8 +188,8 @@ def probe():
     配对码只能用一次，所以要在发出配对请求之前知道凭据有地方放。
     """
     account, value = 'probe/' + uuid.uuid4().hex, 'probe-' + uuid.uuid4().hex
-    store(account, value)
     try:
+        store(account, value)  # 在 try 里：写入后才失败的后端也要清掉探测条目
         if load(account) != value:
             raise StoreError('the system credential store did not return what was written')
     finally:

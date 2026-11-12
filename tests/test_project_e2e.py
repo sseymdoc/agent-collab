@@ -9,12 +9,12 @@ from pathlib import Path
 import unittest
 import uuid
 
+import test_cli_e2e
 import test_e2e_local as e2e
-from test_cli_e2e import CliE2E
 
 
 @unittest.skipUnless(e2e.sockets_ok(), 'loopback socket 不可用')
-class ProjectE2E(CliE2E):
+class ProjectE2E(test_cli_e2e.CliE2E):  # 经模块引用基类：不把基类放进本模块，免得被重复发现
     test_cli_and_another_client_share_tasks_state_settings_and_revocation = None  # 只借用夹具，不重跑基类的用例
 
     def files(self, root):

@@ -148,14 +148,12 @@ class CredentialBackendTests(unittest.TestCase):
 
 
 def system_store_usable():
-    if sys.platform == 'win32':
+    # 用与配对相同的写入、读回、删除探测：装了但当前会话不可写（SSH、没有解锁的钥匙环）时跳过，而不是失败。
+    try:
+        credstore.probe()
         return True
-    if sys.platform == 'darwin':
-        try:  # SSH 等非图形会话里钥匙串不可用
-            return subprocess.run([credstore.SECURITY, 'show-keychain-info'], capture_output=True, timeout=20).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-    return bool(shutil.which('secret-tool')) and bool(os.environ.get('DBUS_SESSION_BUS_ADDRESS'))
+    except credstore.StoreError:
+        return False
 
 
 @unittest.skipUnless(system_store_usable(), '当前会话没有可用的系统凭据存储')

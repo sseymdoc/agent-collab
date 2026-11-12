@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { invoke } from '../transport'
 import { Badge, Json, Section, errText, show } from '../ui'
 
@@ -54,8 +54,9 @@ function Discovery({ d, info }: { d: any; info: any }) {
   </>
 }
 
-// 本机部署与“作为节点加入”。onOpen 与连接页相同：打开连接并进入主界面。
-export function Wizard({ info, onOpen, onConnect }: { info: any; onOpen: (opened: any, c: any) => Promise<void>; onConnect: () => void }) {
+// 本机部署与“作为节点加入”。打开连接经连接页的 openFor：与连接页其他入口共用一个连接流程代次。
+// begin/openFor 来自连接页：领取连接流程的代次，之后由 openFor 在每次等待后核对，被别的流程取代就不再打开。
+export function Wizard({ info, begin, openFor, onConnect }: { info: any; begin: () => number; openFor: (g: number, c: any) => Promise<void>; onConnect: () => void }) {
   const [mode, setMode] = useState<'local' | 'worker' | null>(null)
   const [d, setD] = useState<any>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -65,9 +66,6 @@ export function Wizard({ info, onOpen, onConnect }: { info: any; onOpen: (opened
   const [url, setUrl] = useState('')
   const [code, setCode] = useState('')
   const [node, setNode] = useState('')
-  // 向导被离开（改为连接已有 controller、或从连接页打开了别的连接）后，安装照常完成，但不再自动打开本机连接。
-  const owned = useRef(true)
-  useEffect(() => { owned.current = true; return () => { owned.current = false } }, [])
   const discover = () => invoke('local_discover').then(setD, e => setErr(errText(e)))
   useEffect(() => { if (mode && !d) void discover() }, [mode]) // eslint-disable-line
   const run = async (label: string, f: () => Promise<void>) => {
@@ -75,14 +73,13 @@ export function Wizard({ info, onOpen, onConnect }: { info: any; onOpen: (opened
     try { await f() } catch (e: any) { setErr(errText(e)); if (typeof e?.output === 'string') setOut(e.output) } finally { setBusy(null); void discover() }
   }
   const setup = (args: Record<string, unknown>) => run('安装中，可能需要几分钟…', async () => {
+    // 开始时领取代次：安装期间改为连接已有 controller、或从连接页打开了别的连接，安装照常完成，但不再自动打开本机连接。
+    const g = args.role === 'all-in-one' ? begin() : 0
     const r = await invoke('local_setup', args)
     setOut(r.output ?? null)
     if (!r.ok) throw new Error('安装没有完成，安装器输出见下方')
     if (args.role === 'worker') setOk('这台机器已作为节点安装并加入 controller。它出现在该 controller 的“设备”页后，可在那里重新探测登录与模型目录。')
-    if (args.role === 'all-in-one' && owned.current) {
-      const c = await invoke('local_pair')
-      await onOpen(await invoke('connection_open', { id: c.id }), c)
-    }
+    if (args.role === 'all-in-one') await openFor(g, await invoke('local_pair'))
   })
   const has = installed(d?.install)
   const helper = d ? d.helper : info?.helper
@@ -99,16 +96,16 @@ export function Wizard({ info, onOpen, onConnect }: { info: any; onOpen: (opened
     {mode === 'local' && d && (has
       ? <p className="muted">已有安装时只报告现状，不提供替换它的选项。{/all-in-one|controller/.test(String(d.install?.role)) && '它包含 controller 时，可以把桌面端连接到它：'}
         {/all-in-one|controller/.test(String(d.install?.role)) && <button disabled={!!busy} onClick={() => void run('配对中…', async () => {
-          const c = await invoke('local_pair'); await onOpen(await invoke('connection_open', { id: c.id }), c) })}>连接本机 controller</button>}</p>
+          const g = begin(); await openFor(g, await invoke('local_pair')) })}>连接本机 controller</button>}</p>
       : <p className="actions"><button className="primary" disabled={!!busy || !helper} onClick={() => void setup({ role: 'all-in-one' })}>创建本机部署（controller + 节点）</button>
         <small className="muted">完成后自动把桌面端配对到本机 controller。</small></p>)}
     {mode === 'worker' && d && (has ? <p className="muted">这台机器已有安装，不会被替换；如需改为加入别的 controller，请先在命令行处理现有安装。</p>
-      : <form onSubmit={e => { e.preventDefault(); void setup({ role: 'worker', controller_url: url.trim(), pairing_code: code.trim(), ...(node.trim() ? { node_id: node.trim() } : {}) }) }}>
+      : <form onSubmit={e => { e.preventDefault(); void setup({ role: 'worker', controller_url: url.trim(), pairing_code: code.trim(), node_id: node.trim() }) }}>
         <p className="muted">节点配对码在已连接该 controller 的桌面端“设备 → 签发节点配对码”里取得（一次性，10 分钟内有效）。</p>
         <label>controller 地址<input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://controller.example.com:8443" required /></label>
         <label>节点配对码<input value={code} onChange={e => setCode(e.target.value)} autoComplete="off" required /></label>
-        <label>节点名（可选，需与签发配对码时的 node_id 一致）<input value={node} onChange={e => setNode(e.target.value)} pattern="[a-z0-9][a-z0-9-]{0,62}" /></label>
-        <button type="submit" className="primary" disabled={!!busy || !helper || !url.trim() || !code.trim()}>安装并加入</button>
+        <label>节点名（与签发配对码时填的 node_id 一致：配对码只对那个名字有效）<input value={node} onChange={e => setNode(e.target.value)} pattern="[a-z0-9][a-z0-9-]{0,62}" required /></label>
+        <button type="submit" className="primary" disabled={!!busy || !helper || !url.trim() || !code.trim() || !node.trim()}>安装并加入</button>
       </form>)}
     {busy && <p className="muted" role="status">{busy}</p>}
     {ok && <p className="ok">{ok}</p>}
