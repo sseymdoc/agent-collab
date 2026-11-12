@@ -161,8 +161,13 @@ class CliTests(unittest.TestCase):
         for grant in (['/grant', '*S-1-5-32-545:R'], ['/deny', '*S-1-1-0:W']):  # Users 显式授权、Everyone 显式拒绝
             subprocess.run([artifacts._system_tool('icacls.exe'), str(path)] + grant, capture_output=True, check=True)
         self.assertGreater(len(artifacts._principals(path)), 1)
-        artifacts.owner_only(path)
+        artifacts._current_user.cache_clear()  # 让 whoami 也经过下面的检查
+        with patch('subprocess.run', wraps=subprocess.run) as run:
+            artifacts.owner_only(path)
         self.assertEqual([n.casefold() for n in artifacts._principals(path)], [artifacts._current_user()[0].casefold()])
+        # 凭据文件可能由无控制台的 pythonw 服务或桌面端写入：whoami/icacls 缺 CREATE_NO_WINDOW 会各闪一个控制台窗口。
+        self.assertIn('/remove', [a for c in run.call_args_list for a in c[0][0]])
+        self.assertEqual({c[1].get('creationflags') for c in run.call_args_list}, {subprocess.CREATE_NO_WINDOW})
 
     @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
     def test_atomic_credential_write_leaves_only_the_current_user_on_windows(self):
@@ -228,10 +233,12 @@ class CliTests(unittest.TestCase):
         return path
 
     def profile(self):
+        # 与 client pair 相同的写法：文件后端的凭据文件只允许当前用户访问，读取前会核对。
+        from agent_collab import artifacts
         home = self.temp / 'home'
-        (home / 'clients').mkdir(parents=True)
-        (home / 'clients' / 'default.json').write_text(json.dumps({'url': 'https://paired.example', 'token': 'client-secret',
-                                                                    'controller_id': CONTROLLER, 'ca_file': None}), encoding='utf-8')
+        with artifacts.SecretFile(home / 'clients' / 'default.json') as secret:
+            secret.save(json.dumps({'url': 'https://paired.example', 'token': 'client-secret',
+                                    'controller_id': CONTROLLER, 'ca_file': None}).encode('utf-8'))
         return home
 
     def test_profile_credentials_are_only_sent_to_the_paired_address(self):
@@ -246,7 +253,7 @@ class CliTests(unittest.TestCase):
 
     def test_pair_restricts_the_credential_file_before_spending_the_code(self):
         home, clients = self.temp / 'pair-home', self.temp / 'pair-home' / 'clients'
-        argv = ['client', 'pair', '--url', 'https://paired.example', '--code', 'one-time']
+        argv = ['client', 'pair', '--url', 'https://paired.example', '--code', 'one-time', '--credential-store', 'file']
         with patch.dict(os.environ, {'AGENT_COLLAB_HOME': str(home)}):
             # 收紧失败：配对请求根本没有发出，配对码还能用，也不留下文件。
             with patch('agent_collab.artifacts.owner_only', side_effect=OSError('icacls failed')),                     patch.object(cli, 'request') as sent, self.assertRaises(SystemExit):
@@ -272,7 +279,9 @@ class CliTests(unittest.TestCase):
             self.assertEqual(saved.exists(), kept)
 
     def test_unauthorized_responses_exit_3_everywhere(self):
-        with patch.object(cli, 'request', return_value=(401, {})), redirect_stdout(io.StringIO()):
+        # 提交会在配置目录里留下请求回执：指到临时目录，不写进运行测试的用户的真实配置。
+        with patch.dict(os.environ, {'AGENT_COLLAB_HOME': str(self.temp / 'receipts-home')}), \
+                patch.object(cli, 'request', return_value=(401, {})), redirect_stdout(io.StringIO()):
             self.assertEqual(cli._client(['GET', '/overview', '--token-file', str(self.token())], False), 3)
             job_file = self.temp / 'job.json'
             job_file.write_text('{"contract": {}}', encoding='utf-8')

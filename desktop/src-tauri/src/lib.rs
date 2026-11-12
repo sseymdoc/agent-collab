@@ -1,18 +1,26 @@
 //! Agent Collab 桌面外壳。契约见 `docs/desktop.md`。
 //!
-//! 外壳只做四件事：保管客户端凭据、代发 controller 请求、转发事件流、把工件存到用户选定的位置。
-//! 凭据只存在于系统凭据存储和本进程内存里的 [`Token`]，不进入返回值、事件、日志和 `connections.json`。
+//! 外壳保管客户端凭据、代发 controller 请求、转发事件流、把工件存到用户选定的位置、发系统通知；
+//! 项目目录的读写（`projects`）与本机部署（`local`）交给随包的本机助手（`helper`）。
+//! 凭据只存在于系统凭据存储和本进程内存里的 [`Token`]，不进入返回值、事件、日志、`connections.json`，
+//! 也不进入助手的参数、环境与文件。
 
+mod dialog;
+mod helper;
+mod local;
+mod projects;
 mod sse;
+mod tls;
 mod validate;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::header::{HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,14 +38,15 @@ const IDLE: Duration = Duration::from_secs(60);
 /// 命令失败时返回给页面的 `{"code", "message"}`。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BridgeError {
-    code: &'static str,
+    /// 外壳自己的错误码都是固定的；本机助手返回的错误码原样透出，所以不是 `&'static str`。
+    code: Cow<'static, str>,
     message: String,
 }
 
 type Result<T> = std::result::Result<T, BridgeError>;
 
 fn err(code: &'static str, message: impl Into<String>) -> BridgeError {
-    BridgeError { code, message: message.into() }
+    BridgeError { code: Cow::Borrowed(code), message: message.into() }
 }
 
 fn invalid(message: impl Into<String>) -> BridgeError {
@@ -78,15 +87,26 @@ fn http_error(what: &str, status: StatusCode, body: &[u8]) -> BridgeError {
         .ok()
         .and_then(|v| v["error"]["message"].as_str().map(|m| format!("：{}", m.chars().take(300).collect::<String>())))
         .unwrap_or_default();
-    // 401/403：配对码无效或过期，或这条连接的凭据已被撤销；页面据此提示重新配对。
-    let code = if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+    // 401：配对码无效或过期，或这条连接的凭据已被撤销；页面据此提示重新配对。
+    // 403：凭据有效但没有这项操作的权限；连接与本机凭据都保留，不能当作认证失效处理。
+    let code = if status == StatusCode::UNAUTHORIZED {
         "unauthorized"
+    } else if status == StatusCode::FORBIDDEN {
+        "forbidden"
     } else if status.is_client_error() {
         "invalid"
     } else {
         "network"
     };
     err(code, format!("{what}（HTTP {}）{detail}", status.as_u16()))
+}
+
+fn helper_unavailable() -> BridgeError {
+    err("helper_unavailable", "本机助手不可用：安装包不完整，缺少随包的 Python 运行时或后台程序")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn storage_err(e: keyring::Error) -> BridgeError {
@@ -105,12 +125,13 @@ fn storage_err(e: keyring::Error) -> BridgeError {
 /// 客户端凭据。故意不实现 Debug / Serialize / Clone。
 struct Token(String);
 
-/// 当前连接：地址、绑定的 controller 与内存中的凭据。
+/// 当前连接：地址、绑定的 controller、内存中的凭据，以及按它的信任来源构造的 HTTP 客户端。
 struct Active {
     id: String,
     base: String,
     controller_id: String,
     token: Token,
+    http: tls::Http,
 }
 
 /// 连接代次与事件流的状态机。不含 I/O，由单元测试覆盖。
@@ -179,24 +200,38 @@ struct Shell {
     inner: Mutex<Inner>,
     /// 配对逐个进行：查重、写凭据、保存连接三步之间不能插入另一次配对。
     pairing: tokio::sync::Mutex<()>,
-    http: reqwest::Client,
+    /// 信任系统根证书的客户端：没有指定 CA 的连接都用它。
+    http: tls::Http,
+    /// 同一时间只运行一项项目操作。
+    ops: projects::Ops,
+    /// 本机部署的安装与服务启停逐个进行。
+    deploying: tokio::sync::Mutex<()>,
 }
 
 impl Shell {
-    fn new() -> reqwest::Result<Self> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(IDLE)
-            .user_agent(concat!("agent-collab-desktop/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        Ok(Self { inner: Mutex::default(), pairing: tokio::sync::Mutex::new(()), http })
+    fn new() -> std::result::Result<Self, String> {
+        Ok(Self {
+            inner: Mutex::default(),
+            pairing: tokio::sync::Mutex::new(()),
+            http: tls::http(None)?,
+            ops: projects::Ops::default(),
+            deploying: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// 状态锁。只在同步代码段里持有，不跨 await。
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 这条连接的 HTTP 客户端。指定了 CA 的连接只信任记录里的那份证书；
+    /// 记录里的证书缺失或损坏时报错，不退回系统根证书。
+    fn http_for(&self, conn: &Connection) -> Result<tls::Http> {
+        if !conn.custom_ca {
+            return Ok(self.http.clone());
+        }
+        let pem = conn.ca_pem.as_deref().ok_or_else(|| io("连接记录里没有它的 CA 证书，请忘记这条连接后重新配对"))?;
+        tls::http(Some(pem)).map_err(io)
     }
 
     /// 以当前连接的凭据发出请求，并在响应返回时核对代次与 `X-Controller-Id`。
@@ -215,8 +250,8 @@ impl Shell {
     }
 
     /// 用凭据调用 `DELETE /client` 自我撤销，返回是否确认成功。
-    async fn revoke(&self, base: &str, controller_id: Option<&str>, token: &Token) -> bool {
-        match self.http.delete(format!("{base}{API}/client")).bearer_auth(&token.0).send().await {
+    async fn revoke(&self, http: &reqwest::Client, base: &str, controller_id: Option<&str>, token: &Token) -> bool {
+        match http.delete(format!("{base}{API}/client")).bearer_auth(&token.0).send().await {
             Ok(r) => r.status().is_success() && controller_id.is_none_or(|id| controller_header(&r).as_deref() == Some(id)),
             Err(_) => false,
         }
@@ -293,6 +328,26 @@ struct Connection {
     /// 已在 controller 上确认撤销、但本机凭据还没删掉的连接（等待再次“忘记”来清理）。旧文件里没有这个字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revoked_at: Option<String>,
+    /// 这条连接只信任配对时指定的 CA，系统根证书对它不生效。旧文件里没有这三个字段。
+    #[serde(default)]
+    custom_ca: bool,
+    /// 首张 CA 证书 DER 的 SHA-256。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_fingerprint: Option<String>,
+    /// CA 证书（PEM，公开信息）。只保存在连接记录里，不返回给页面。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_pem: Option<String>,
+}
+
+impl Connection {
+    /// 返回给页面的形状：去掉证书正文，页面只需要指纹。
+    fn view(&self) -> Value {
+        let mut value = json!(self);
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("ca_pem");
+        }
+        value
+    }
 }
 
 #[derive(Deserialize)]
@@ -316,14 +371,46 @@ fn load(app: &AppHandle, _held: &Inner) -> Result<Vec<Connection>> {
 }
 
 fn save(app: &AppHandle, _held: &Inner, connections: &[Connection]) -> Result<()> {
-    let path = store_path(app)?;
+    write_json(&store_path(app)?, &json!({ "connections": connections }))
+}
+
+/// 写一份 JSON 记录：先写同目录的临时文件再改名，读的一方看不到写了一半的文件。
+fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(&json!({ "connections": connections })).map_err(io)?;
-    std::fs::write(&tmp, bytes).map_err(io)?;
-    std::fs::rename(&tmp, &path).map_err(io)
+    std::fs::write(&tmp, serde_json::to_vec_pretty(value).map_err(io)?).map_err(io)?;
+    std::fs::rename(&tmp, path).map_err(io)
+}
+
+/// 应用本机数据目录：助手的工作目录，项目操作的状态与暂存文件在它下面的 `projects/`。
+fn data_dir(app: &AppHandle) -> Result<PathBuf> {
+    let dir = app.path().app_local_data_dir().map_err(io)?;
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    Ok(dir)
+}
+
+/// 随包的本机助手，在应用资源目录的 `resources/` 下（见 `docs/desktop.md`“构建”）。
+fn bundle(app: &AppHandle) -> helper::Bundle {
+    helper::locate(app.path().resource_dir().ok().map(|dir| dir.join("resources")).as_deref())
+}
+
+/// 这台设备的名称：写进基线来源与应用记录，也用作本机配对时的客户端名称。
+fn device_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let name = if cfg!(windows) {
+            std::env::var("COMPUTERNAME").ok()
+        } else {
+            let output = std::process::Command::new("/bin/hostname").stdin(std::process::Stdio::null()).output().ok();
+            output.filter(|o| o.status.success()).and_then(|o| String::from_utf8(o.stdout).ok())
+        };
+        // controller 要求设备名非空且不超过 120 个字符。
+        let name: String = name.unwrap_or_default().trim().chars().filter(|c| !c.is_control()).take(120).collect();
+        if name.is_empty() { "desktop".into() } else { name }
+    })
+    .clone()
 }
 
 /// 同一配置目录只允许一个实例：`connections.json` 的读-改-写、它的临时文件和凭据增删只在进程内串行，
@@ -384,16 +471,20 @@ fn app_info(app: AppHandle) -> Value {
         "commit": option_env!("AGENT_COLLAB_COMMIT"),
         "platform": std::env::consts::OS,
         "arch": match std::env::consts::ARCH { "aarch64" => "arm64", other => other },
-        // 候选验证版：编译进了自动化钩子（cargo feature `automation`）。
         // 预发布版本号或编译进了自动化钩子的构建都不是正式发行版。
         "candidate": cfg!(feature = "automation") || env!("CARGO_PKG_VERSION").contains('-'),
+        // 内部测试版：编译进了自动化钩子（cargo feature `automation`），不对外分发。
+        "automation": cfg!(feature = "automation"),
+        "helper": bundle(&app).helper.is_some(),
+        // 本机部署的实例名；正式版为空串。
+        "instance": local::INSTANCE,
     })
 }
 
 #[tauri::command]
 async fn connections_list(app: AppHandle, shell: State<'_, Shell>) -> Result<Value> {
     let inner = shell.lock();
-    let connections = load(&app, &inner)?;
+    let connections: Vec<Value> = load(&app, &inner)?.iter().map(Connection::view).collect();
     let active = inner.active.as_ref().map(|a| json!({ "id": a.id, "epoch": inner.epoch }));
     Ok(json!({ "connections": connections, "active": active }))
 }
@@ -412,15 +503,47 @@ struct Pairing {
     scopes: Vec<String>,
 }
 
-#[tauri::command]
-async fn connection_pair(app: AppHandle, shell: State<'_, Shell>, url: String, code: String, name: String) -> Result<Connection> {
+/// CA 证书文件的大小上限；一份证书链只有几 KB。
+const MAX_CA_FILE: u64 = 1024 * 1024;
+
+#[tauri::command(rename_all = "snake_case")]
+async fn connection_pair(
+    window: WebviewWindow,
+    app: AppHandle,
+    shell: State<'_, Shell>,
+    url: String,
+    code: String,
+    name: String,
+    custom_ca: Option<bool>,
+) -> Result<Value> {
     let base = validate::base_url(&url).map_err(invalid)?;
-    let (code, name) = (code.trim(), name.trim());
-    if code.is_empty() {
+    if code.trim().is_empty() {
         return Err(invalid("配对码不能为空"));
     }
-    let response = shell
-        .http
+    let ca = if custom_ca == Some(true) {
+        // 取消选取则不配对，配对码不消耗。证书只能来自这个对话框，页面不能提供路径或内容。
+        let Some(path) = dialog::pick_file(&window, "选择 CA 证书", "PEM 证书", &["pem", "crt", "cer"]).await? else {
+            return Ok(json!({ "cancelled": true }));
+        };
+        if std::fs::metadata(&path).map_err(io)?.len() > MAX_CA_FILE {
+            return Err(invalid("所选文件太大，不是 CA 证书"));
+        }
+        Some(tls::Ca::parse(&std::fs::read(&path).map_err(io)?).map_err(invalid)?)
+    } else {
+        None
+    };
+    pair(&app, &shell, base, &code, &name, ca).await.map(|conn| conn.view())
+}
+
+/// 用配对码换取凭据并保存为一条连接。`connection_pair` 与 `local_pair` 共用。
+async fn pair(app: &AppHandle, shell: &Shell, base: String, code: &str, name: &str, ca: Option<tls::Ca>) -> Result<Connection> {
+    let (code, name) = (code.trim(), name.trim());
+    let http = match &ca {
+        Some(ca) => tls::http(Some(&ca.pem)).map_err(invalid)?,
+        None => shell.http.clone(),
+    };
+    let response = http
+        .api
         .post(format!("{base}{API}/clients/pair"))
         .header(CONTENT_TYPE, "application/json")
         .body(json!({ "code": code, "name": name, "kind": "desktop" }).to_string())
@@ -446,11 +569,14 @@ async fn connection_pair(app: AppHandle, shell: State<'_, Shell>, url: String, c
         scopes: pairing.scopes,
         paired_at: now_iso(),
         revoked_at: None,
+        custom_ca: ca.is_some(),
+        ca_fingerprint: ca.as_ref().map(|ca| ca.fingerprint.clone()),
+        ca_pem: ca.map(|ca| ca.pem),
     };
     // 从这里起手里有一份已签发的凭据：之后任何一步失败，都尽力用它自我撤销，不留下无人保管的凭据。
-    let adopted = shell.adopt(&app, &conn, header.as_deref(), &token).await;
+    let adopted = shell.adopt(app, &conn, header.as_deref(), &token).await;
     if adopted.is_err() {
-        shell.revoke(&base, None, &token).await;
+        shell.revoke(&http.api, &base, None, &token).await;
     }
     adopted.map(|()| conn)
 }
@@ -468,8 +594,9 @@ async fn connection_open(app: AppHandle, shell: State<'_, Shell>, id: String) ->
         (conn, inner.bump())
     };
     let base = validate::base_url(&conn.url).map_err(invalid)?;
+    let http = shell.http_for(&conn)?;
     let token = Token(credential(&conn, |entry| entry.get_password()).await?);
-    let response = shell.http.get(format!("{base}{API}/client")).bearer_auth(&token.0).send().await.map_err(net)?;
+    let response = http.api.get(format!("{base}{API}/client")).bearer_auth(&token.0).send().await.map_err(net)?;
     let status = response.status();
     let header = controller_header(&response);
     if from_proxy(header.as_deref(), status) {
@@ -491,7 +618,7 @@ async fn connection_open(app: AppHandle, shell: State<'_, Shell>, id: String) ->
         return Err(stale());
     }
     find(&app, &inner, &id)?; // 核对期间这条连接可能已被忘掉
-    inner.active = Some(Arc::new(Active { id, base, controller_id: conn.controller_id, token }));
+    inner.active = Some(Arc::new(Active { id, base, controller_id: conn.controller_id, token, http }));
     Ok(json!({ "epoch": epoch, "identity": info["identity"].take(), "controller": info["controller"].take() }))
 }
 
@@ -513,8 +640,10 @@ async fn connection_forget(app: AppHandle, shell: State<'_, Shell>, id: String, 
     let mut revoked = conn.revoked_at.is_some();
     if revoke && !revoked {
         // 撤销失败（包括读不到凭据）不阻止本地删除，结果如实返回。
-        if let (Ok(base), Ok(secret)) = (validate::base_url(&conn.url), credential(&conn, |entry| entry.get_password()).await) {
-            revoked = shell.revoke(&base, Some(&conn.controller_id), &Token(secret)).await;
+        if let (Ok(base), Ok(http), Ok(secret)) =
+            (validate::base_url(&conn.url), shell.http_for(&conn), credential(&conn, |entry| entry.get_password()).await)
+        {
+            revoked = shell.revoke(&http.api, &base, Some(&conn.controller_id), &Token(secret)).await;
         }
     }
     // 先删连接记录、再删凭据，凭据删不掉时把记录放回：任何一步失败，列表里都留着这条连接，可以再次“忘记”。
@@ -561,17 +690,21 @@ async fn api_request(
     if !validate::method(&method) {
         return Err(invalid("不支持的请求方法"));
     }
+    let method_name = method.to_ascii_uppercase();
     let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| invalid("不支持的请求方法"))?;
     let url = validate::api_url(&active.base, &path).map_err(invalid)?;
-    let mut request = shell.http.request(method, url);
+    let mut request = active.http.api.request(method, url);
     // 页面给的请求头只转发 X-Coordinator-Token。
     if let Some((_, value)) = headers.iter().flatten().find(|(k, _)| k.eq_ignore_ascii_case("x-coordinator-token")) {
         let mut value = HeaderValue::from_str(value).map_err(|_| invalid("X-Coordinator-Token 的值无效"))?;
         value.set_sensitive(true);
         request = request.header("x-coordinator-token", value);
     }
-    if let Some(body) = body {
-        request = request.header(CONTENT_TYPE, "application/json").body(body);
+    match body {
+        Some(body) => request = request.header(CONTENT_TYPE, "application/json").body(body),
+        // 没有请求体的 POST/PUT 也声明长度 0：HTTP 客户端对空体不加 Content-Length，controller 会拒绝。
+        None if matches!(method_name.as_str(), "POST" | "PUT" | "PATCH") => request = request.header(CONTENT_LENGTH, 0).body(Vec::new()),
+        None => {}
     }
     let response = shell.send(epoch, &active, request).await?;
     let status = response.status().as_u16();
@@ -626,7 +759,7 @@ impl Stream {
         if let Some(cursor) = cursor {
             url.query_pairs_mut().append_pair("cursor", &cursor.to_string());
         }
-        let request = shell.http.get(url).header(ACCEPT, "text/event-stream").bearer_auth(&active.token.0);
+        let request = active.http.api.get(url).header(ACCEPT, "text/event-stream").bearer_auth(&active.token.0);
         let mut response = match request.send().await {
             Ok(response) => response,
             Err(e) => return self.closed(net(e).message),
@@ -642,8 +775,13 @@ impl Stream {
         }
         match response.status() {
             StatusCode::OK => {}
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            StatusCode::UNAUTHORIZED => {
                 self.emit("unauthorized", None, None, None);
+                return;
+            }
+            // 没有读取事件的权限：凭据仍然有效，页面停止重连但不离开这条连接。
+            StatusCode::FORBIDDEN => {
+                self.emit("forbidden", None, None, None);
                 return;
             }
             status => return self.closed(format!("http_{}", status.as_u16())),
@@ -665,7 +803,7 @@ impl Stream {
                     return self.closed("frame_too_large");
                 }
                 let (kind, id, ty, data) = classify(frame);
-                if !self.emit(kind, id, Some(ty), Some(data)) || kind == "unauthorized" {
+                if !self.emit(kind, id, Some(ty), Some(data)) || kind == "unauthorized" || kind == "forbidden" {
                     return;
                 }
             }
@@ -680,6 +818,7 @@ impl Stream {
 fn classify(frame: sse::Frame) -> (&'static str, Option<u64>, String, String) {
     let kind = match frame.event.as_deref() {
         Some("unauthorized") => "unauthorized",
+        Some("forbidden") => "forbidden",
         Some("snapshot_required") => "snapshot_required",
         _ => "event",
     };
@@ -747,10 +886,14 @@ impl BlobSink {
         Ok(())
     }
 
+    /// 已写入的内容的摘要是否等于 `sha256`。
+    fn matches(&self, sha256: &str) -> bool {
+        hex(&self.hasher.clone().finalize()) == sha256
+    }
+
     /// 摘要相符则落盘并原子改名到 `dest`，返回字节数；不符返回 `io` 错误（临时文件随即删除）。
     fn finish(mut self, sha256: &str, dest: &Path) -> Result<u64> {
-        let digest: String = std::mem::take(&mut self.hasher).finalize().iter().map(|b| format!("{b:02x}")).collect();
-        if digest != sha256 {
+        if !self.matches(sha256) {
             return Err(io("下载内容的 SHA-256 与预期不符，文件未保存"));
         }
         if let Some(file) = self.file.take() {
@@ -768,24 +911,6 @@ impl Drop for BlobSink {
     }
 }
 
-/// 弹出系统“另存为”对话框；用户取消时返回 None。
-async fn save_dialog(window: &WebviewWindow, file_name: String) -> Result<Option<PathBuf>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let parent = window.clone();
-    // 对话框要在主线程上创建（macOS 的要求）；创建后得到的 future 可以在任意线程等待。
-    window
-        .run_on_main_thread(move || {
-            let mut dialog = rfd::AsyncFileDialog::new().set_parent(&parent);
-            if !file_name.is_empty() {
-                dialog = dialog.set_file_name(file_name);
-            }
-            let _ = tx.send(dialog.save_file());
-        })
-        .map_err(io)?;
-    let picked = rx.await.map_err(|_| io("无法打开保存对话框"))?.await;
-    Ok(picked.map(|file| file.path().to_path_buf()))
-}
-
 #[tauri::command]
 async fn blob_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, sha256: String, name: String) -> Result<Value> {
     let active = shell.lock().current(epoch)?;
@@ -793,11 +918,11 @@ async fn blob_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, s
         return Err(invalid("sha256 必须是 64 位小写十六进制"));
     }
     let url = validate::api_url(&active.base, &format!("/blobs/{sha256}")).map_err(invalid)?;
-    let Some(dest) = save_dialog(&window, validate::file_name(&name)).await? else {
+    let Some(dest) = dialog::save(&window, validate::file_name(&name)).await? else {
         return Ok(json!({ "cancelled": true }));
     };
     shell.lock().current(epoch)?; // 对话框开着的时候连接可能已经切换
-    let mut response = shell.send(epoch, &active, shell.http.get(url)).await?;
+    let mut response = shell.send(epoch, &active, active.http.api.get(url)).await?;
     match response.status() {
         StatusCode::OK => {}
         StatusCode::NOT_FOUND => return Err(err("not_found", "controller 上没有这个工件")),
@@ -817,11 +942,24 @@ async fn blob_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, s
     Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes }))
 }
 
-// ---------------------------------------------------------------- 自动化钩子（仅候选版验证用）
+// ---------------------------------------------------------------- 命令：系统通知
+
+/// 发一条系统通知。是否通知、通知哪些事件与限流由页面按本机设置决定；这里只去掉控制字符并限制长度。
+#[tauri::command]
+fn notify(app: AppHandle, title: String, body: String) -> Result<Value> {
+    use tauri_plugin_notification::NotificationExt;
+    let clip = |text: &str, max: usize| text.chars().filter(|c| !c.is_control() || *c == '\n').take(max).collect::<String>();
+    app.notification().builder().title(clip(&title, 120)).body(clip(&body, 500)).show().map_err(io)?;
+    Ok(json!({}))
+}
+
+// ---------------------------------------------------------------- 自动化钩子（仅内部测试版）
 
 /// 默认不编译。启用 cargo feature `automation` 后：
 /// - 环境变量 `AGENT_COLLAB_DESKTOP_AUTOMATION` 指向的本地 JS 文件，在主窗口页面加载完成后执行一次；
 /// - 命令 `automation_report {"data"}` 把 JSON 逐行追加到 `AGENT_COLLAB_DESKTOP_AUTOMATION_OUT` 指向的文件。
+///
+/// 同一个 feature 还编译进对话框替身（`dialog`）与助手位置覆盖（`helper`）。
 #[cfg(feature = "automation")]
 mod automation {
     use super::*;
@@ -874,6 +1012,8 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(shell)
         .plugin(navigation_guard())
+        // 只用它的 Rust API 发通知；capabilities 里没有授予它的页面权限，页面只能经 `notify` 命令。
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             match instance_lock(&app.path().app_config_dir()?)? {
                 Some(lock) => {
@@ -887,6 +1027,7 @@ pub fn run() {
                     std::process::exit(0);
                 }
             }
+            projects::clear_staging(app.handle()); // 上次运行被中断时留下的暂存文件
             #[cfg(feature = "automation")]
             automation::grant(app)?;
             Ok(())
@@ -902,6 +1043,22 @@ pub fn run() {
             stream_open,
             stream_close,
             blob_save,
+            notify,
+            projects::project_bind,
+            projects::project_bindings,
+            projects::project_unbind,
+            projects::project_scan,
+            projects::project_upload,
+            projects::project_cancel,
+            projects::result_download,
+            projects::result_plan,
+            projects::result_apply,
+            projects::result_unfinished,
+            projects::result_recover,
+            local::local_discover,
+            local::local_setup,
+            local::local_service,
+            local::local_pair,
             #[cfg(feature = "automation")]
             automation::automation_report,
         ]);
@@ -920,6 +1077,7 @@ mod tests {
             base: "https://controller.example".into(),
             controller_id: "ctl-a".into(),
             token: Token("secret".into()),
+            http: tls::http(None).unwrap(),
         })
     }
 
@@ -931,8 +1089,8 @@ mod tests {
         (inner, epoch)
     }
 
-    fn code<T>(result: Result<T>) -> &'static str {
-        result.err().map(|e| e.code).unwrap_or("ok")
+    fn code<T>(result: Result<T>) -> String {
+        result.err().map_or("ok".into(), |e| e.code.into_owned())
     }
 
     #[test]
@@ -993,6 +1151,45 @@ mod tests {
         conn.revoked_at = Some("2026-11-11T00:00:00.000Z".into());
         let back: Connection = serde_json::from_value(serde_json::to_value(&conn).unwrap()).unwrap();
         assert_eq!(back.revoked_at.as_deref(), Some("2026-11-11T00:00:00.000Z"));
+        // 旧记录没有 CA 字段：按系统根证书处理，返回给页面时 custom_ca 为 false。
+        assert!(!back.custom_ca && back.ca_pem.is_none());
+        assert_eq!(back.view()["custom_ca"], json!(false));
+        assert!(back.view().get("ca_fingerprint").is_none());
+    }
+
+    #[test]
+    fn ca_certificate_stays_in_the_record_and_out_of_the_page() {
+        let mut conn: Connection = serde_json::from_value(json!({
+            "id": "c1", "name": "n", "url": "https://x", "controller_id": "ctl", "client_id": "c1",
+            "kind": "desktop", "scopes": [], "paired_at": "2026-01-01T00:00:00.000Z"
+        }))
+        .unwrap();
+        conn.custom_ca = true;
+        conn.ca_fingerprint = Some("ab".repeat(32));
+        conn.ca_pem = Some("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into());
+        // 写进 connections.json 的记录带证书，读回来不丢。
+        let stored = serde_json::to_value(&conn).unwrap();
+        assert!(stored["ca_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+        assert_eq!(serde_json::from_value::<Connection>(stored).unwrap().ca_pem, conn.ca_pem);
+        // 页面只看到开关与指纹。
+        let view = conn.view();
+        assert_eq!((view["custom_ca"].clone(), view["ca_fingerprint"].clone()), (json!(true), json!("ab".repeat(32))));
+        assert!(view.get("ca_pem").is_none());
+    }
+
+    #[test]
+    fn a_connection_with_a_custom_ca_never_falls_back_to_system_roots() {
+        let shell = Shell::new().unwrap();
+        let mut conn: Connection = serde_json::from_value(json!({
+            "id": "c1", "name": "n", "url": "https://x", "controller_id": "ctl", "client_id": "c1",
+            "kind": "desktop", "scopes": [], "paired_at": "2026-01-01T00:00:00.000Z"
+        }))
+        .unwrap();
+        assert!(shell.http_for(&conn).is_ok());
+        conn.custom_ca = true; // 记录说要用指定的 CA，但证书不在或已损坏
+        assert_eq!(code(shell.http_for(&conn)), "io");
+        conn.ca_pem = Some("garbage".into());
+        assert_eq!(code(shell.http_for(&conn)), "io");
     }
 
     #[test]
@@ -1080,6 +1277,8 @@ mod tests {
             ("snapshot_required", None, "snapshot_required".to_string(), "{\"min_seq\":9}".to_string())
         );
         assert_eq!(classify(frame(None, Some("unauthorized"), "")).0, "unauthorized");
+        // 权限不足与凭据失效是两种帧：前者不让页面离开连接。
+        assert_eq!(classify(frame(None, Some("forbidden"), "{}")).0, "forbidden");
         // 没有 event 字段按 SSE 缺省类型 message；非数字 id 记为 null。
         assert_eq!(classify(frame(Some("abc"), None, "x")), ("event", None, "message".to_string(), "x".to_string()));
     }
@@ -1104,8 +1303,11 @@ mod tests {
         );
         assert_eq!(proxy_error(StatusCode::BAD_GATEWAY).code, "network");
         let e = http_error("配对失败", StatusCode::BAD_REQUEST, br#"{"error":{"code":"invalid","message":"bad code"}}"#);
-        assert_eq!((e.code, e.message.as_str()), ("invalid", "配对失败（HTTP 400）：bad code"));
+        assert_eq!((&*e.code, e.message.as_str()), ("invalid", "配对失败（HTTP 400）：bad code"));
         assert_eq!(http_error("x", StatusCode::BAD_GATEWAY, b"<html>").code, "network");
+        // 401 与 403 不能合并：403 是权限不足，凭据仍然有效。
+        assert_eq!(http_error("x", StatusCode::UNAUTHORIZED, b"").code, "unauthorized");
+        assert_eq!(http_error("x", StatusCode::FORBIDDEN, b"").code, "forbidden");
     }
 
     #[test]

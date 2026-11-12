@@ -7,6 +7,8 @@ import subprocess
 
 HARNESSES = ('codex', 'claude')
 CODEX_CLEARED_ENV = ('CODEX_THREAD_ID', 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE')
+# Windows 服务由无控制台的 pythonw 运行：短命控制台子进程不加此标志会各自弹出一个窗口（每轮登录探测闪两个）。
+NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
 
 
 def resolve_commands(config=None, env=None, system=None, home=None, mac_dirs=None):
@@ -91,7 +93,7 @@ def probe_auth_detail(name, command, runner=None, system=None):
         return 'unknown', 'command_missing'
     def status():
         return (runner or subprocess.run)(command['argv'] + (['login', 'status'] if name == 'codex' else ['auth', 'status']),
-            env=command['env'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+            env=command['env'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, **NO_WINDOW)
     try:
         result = status()
         if name == 'claude':

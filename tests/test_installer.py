@@ -234,6 +234,34 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(hashes(self.state), before)
         self.invoke('--uninstall', '--purge-code')
 
+    def test_interrupted_uninstall_is_completed_by_running_uninstall_again(self):
+        self.invoke('--release', str(self.v1))
+        before = hashes(self.state)
+        # 第一次卸载在删掉当前指针之后、删除代码目录时失败（Windows 上目录仍被刚结束的服务进程占用）。
+        with patch.object(ins, 'remove_tree', side_effect=PermissionError(32, 'in use')):
+            self.invoke('--uninstall', status=1)
+        self.assertIsNone(ins.current_version(self.prefix))
+        self.assertTrue((self.prefix / 'versions/1.0.0').exists())
+        # 再次卸载接着完成，而不是以“当前指针与安装记录不一致”拒绝；状态目录不动。
+        self.invoke('--uninstall')
+        self.assertFalse((self.prefix / 'versions/1.0.0').exists())
+        self.assertEqual(json.loads((self.prefix / 'installation.json').read_text(encoding='utf-8'))['version'], None)
+        self.assertEqual(hashes(self.state), before)
+        self.invoke('--release', str(self.v1))
+        self.assertEqual(ins.current_version(self.prefix), '1.0.0')
+
+    def test_uninstall_from_inside_the_current_version_directory(self):
+        # 经安装后的启动器卸载时，进程的工作目录是当前版本目录；卸载要先离开它（Windows 上否则无法删除）。
+        self.invoke('--release', str(self.v1))
+        here = os.getcwd()
+        os.chdir(str(self.prefix / 'versions/1.0.0'))
+        try:
+            self.invoke('--uninstall')
+            self.assertFalse((self.prefix / 'versions/1.0.0').exists())
+            self.assertEqual(Path(os.getcwd()).resolve(), self.prefix.resolve())
+        finally:
+            os.chdir(here)
+
     def test_default_uninstall_retains_archived_code_and_supports_reinstall(self):
         self.invoke('--release', str(self.v1))
         self.invoke('--release', str(self.v2))

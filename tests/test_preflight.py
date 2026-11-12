@@ -158,6 +158,9 @@ class PreflightTests(unittest.TestCase):
         self.assertIn('records', c['database']['tables'])
         self.assertEqual(c['meta']['metadata_version'], 5)
         self.assertEqual(c['config']['managed_coordinator']['status'], 'ready')
+        # 保存过的协调设置优先于 config.json，与 controller 一致。
+        self.put('settings', 'coordination', dict(revision=1, enabled=False, node_ids=[]))
+        self.assertEqual(self.report()['controller']['config']['managed_coordinator']['status'], 'disabled')
         self.assertEqual(c['jobs']['by_status'], {'running': 1})
         self.assertEqual(c['jobs']['non_terminal'][0]['harness'], 'codex')
         self.assertEqual(c['attempts']['active'][0]['epoch'], 2)
@@ -529,6 +532,7 @@ class PreflightTests(unittest.TestCase):
             with self.subTest(kind=kind), patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, stdout, b'')) as run:
                 self.assertIs(preflight._probe(dict(kind=kind, name=name)), expected)
                 run.assert_called_once()
+                self.assertEqual(run.call_args[1].get('creationflags'), subprocess.CREATE_NO_WINDOW if os.name == 'nt' else None)
                 self.assertIn('print-disabled' if kind == 'launchd' else '/query', run.call_args[0][0])
 
     def test_service_command_credentials_are_redacted(self):
@@ -575,6 +579,9 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(declared())
         old = dict(agent_version='old', physical_host_id='host-b', capabilities=dict(os='linux', arch='x86_64', harness={}))
         self.put('node', 'retired', dict(old, node_id='retired', drain=True))  # 早已停用、记录还在的节点
+        self.assertTrue(declared())
+        # 已退役的节点（保留记录、不再参与调度）同样不计入，即使它没有被排空。
+        self.put('node', 'tombstone', dict(old, node_id='tombstone', drain=False, retired_at='2026-11-11T00:00:00Z'))
         self.assertTrue(declared())
         self.put('node', 'still-serving', dict(old, node_id='still-serving', drain=False))
         self.assertFalse(declared())

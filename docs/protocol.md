@@ -350,7 +350,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 ## 12. 客户端授权、模型策略与统一入口（向后兼容；旧字段语义不变）
 
-桌面端、CLI 与其他自动化客户端共用本节的端点和授权模型。controller 在 `GET /client`、`GET /overview` 的 `controller.features` 和节点注册响应的 `features` 中列出已支持的能力名：`clients`、`model_settings`、`node_models`、`contract_draft`、`baselines`。客户端和节点只在对端列出相应能力后使用对应字段。
+桌面端、CLI 与其他自动化客户端共用本节的端点和授权模型。controller 在 `GET /client`、`GET /overview` 的 `controller.features` 和节点注册响应的 `features` 中列出已支持的能力名：`clients`、`model_settings`、`node_models`、`contract_draft`、`baselines`、`catalog_provenance`，以及 §13 的 `projects`、`applications`、`node_admin`、`coordination_settings`、`raw_logs`、`remote_apply`。客户端和节点只在对端列出相应能力后使用对应字段。
 
 **12.1 客户端凭据**
 
@@ -378,7 +378,9 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - `POST /clients/codes`（maintain）`{"request_id", "role" | "scopes", "ttl_s"}` → 201 `{"code", "scopes", "expires_at"}`；响应不进入幂等回执，重复的 request_id 返回 409。客户端凭据只能签发不超出自身 scopes 的配对码，否则返回 403 `forbidden`，`details.required_scope` 为第一个缺少的 scope；管理令牌与会话不受此限。
 - `POST /clients/{client_id}/revoke`（maintain）`{"request_id", "expected_version"}` → 更新后的 client。
 
-撤销从下一次请求起生效，不影响节点凭据和其他客户端。已建立的事件流在下一个轮询周期（缺省 0.25 秒）重新认证，收到一帧 `event: unauthorized` 后被服务端关闭。
+撤销从下一次请求起生效，不影响节点凭据和其他客户端。已建立的事件流在下一个轮询周期（缺省 0.25 秒）重新认证：凭据已撤销或失效时收到一帧 `event: unauthorized`，凭据有效但失去 `read` 权限时收到一帧 `event: forbidden`，随后被服务端关闭。
+
+401 与 403 是两种情况，客户端分开处理。401（`unauthorized`）表示凭据失效或已撤销，客户端停止使用这条连接并提示重新配对。403（`forbidden`）表示凭据有效但没有这项操作的权限：连接与本机凭据保留，已授权的读取照常可用，界面说明缺少的权限（`details.required_scope`）。
 
 所有 `/api/v1` 响应带 `X-Controller-Id: <controller_id>`。客户端把连接绑定到配对时得到的 controller_id；响应里的值不同即停止使用该连接。不带该头的 5xx 视为前置代理代答，按网络错误处理，不算身份不符。
 
@@ -390,22 +392,23 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 ```json
 {"revision": 0, "updated_at": null, "updated_by": null,
- "codex": {"default": {"model": null, "effort": null}, "allowed": null},
+ "codex": {"default": {"model": null, "effort": null}, "allowed": null, "unverified_nodes": "wait"},
  "claude": {"default": {"model": null, "effort": null}}}
 ```
 
 - `codex.default`：执行任务的工作区默认值；null 表示未设置。
 - `codex.allowed`：部署策略。null 表示部署不作限制；否则为 `{"<model>": ["<effort>", ...]}`，只有列出的组合可用，默认值必须在其中。
-- `claude.default`：受管协调回合的模型与 effort；null 时沿用 `config.json` 中 `standby_profiles` 所选 profile 的值。两组设置互不覆盖。
+- `codex.unverified_nodes`：模型目录未核实（未知或已过期，见 12.5）的节点能否承接 codex 任务。`wait`（缺省）只派给目录已核实含该组合的节点；`allow` 是显式开启的“未核实能力尝试”，仍优先已核实的节点。`PUT` 的 `codex` 里省略这一项时保持原值。
+- `claude.default`：受管协调回合的模型与 effort；null 时沿用 `config.json` 中 `standby_profiles` 所选 profile 的值。两组设置互不覆盖。协调是否启用与候选节点见 §13.7。
 - model 匹配 `[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}`，effort 匹配 `[a-z][a-z0-9_-]{0,31}`。
 - 新建的 controller 数据库从上述未设置状态开始。已有任务或节点记录、但没有该记录的数据库（升级前的部署）在启动时写入一次迁移值：`codex.default = gpt-6-astra / xhigh`，`codex.allowed = {"gpt-6-astra": ["high", "xhigh", "max"]}`，`claude.default` 取当时生效的 standby profile；`updated_by.kind` 为 `migration`。之后与其他设置一样可编辑。
-- 项目默认层尚未实现；优先级预留为 任务覆盖 > 项目默认 > 工作区默认。
+- 优先级为 任务覆盖 > 项目默认 > 工作区默认；项目默认值见 §13.1。部署许可范围（`codex.allowed`）只有工作区一层。
 
 端点：
 
 - `GET /settings/models`（read）→ `{"settings", "catalog", "selectable", "history"}`。
-  - `catalog.nodes.<node_id>.<harness>` = `{"status": "ok|unknown|legacy", "source", "fetched_at", "cli_version", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}`，见 12.5。
-  - `selectable.codex` = `[{"model", "efforts": [...], "nodes": [node_id...]}]`：部署策略与各节点目录（status 为 ok 或 legacy）的交集；`selectable.unknown_nodes` 列出目录未知的节点。目录条目来自节点上的 CLI，不表示该账号已成功调用过这个模型。
+  - `catalog.nodes.<node_id>.<harness>` = `{"status": "ok|stale|unknown|legacy", "state", "source", "fetched_at", "cli_version", "provider", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}`，见 12.5。`status` 是节点上报的值，`state` 是按有效期算出的当前状态（多一个取值 `expired`）；`catalog.max_age_s` 是有效期。已退役的节点不在其中。
+  - `selectable.codex` = `[{"model", "efforts": [...], "nodes": [node_id...]}]`：部署策略与已核实的节点目录（state 为 ok、stale 或 legacy）的交集；`selectable.unknown_nodes` 列出目录未核实（unknown 或 expired）的节点。目录条目来自节点上的 CLI，不表示该账号已成功调用过这个模型。
   - `history`：最近 20 次修改 `{"revision", "at", "actor", "before", "after"}`。
 - `PUT /settings/models`（settings）`{"request_id", "expected_revision", "codex"?, "claude"?}` → 更新后的 settings；`request_id` 必填，相同内容重放返回第一次的应答（不再递增 revision），同一 `request_id` 换了内容返回 409 `conflict`；`expected_revision` 与当前不同返回 409 `version_mismatch`，`details.current` 为当前 settings。写 `settings.updated` 事件。
 
@@ -413,8 +416,8 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - `harness: codex` 的契约可以省略 `harness_params.model` 与 `effort`。受理时逐项解析：请求里显式给出的值 → 工作区默认值；同一根工作包内的后续修订改用根冻结的默认值。解析不出返回 400，`details.reason` 为 `model_default_unset`；解析结果不在许可范围返回 400，`details.reason` 为 `model_not_allowed`。同一根工作包的后续修订若显式给出 model，必须与根冻结的 model 相同（冻结的 model 为 null 时不限），否则同样返回 400 `model_not_allowed`；effort 可在冻结的许可范围内覆盖。不会换成别的模型或 effort。
 - 解析结果写入 job 的 `contract.harness_params`（与此前由固定常量填充的位置相同），受理后不变；之后修改设置不影响已受理的 job，包括排队中的。
-- job 记录带 `model_policy`：`{"schema": 1, "settings_revision", "requested": {"model", "effort"}, "resolved": {"model", "effort"}, "source": {"model", "effort"}}`。`requested` 是请求显式给出的值（没有则为 null）；`source` 取 `task_override`、`workspace_default`、`root_frozen`、`coordinator_override`、`legacy_compat`（`project_default` 预留）。升级前受理的 job 没有此字段；`request_hash` 与既有契约内容不重算。
-- 根工作包记录带冻结策略 `model_policy`：`{"schema": 1, "settings_revision", "codex": {"model", "effort", "allowed": {...}|null}}`，取根 job 受理时的解析结果与当时的 `codex.allowed`；根 job 不是 codex 时取当时的工作区默认值（未设置则 model、effort 为 null）。
+- job 记录带 `model_policy`：`{"schema": 1, "settings_revision", "requested": {"model", "effort"}, "resolved": {"model", "effort"}, "source": {"model", "effort"}, "unverified_nodes"}`，属于项目的任务再带 `project_revision`。`requested` 是请求显式给出的值（没有则为 null）；`source` 逐项取 `task_override`、`project_default`、`workspace_default`、`root_frozen`、`coordinator_override`、`legacy_compat`。`unverified_nodes` 是受理时生效的派单策略（12.5），与模型一起冻结。升级前受理的 job 没有此字段；`request_hash` 与既有契约内容不重算。
+- 根工作包记录带冻结策略 `model_policy`：`{"schema": 1, "settings_revision", "codex": {"model", "effort", "allowed": {...}|null, "unverified_nodes"}}`，属于项目的根再带 `project_id`、`project_revision`。取根 job 受理时的解析结果与当时的 `codex.allowed`；根 job 不是 codex 时取当时的默认值（项目默认优先于工作区默认，未设置则 model、effort 为 null）。
 - 受管修复只读根的冻结策略：模型固定为冻结的 model；`follow_up.effort` 为 null 时用冻结的 effort，给出值时必须在冻结的许可范围内（`allowed` 为 null 时不限），并在子 job 的 `model_policy.source.effort` 记 `coordinator_override`。不在范围内时拒绝该修复请求（`coordinator.follow_up_rejected`，原因 `effort_not_allowed`），验收结论保留。冻结的 model 为 null 时修复请求以 `model_default_unset` 被拒绝。根工作包的累计预算规则不变。
 - 升级前创建的根没有冻结策略，读取时按原行为推导：model 与 effort 取根 job 的 codex 参数（根不是 codex 时为 `gpt-6-astra` / `xhigh`），`allowed` 为 `{"<model>": ["high", "xhigh", "max"]}`，来源记 `legacy_compat`。
 - 协调决策 schema 的 `follow_up.effort` 为 `string | null`，不带枚举；`context.json` 增加 `repair_policy: {"model", "effort", "allowed_efforts"}` 供协调者参考。节点同时接受此前的 schema（effort 必填、枚举 high/xhigh/max），以便先升级节点、后升级 controller。
@@ -422,25 +425,181 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 **12.5 节点模型目录**
 
-- 节点注册可带 `capabilities.models`：`{"codex": {"status": "ok|unknown", "source", "fetched_at", "cli_version", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}, "claude": {...}}`。codex 目录由节点在自己的服务进程上下文里启动 `codex app-server`（stdio，不监听网络端口），发送 `initialize` 与 `model/list` 取得，按 `model_catalog_s`（缺省 21600 秒）刷新；取不到时 `status` 为 `unknown` 并给出 `reason`。claude CLI 没有目录接口，`status` 为 `unknown`、`reason` 为 `no_catalog_interface`。读取目录不调用模型。
+- 节点注册可带 `capabilities.models`：`{"codex": {"status": "ok|stale|unknown", "source", "fetched_at", "cli_version", "provider", "reason", "models": [{"id", "efforts": [...], "default_effort"}]}, "claude": {...}}`。codex 目录由节点在自己的服务进程上下文里启动 `codex app-server`（stdio，不监听网络端口），发送 `initialize`、`config/read` 与 `model/list` 取得，按 `model_catalog_s`（缺省 21600 秒）刷新，每次探测后重新注册；取不到时 `status` 为 `unknown` 并给出 `reason`。claude CLI 没有目录接口，`status` 为 `unknown`、`reason` 为 `no_catalog_interface`。读取目录不调用模型。
+- 探测与执行使用同一个模型 provider。执行用 `codex exec --ignore-user-config`，不读 `$CODEX_HOME/config.toml`；`app-server` 没有这个选项，会读用户配置。因此两边的命令行都显式带 `-c model_provider="openai"`，探测再用 `config/read` 读回生效的 `model_provider`：读不回记 `provider_unverified`，与执行用的不一致记 `provider_mismatch`，两种情况都不采用这份目录。认证两边都取自同一个 `CODEX_HOME`。`provider` 字段记下目录对应的 provider。
+- 刷新失败时，节点沿用最近一次成功的目录并标为 `stale`：`fetched_at` 保持那次成功的时间，`reason` 是这次失败的原因；前提是 CLI 版本与 provider 都没有变，否则上报 `unknown`。最近一次成功的目录保存在节点数据目录的 `model-catalog.json`，重启后仍可沿用。
+- 有效期：`fetched_at` 早于 `catalog_max_age_s`（controller 配置，缺省 172800 秒）的 `ok` 或 `stale` 目录按 `expired` 处理。`ok`、`stale`、`legacy` 是“已核实”，`unknown`、`expired` 是“未核实”。
+- `provider` 字段与 `stale` 状态只在注册响应的 `features` 含 `catalog_provenance` 时发送；否则节点去掉 `provider`，把沿用的旧目录按 `unknown` 上报。
 - 节点第一次注册不带 `models`；注册响应的 `features` 含 `node_models` 时再带上它重新注册。节点与 controller 断线重连后重新注册，以重新取得 `features`（controller 原地升级时恢复代次不变，心跳不会提示能力变化）。
 - 没有上报 `models` 的节点（旧版本）按其适配器实际接受的固定集合处理：`status: legacy`，`gpt-6-astra` 配 `high`、`xhigh`、`max`。
-- 调度过滤（§6）：codex 任务的 model 不在节点目录里记 `model_unsupported:<model>`，effort 不在该模型的列表里记 `effort_unsupported:<model>/<effort>`；只对 status 为 ok 或 legacy 的目录判断。目录 unknown 的节点不因此被排除，调度解释里该节点带 `model_catalog: "unknown"`。
+- 调度过滤（§6）：对已核实的目录，codex 任务的 model 不在其中记 `model_unsupported:<model>`，effort 不在该模型的列表里记 `effort_unsupported:<model>/<effort>`。目录未核实不等于不支持，也不等于支持：任务的 `model_policy.unverified_nodes` 为 `wait`（缺省）时该节点记 `model_catalog_unverified:<unknown|expired>`、不派单，任务没有别的合格节点就停在 `waiting_capability`；为 `allow` 时该节点可以承接，但排在所有目录已核实含该组合的节点之后。调度解释里每个节点带 `model_catalog`（当前状态）与 `unverified_attempt`（这次派单是否属于未核实能力尝试），顶层带 `policy.unverified_nodes`。
 
 **12.6 模板、契约草拟与输入基线**
 
 - `GET /templates`（read）→ `{"templates": [{"id", "title", "description", "harness", "diagnostic"}]}`。当前模板：`codex-change`（Codex 修改并运行检查；失败或接管时才触发协调，结果自动发布）、`codex-change-accept`（执行并验收：`publish = {"mode": "manual", "requires_acceptance": true}`、`coordination.policy = always`，验收通过后由客户端发布）、`diagnostic`（确定性步骤，不调用模型，用于检查 controller、节点、检查与工件链路）。
-- `POST /contracts/draft`（tasks）`{"template", "title"?, "goal", "acceptance"?: [...], "excludes"?: [...], "baseline_id"? | "inputs_manifest"?, "checks"?: [{"name", "run", "timeout_s"?}], "model"?, "effort"?, "requirements"?}` → `{"title", "contract", "preview", "model_policy", "settings_revision", "warnings"}`。只生成并校验契约，不改变状态。`contract` 是可原样用于 `POST /jobs` 的请求（只含显式选择的 model、effort）；`preview` 是按当前设置解析并补全默认值后的完整契约，`model_policy` 是对应的解析结果。`warnings` 为 `[{"code", "detail"}]`：`empty_inputs`（没有输入基线）、`missing_blobs`（基线有文件未上传）、`no_node_supports_model`（已登记节点的目录都不含该组合）。
-- `POST /jobs` 可带 `expected_settings_revision`：与当前模型设置的 revision 不同时返回 409 `version_mismatch`（`details.current` 为当前设置），用于保证受理时的解析结果就是草拟时看到的那一份。
+- `POST /contracts/draft`（tasks）`{"template", "title"?, "goal", "acceptance"?: [...], "excludes"?: [...], "baseline_id"? | "inputs_manifest"?, "checks"?: [{"name", "run", "timeout_s"?}], "model"?, "effort"?, "requirements"?}` → `{"title", "contract", "preview", "model_policy", "settings_revision", "warnings"}`。只生成并校验契约，不改变状态。`contract` 是可原样用于 `POST /jobs` 的请求（只含显式选择的 model、effort）；`preview` 是按当前设置解析并补全默认值后的完整契约，`model_policy` 是对应的解析结果。`warnings` 为 `[{"code", "detail"}]`：`empty_inputs`（没有输入基线）、`missing_blobs`（基线有文件未上传）、`no_node_supports_model`（所有节点的目录都已核实且都不含该组合）、`no_verified_node_supports_model`（没有已核实的目录含该组合，另有目录未核实的节点，策略为 `wait`）、`unverified_node_attempt`（同上但策略为 `allow`，任务可能派给目录未核实的节点）。请求可带 `project_id`（§13.1），响应相应带 `project_id`、`project_revision`、`baseline_id`。
+- `POST /jobs` 可带 `expected_settings_revision`：与当前模型设置的 revision 不同时返回 409 `version_mismatch`（`details.current` 为当前设置），用于保证受理时的解析结果就是草拟时看到的那一份。属于项目的任务再带 `expected_project_revision`（§13.1）。
+- `POST /jobs` 的幂等回执先于上述版本核对：同一 `request_id`、同一内容的重放返回第一次受理的 job（当时冻结的 `model_policy` 不变），即使之后设置已经改变；重放照常先通过凭据与权限检查。
 - `GET /jobs` 可带 `work_package_id=<根工作包>`，只列出该根的各次修订（新的在前）。
 - `POST /baselines`（tasks）`{"request_id", "name", "manifest"}` → 201 baseline；`GET /baselines`（read）→ `{"baselines": [...]}`。baseline 为 `{"baseline_id", "name", "manifest_sha256", "files", "bytes", "missing_blobs", "created_at", "created_by"}`；manifest 的 `base` 必须为 null，文件内容经 `PUT /blobs/<sha256>` 上传。基线及其 blob 计入备份。
 
 **12.7 读取补充**
 
+- `GET /events?before=<seq>&limit=<n>`（read）→ `{"events": [...], "min_seq"}`：序号小于 `before` 的最近 `limit` 条全局事件，按序号升序；`before=0` 表示从最新一条开始。用于从新到旧翻看活动。不带 `before` 时仍是 `after=<seq>` 的向后续读。
 - `GET /jobs/{id}/events?before=<seq>&limit=<n>`（read）→ `{"events": [...]}`：该 job 序号小于 `before` 的事件，按序号升序，最多 `limit` 条（1–1000，缺省 200）。
 - `GET /nodes` 的每个节点带 `attempts`：该节点上有效（assigned、leased、running）的 attempt，`[{"attempt_id", "job_id", "title", "status", "epoch", "lease_expires_at", "harness", "model", "effort", "coordinates"}]`；`coordinates` 为 true 表示它是受管协调回合。
 - `GET /checkpoints/{id}/files`（read）→ `{"checkpoint_id", "manifest_sha256", "files": [{"path", "sha256", "size", "executable"}]}`；文件内容用 `GET /blobs/<sha256>` 读取。
 
-## 13. 不在 v1 承诺范围
+## 13. 项目、输入与成果应用、节点管理（向后兼容；旧字段语义不变）
+
+**13.1 项目**
+
+```json
+{"project_id", "name", "revision",
+ "defaults": {"codex": {"model": null, "effort": null, "unverified_nodes": null}, "exclude": null},
+ "baseline": {"baseline_id", "manifest_sha256", "files", "bytes", "at"} | null,
+ "applied": {"application_id", "job_id", "checkpoint_id", "manifest_sha256", "device", "finished_at"} | null,
+ "archived_at", "created_at", "created_by", "updated_at", "updated_by", "jobs", "active_jobs"}
+```
+
+- `defaults` 的每一项为 null 表示沿用工作区的值。`codex.model` 与 `effort` 成对给出或都不给，且必须在部署许可范围内；`exclude` 是项目的排除规则（POSIX 相对 glob），用于执行节点的检查点与成果应用，草拟时写进 `contract.workspace.exclude`。不论排除规则如何，应用成果时都不写 `.git/`、`.hg/`、`.svn/` 下的路径（版本库元数据里有会被执行的钩子）。
+- `revision` 是配置版本：名称、默认策略或归档状态每改一次加一，并留下历史（`GET /projects/{id}` 的 `history`，最近 20 次）。登记输入基线与应用成果不改变 `revision`。
+- 本机目录不在 controller 上。项目对应哪台设备上的哪个目录，是那台设备上的绑定（桌面端的 `projects.json`、CLI 的 `<配置目录>/projects.json`），每台设备各有各的；controller 只在基线的 `source` 里保存目录名等说明。
+- 优先级：任务显式给出的值 > 项目默认值 > 工作区默认值，model 与 effort 逐项判断来源（`model_policy.source`）。受理时冻结：job 带 `project_id`、`project_revision`，`model_policy` 带 `settings_revision`、`project_revision`、解析结果与来源；根工作包的冻结策略带 `project_id`、`project_revision`。之后修改项目默认值或工作区设置不影响已受理的任务（包括排队中的）和它们的修复。同一根工作包的修订属于根所在的项目，换项目返回 400。
+- 归档的项目不接受新的基线、草拟与任务（409 `project_archived`）；它的任务、基线、应用记录都保留并可读，可以取消归档。没有删除项目的端点。
+
+端点（`projects` 能力）：
+
+- `GET /projects`（read）→ `{"projects": [...]}`，含已归档的。`GET /projects/{id}`（read）→ 项目加 `history`。
+- `POST /projects`（tasks）`{"request_id", "name", "defaults"?}` → 201。`PUT /projects/{id}`（tasks）`{"request_id", "expected_revision", "name"?, "defaults"?, "archived"?}` → 更新后的项目；`defaults` 整体替换。`expected_revision` 与当前不同返回 409 `version_mismatch`（`details.current`）。改动 `defaults` 另需 `settings` 权限。
+- `POST /contracts/draft` 与 `POST /jobs` 可带 `project_id`。草拟返回 `settings_revision` 与 `project_revision`；提交带 `expected_settings_revision` 与 `expected_project_revision`，任一与当前不同都返回 409 `version_mismatch`。草拟没有另给输入时用项目最近登记的基线，响应的 `baseline_id` 给出实际所用的那一份。
+- `GET /jobs?project_id=<id>`、`GET /baselines?project_id=<id>` 按项目筛选。
+
+**13.2 输入基线与本机快照**
+
+- `POST /baselines` 可带 `project_id` 与 `source`（≤16 KiB 的说明对象：设备名、目录名、Git 分支与未提交改动数、排除规则、被排除与被跳过的条目数、扫描时间）。baseline 记录相应带这两项；项目的 `baseline` 指向最近登记的一份。重复的 `request_id`（请求体相同）返回第一次登记的那份基线（状态与第一次相同）；请求体不同返回 409。
+- 客户端把一次扫描当作一次登记操作：`request_id` 由这次扫描的身份派生（CLI 的扫描 ID、桌面端的快照 ID），不由内容或扫描时间派生；请求体在第一次发出之前存在本机（CLI 的 `requests/<request_id>.json`，桌面端的快照），恢复时原样重放。内容相同的两次扫描是两次登记，文件内容按哈希复用。
+- `POST /blobs/missing`（tasks）`{"sha256": [...]}`（≤20000 项）→ `{"missing": [...]}`：controller 还没有的内容。客户端只上传缺的（`PUT /blobs/<sha256>`），上传可以中断后重来；重复上传已有的内容返回 200，不产生新对象。
+- `GET /client` 的 `controller.limits` = `{"max_blob_bytes", "max_json_bytes"}`：单个文件与单次请求的上限。文件清单随 `POST /baselines` 内联提交，受 `max_json_bytes` 限制（缺省 2 MiB，约一万余个文件）。
+- 输入清单与它引用的全部内容到齐之前，启用自动恢复的任务处于 `protection: preparing`，不派单，`status_reason` 带 `protection_not_ready;missing_blobs:<sha256,...>`；到齐后变为 `protected` 并可被领取。提供输入的设备在内容到齐后不需要保持在线，也不必是执行节点。
+- 本机快照由 `agent_collab/project.py` 生成，CLI 与桌面端共用：
+  - 只读选定目录之内的普通文件。符号链接与 Windows 重解析点（含目录联接）不跟随、不进入，记为跳过（`link`）；选定的目录本身可以是链接，解析成真实路径后使用。
+  - 缺省排除版本库元数据（`.git/**` 等）、依赖与构建缓存（`node_modules/**`、`.venv/**`、`__pycache__/**` 等）和常见凭据文件（`.env`、`.env.*`、`*.pem`、`*.key`、`id_rsa`、`*.token` 等）；规则可以调整。扫描结果给出文件数、总字节数、被排除的条目与被跳过的文件及原因（`link`、`name_not_portable`、`too_large`、`unreadable`、`special_file`）。
+  - manifest 路径为 NFC 形式；本机文件名不是 NFC 时快照记下它的实际名称。Windows 无法表示的名称（保留设备名、以点或空格结尾、含 `:` 等）记为 `name_not_portable` 并跳过。仅大小写不同的两个路径无法放进同一份输入，扫描失败（`path_conflict`）。可执行位在 POSIX 上取自文件权限；Windows 上沿用上一份输入里同一路径的标记。
+  - 每个文件读取前后核对大小与修改时间，读完后再遍历一次目录比对名称、大小与修改时间；发现变化就整体重扫，三次仍不稳定则失败（`unstable`），不产生混合了新旧内容的快照。
+  - 上传时逐个文件再核对内容哈希；与快照不符说明源文件在扫描后被改过（`source_changed`），这份快照不登记为输入。内容寻址保证改过的文件不会以旧哈希的名义进入基线。
+
+**13.3 成果状态**
+
+四个分开的事实：有检查点（final 检查点已 durable）、已发布（`delivery_version > 0`）、已下载、已应用到项目。
+
+- `POST /jobs/{id}/downloads`（read）`{"request_id", "checkpoint_id", "files", "bytes"}` → 201 `{"download_id", "job_id", "checkpoint_id", "manifest_sha256", "files", "bytes", "by", "at"}`，写 `job.downloaded` 事件。客户端在整包下载完成、每个文件的哈希都核对过之后调用；查看文件清单、文本预览或另存单个文件不登记。
+- `GET /jobs/{id}` 增加 `downloads` 与 `applications` 两个列表。
+- 下载到本机的文件路径只能落在用户选定的目录之内：manifest 路径经 §3 的校验（禁止绝对路径、`..`、盘符），写入时逐级拒绝链接。
+
+**13.4 应用到项目**
+
+应用操作（`applications` 能力）是一条记录：
+
+```json
+{"application_id", "project_id", "job_id", "checkpoint_id", "manifest_sha256", "base_manifest_sha256",
+ "device", "by", "status": "started|applied|partial|conflict|failed|unknown",
+ "plan", "detail", "started_at", "finished_at"}
+```
+
+- `POST /projects/{id}/applications`（tasks）`{"request_id", "application_id", "job_id", "checkpoint_id", "device", "plan"}` → 201，`status: started`。任务必须属于该项目，`checkpoint_id` 必须是它已发布的检查点。客户端在第一次写入之前调用；登记不上就不写。
+- `POST /projects/{id}/applications/{application_id}`（tasks）`{"request_id", "status", "detail"}` → 更新后的记录。只有发起它的客户端可以上报，结果一经确定不能改写。`GET /projects/{id}/applications`（read）列出记录。写 `project.application` 事件。
+- `status` 的含义：`applied` 计划里的改动全部写入；`partial` 写入了一部分（有冲突、出错或被中断后未续完）；`conflict` 因冲突没有写入；`failed` 没有写入或已回滚；`unknown` 被中断且用户选择不再处理。中断的操作停在 `started`。
+- job 的 `integration_status`：只有 `applied` 才置为 `integrated`；`partial` 与 `conflict` 置为 `conflict`；`failed`、`unknown` 与停在 `started` 的不改变它。契约指定了回写目标节点（§11.10）的任务由那条路径决定回写状态。项目的 `applied` 记下最近一次完整应用。
+
+本机的应用规则在 `agent_collab/project.py`，CLI 与桌面端共用：
+
+- 比较三份内容：任务的输入基线、成果、目录当前内容。计划只包含成果相对基线新增、修改、删除的路径；目录里的其他文件（任务期间新建的、未跟踪的、被排除的）不在计划里，不会被写或删。
+- 每个路径的状态：目录内容等于基线为 `clean`，可以应用；等于成果为 `already`；两者都不是为 `conflict`（`modified_locally`、`deleted_locally`、`created_locally`），保留本机内容。路径经过链接或与现有条目仅大小写不同时为 `conflict`（`unsafe_path`）。
+- 并发任务各自在独立工作区执行；它们的成果先后应用到同一个目录时，后一次按自己的基线重新核对：前一次已经改过的文件不再等于后者的基线，记为冲突，不被覆盖。改动互不重叠的成果可以先后应用。同一目录上有一次未完成的应用时，新的应用被拒绝（`unfinished_application`）。
+- 有冲突时缺省什么都不写。用户明确选择“只应用没有冲突的文件”时写入其余文件，结果为 `partial`。
+- 取消只在两个文件之间生效：正在写的文件写完（备份、原子替换、记日志）后不再开始下一个；结果带 `cancelled: true`，未写的文件列在 `pending`，有已写入的文件时为 `partial`，一个都没写时为 `failed`。最后一个文件写完之后才到的取消不改变结果；取消不等于回滚。上报的 `detail` 相应带 `cancelled: true`。
+- 客户端在写入完成后先把要上报的结果连同固定的 `request_id` 存在本机，再发 `POST /projects/{id}/applications/{application_id}`；送不到时按同一个 `request_id` 补报（幂等，controller 只记一次），只向发起这次应用的 controller、用原来的客户端凭据补报。
+- 写入之前：成果内容全部取到并核对哈希，检查磁盘空间。写入时先把将被替换或删除的原文件备份到本机状态目录，再逐个文件原子替换并追加日志；每个文件写入前再核对一次它仍是计划时看到的内容，变了就不动它（`changed_since_plan`）。
+- 整批写入不是跨文件的原子事务。写入中途进程退出、磁盘写满或权限不足时：出错的文件与未写的文件如实列出；被中断的操作留下状态为 `writing` 的日志，下次由 `recover` 逐文件核对目录现状（已写入、未写入、之后又被改动），可以续写、把已写入且之后未再改动的文件恢复成备份里的原样，或按现状结束并记为 `unknown`。
+
+**13.5 节点配对码、维护与退役**（`node_admin` 能力）
+
+- `POST /nodes/codes`（devices）`{"request_id", "node_id", "ttl_s"?, "replace"?}` → 201 `{"code", "node_id", "expires_at"}`。配对码只在这次响应里出现，重复的 `request_id` 返回 409。`node_id` 已登记时必须带 `replace: true`（配对会替换它原有的凭据），否则返回 409 `node_exists`；已退役的节点返回 409 `node_retired`。写 `audit.action` 事件。
+- `POST /nodes/{id}/maintenance`（devices）`{"request_id", "expected_version", "active", "reason"?}` → node。`active` 为 true 时 `reason` 必填（非空，至多 300 字符），为 false 时不需要。进入维护时停止向该节点派单（调度原因 `maintenance`），已在运行的任务不受影响；结束维护时恢复进入维护之前的接单状态（此前已暂停接单的保持暂停）。`GET /nodes` 的每个节点带 `maintenance`（`{"reason", "by", "at", "drain_before"}` 或 null）与 `maintenance_state`：`none`、`draining`（还有任务在运行）、`active`。
+- `POST /nodes/{id}/retire`（devices）`{"request_id", "expected_version", "retired", "reason"?}` → node。`retired` 为 true 时 `reason` 必填（非空，至多 300 字符），为 false 时不需要。退役前必须先处理：该节点上有效的 attempt、当前 attempt 在该节点且处于待对账、恢复中或已请求取消的任务、以该节点为目标且尚未完成的回写、该节点上尚未完成的管理操作、结果待确认的远端写回、把它列为候选的协调设置；否则返回 409 `retire_blocked`，`details.blockers` 是一个对象，只含存在的项：`active_attempts`（attempt_id 列表）、`unsettled_jobs`（job_id 列表）、`pending_integrations`（job_id 列表）、`pending_operations`（状态为 `requested` 或 `received` 的 op_id 列表）、`unsettled_applications`（以该节点为目标、仍为 `started` 的 application_id 列表）、`coordination_profile`（协调 profile 的 id）。
+  - 退役后：节点记录保留（带 `retired_at`、`retired_by`、`retire_reason`），历史 attempt 仍引用它；它的节点凭据与未用的配对码作废；不再出现在 `GET /nodes`、总览的节点列表、调度与调度解释、模型目录与可选组合里，也不再产生在线状态事件。`GET /nodes?retired=1` 列出已退役的节点，总览带 `retired_nodes` 计数。
+  - `retired: false` 恢复身份：记录不变，保持不接单，需要重新配对才有凭据。没有删除节点的端点。
+
+**13.6 节点管理操作与原始日志**（`node_admin`、`raw_logs` 能力）
+
+管理操作是结构化的异步记录，种类是封闭集合，不是远程命令通道：
+
+```json
+{"op_id", "node_id", "kind": "probe|log_tail|project_plan|project_apply|project_recover", "params", "status": "requested|received|succeeded|failed|timed_out",
+ "requested_by", "requested_at", "received_at", "finished_at", "deadline_at", "result", "error"}
+```
+
+- `POST /nodes/{id}/operations`（devices）`{"request_id", "kind", "params"?}` → 201 op。这里只接受 `probe`；`log_tail` 经 `POST /jobs/{id}/logs`，三种项目操作经项目端点，在这里返回 400。`GET /nodes/{id}/operations`（read）列出最近 50 项（不带 `result`），`GET /operations/{op_id}`（read）读取单项。写 `node.operation` 事件。
+- 节点在心跳响应的 `operations` 里领取状态为 `requested` 的操作，`POST /nodes/{id}/operations/{op_id}`（节点凭据）上报 `received`，执行后上报 `succeeded` 或 `failed`（带 `result` 或 `error`，结果 ≤768 KiB）。超过 `node_operation_timeout_s`（缺省 120 秒；远端项目写回的三种操作用 `project_operation_timeout_s`，见 §13.10）没有完成记 `timed_out`，不重发；结果已定后的上报不改变它（远端写回的对账例外，见 §13.10）。不认识 `operations` 的旧节点不会领取，操作到期后记 `timed_out`。记录在完成一天后清除。
+- `probe`：节点在自己的服务进程上下文里重新运行官方 CLI 的登录状态探测与模型目录探测（不调用模型），返回 `{"at", "auth": {"codex": {"status", "reason", "command", "disabled"}, "claude": {...}}, "harness", "catalog": {"codex": {"status", "reason", "provider", "models"}}, "context": {"user", "pid", "ssh", "tty", "launchd_label", "windows_session", "systemd_unit", "version", "version_dir", "platform"}}`。用户在节点本机按官方方式登录后，用它确认后台服务读得到凭据；探测之后节点刷新并重新上报认证状态与目录。
+- 远程提供的节点管理是暂停与恢复接单（`POST /nodes/{id}/drain`）、排空并迁移、维护状态、退役与上述操作，它们都不中断节点与 controller 之间的连接。停止或启动整个节点服务不经 controller 下发：服务停下后心跳通道随之断开，无法再经它启动；这两个动作在节点本机进行（`agent-collab service stop|start`，或该设备上桌面端的本机服务面板）。
+
+原始日志与事件是三种不同的东西：
+
+- 产品事件（`GET /events`、`GET /jobs/{id}/events`）：controller 记录的状态变化与节点上报的进度，不是 CLI 的完整输出。
+- 检查摘要（attempt 的 `report.checks`）：每项检查的退出码与标准输出、标准错误的尾部，各 ≤4 KiB。
+- 原始输出：harness 与检查进程的完整标准输出与标准错误，只保存在执行节点的 attempt 目录里。
+- `POST /jobs/{id}/logs`（read）`{"request_id", "attempt_id", "stream"?, "offset"?, "max_bytes"?}` → 201 op（`kind: log_tail`），客户端随后读取 `GET /operations/{op_id}`。`attempt_id` 必须属于该任务；`stream` 为 `index`（缺省，列出可取的输出）、`harness.stdout`、`harness.stderr`、`check.<n>.stdout|stderr`、`step.<n>.stdout|stderr`（n 为 0–99）；`max_bytes` 为 1–262144。节点只按 attempt 目录的固定布局取这些文件，没有按路径读取的接口。`stream` 为 `index` 时结果为 `{"retained", "streams": [{"stream", "bytes"}]}`（取不存在的流另带 `missing: true`）；取具体的流时结果为 `{"retained", "streams", "stream", "offset", "next_offset", "total_bytes", "eof", "data"}`：`retained: false` 表示该节点上已没有这个 attempt 的本地文件；`data` 是经节点脱敏的文本，按 `next_offset` 继续读取下一块。
+
+**13.7 协调设置**（`coordination_settings` 能力）
+
+- `GET /settings/coordination`（read）→ `{"settings": {"revision", "updated_at", "updated_by", "enabled", "node_ids"}, "effective", "unknown_nodes", "history"}`。`effective` 是受管协调回合实际使用的配置（同 `GET /overview` 的 `managed_coordinator`）；`unknown_nodes` 列出不在已登记节点里的 ID。还没有经 API 保存过时 `revision` 为 0，`enabled` 与 `node_ids` 取自 `config.json` 当前生效的 profile。
+- `PUT /settings/coordination`（settings）`{"request_id", "expected_revision", "enabled", "node_ids"}` → 更新后的 settings；版本冲突返回 409 `version_mismatch`。已退役的节点不能列入。保存之后（`revision > 0`），是否启用与候选节点由这份设置决定；协调模型与 effort 取 §12.3 的 `claude.default`，未设置时取 `config.json` 的 profile。没有模型或没有候选节点时 `effective.status` 为 `profile_missing`，协调回合不创建。
+- Codex 执行策略（`settings/models` 的 `codex`、项目默认值）与 Claude 协调策略（`claude.default` 与本节）是两组设置，互不覆盖。
+
+**13.8 节点回写目标的范围**
+
+节点配置 `agent.json` 的可选键 `integration_roots`（绝对路径列表）：给出时，§11.10 的回写目标必须在其中某个目录之内（解析链接后比较），否则该回写上报 `conflict` 且不写入。未配置时行为不变。
+
+**13.9 提交闸门、备份后的活动与切换屏障**
+
+- 提交闸门：`POST /intake`（maintain）`{"request_id", "expected_version", "mode": "open|acceptance|closed", "reason"?}` → meta；`expected_version` 是 `GET /overview` 的 `controller.metadata_version`，`mode` 不是 `open` 时必须给原因。`GET /overview` 带 `intake: {"mode", "reason", "by", "at"}`。写 `controller.intake` 事件。
+  - `closed`：`POST /jobs` 对任何凭据（含管理令牌）返回 409 `intake_closed`。读取、对已有任务的操作、节点上报与 controller 自己创建的协调回合和修复不受影响。
+  - `acceptance`：只接受验收运行，即请求带 `acceptance_run: true`、提交者具备 `maintain` 权限、不属于项目（既不带 `project_id`，`work_package_id` 也不指向属于项目的根：项目任务的修订同样被拒绝）、契约没有回写目标节点、`recovery.side_effects` 为 `none`；不满足形状的返回 400，没带标记的返回 409 `intake_closed`。
+  - 任意模式下都可以提交验收运行；job 带 `acceptance_run`，`GET /jobs?acceptance_run=1` 列出它们。
+- 备份清单（`backup-manifest.json`）带 `event_seq`：快照里最后一条事件的序号。
+- `GET /activity?after=<seq>`（read）→ `{"after", "last_seq", "jobs": [{"job_id", "title", "acceptance_run", "coordinates", "project_id"}], "ordinary_jobs", "acceptance_jobs", "counts", "disposable"}`：序号大于 `after` 的事件里受理的任务与各类事实的数量（确认的检查点、发布、验收、下载、基线、项目、节点写回 `integrated`、已写入或结果未知的应用 `applications_written`、其间开始且仍没有最终结果的应用 `applications_unsettled` 等）。协调回合随它协调的任务归类。`disposable` 为 true 表示其间没有普通任务，也没有任何写回、已写入或结果未定的应用。
+- 切换屏障：`agent-collab controller barrier --data-dir D --request-id <UUID> --reason R`，在已停止的 controller 上运行。要求派单已暂停、提交闸门不是 `open`。它把恢复代次加一并撤销此前签发的全部执行权（与 `restore` 相同的处理，但数据不回退）：attempt 的租约令牌作废、进行中的 attempt 记为失联、未结束的任务停在 `waiting_reconcile`（`stale_generation`）、协调租约失效、节点下次心跳被要求对账；尚未被节点领取（`requested`）的管理操作记 `failed`（`error: stale_generation`；从备份恢复只作废通用操作，不作废项目写回与恢复，因为备份之后节点可能已经执行过它们）；其中未领取的 `project_apply` 对应的远端写回记 `failed`（`reason: stale_generation`，`written` 为空），未领取的 `project_recover` 不改变应用记录（仍为 `started`，可以再次 recover）；已领取的照常对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果。普通的停止再启动保留恢复代次、租约与协调租约。
+
+**13.10 远端项目写回**（`remote_apply` 能力）
+
+成果经目标节点的受限操作写回该节点本机绑定的项目目录。它与 §11.10 是两条路径：§11.10 在受理时由契约指定目标节点与绝对路径，controller 保存并下发这个路径，发布后自动回写；本节的目录只在节点本机授权，controller 从不保存、下发或接收路径，写回由客户端在审阅之后显式发起，每次写回是一条 §13.4 的应用记录。§11.10 不变。
+
+- 目录授权在节点本机：`agent-collab agent project-bind --data-dir <节点数据目录> <project_id> <目录>`、`project-unbind --data-dir D <project_id>`、`project-bindings --data-dir D`。绑定保存在节点数据目录的 `project-bindings.json`，目录解析链接后保存；节点配置了 `integration_roots`（§13.8）时必须在其中，否则拒绝（`outside_integration_roots`）。每次执行前再核对一次：目录仍存在（`not_a_directory`）、仍解析到绑定时的那个真实目录（被换成链接时 `binding_changed`）、仍在 `integration_roots` 之内。
+- 声明：注册响应的 `features` 含 `remote_apply` 时，节点在注册的 `capabilities.project_bindings` 里上报 `[{"project_id", "root_name"}]`（只有目录名，至多 256 项；形状不符的注册返回 400）。节点得知该能力后立即带上绑定再注册一次；绑定改动后不需要重启服务，下一次心跳之后重新注册。`GET /nodes` 的节点 `capabilities` 与 `GET /projects`、`GET /projects/{id}` 的 `remote_targets: [{"node_id", "root_name", "status"}]` 给出这些声明；已退役的节点不算。
+- 端点（读取需要 `read`，其余需要 `tasks`）：
+  - `POST /projects/{id}/plans` `{"request_id", "job_id", "node_id"}` → 201 op（`kind: project_plan`），结果经 `GET /operations/{op_id}` 读取。
+  - `POST /projects/{id}/applications` 带 `node_id` 时是远端写回：`{"request_id", "application_id", "job_id", "checkpoint_id", "node_id", "expected_base_manifest_sha256", "skip_conflicts"?, "plan"?}` → 201 应用记录，`status: started`，另带 `target_node_id`、`operation_id`（这次写回的 `project_apply` 操作）与 `skip_conflicts`，`device` 为节点名。`expected_base_manifest_sha256` 必填（任务没有输入时为 null）；它与 `checkpoint_id` 是客户端审阅时看到的值，与任务当前的输入基线、已发布检查点不一致返回 409 `conflict`（`details.current`）。不接受 `device` 与其他字段。应用 ID 由客户端给出，不能复用；同一 `request_id` 按 §5 的幂等规则重放原记录，不产生第二项操作。
+  - `GET /projects/{id}/applications/{application_id}`（read）→ 应用记录（本机应用与远端写回都适用）。
+  - `POST /projects/{id}/applications/{application_id}/recover` `{"request_id", "action": "status|resume|rollback|abandon"}` → 201 op（`kind: project_recover`）。只用于远端写回、且记录仍为 `started`，否则 409。`status` 以外的动作在这次应用的 `project_apply` 或另一个非 status 的 `project_recover` 仍为 `requested` 或 `received` 时返回 409（`details.operation_id` 是那项操作）；受理后应用记录带 `recovery_operation_id`，此后只认这项操作的结果，超时后晚到的原应用结果不再结束记录。
+  - 校验：任务属于该项目且有已发布检查点（409）；节点在册（404）、未退役（409 `node_retired`）、声明了该项目的绑定（409 `not_bound`）；项目未归档（写回，409 `project_archived`）。
+  - 操作参数全部由 controller 按任务记录填写：`project_id`、`job_id`、`checkpoint_id` 与 `manifest_sha256`（已发布检查点）、`base_manifest_sha256`（任务的输入基线，可为 null）、`exclude`（契约的 `workspace.exclude`）；写回另有 `application_id`、`skip_conflicts`，恢复另有 `application_id`、`action`。通用的 `POST /nodes/{id}/operations` 不接受这三种操作（400）。远端写回的结果只由目标节点上报：经 `POST /projects/{id}/applications/{application_id}` 上报远端写回返回 403。
+- 已上报过结果的 `project_apply` 或 `project_recover` 又被下发（controller 没有它的结果，例如从备份恢复回到了领取之前）时，节点不重新执行，确认领取后按本机应用日志补报当时的结果。
+- 节点执行：只在绑定目录上调用 `agent_collab/project.py` 的 plan、apply、recover（§13.4 的规则：三方比较、冲突缺省不写、`skip_conflicts` 时部分写入、逐文件备份与日志、中断后续写、回滚或按现状结束）；应用日志与备份在节点数据目录的 `projects/` 里。manifest 与成果内容用节点令牌经 `GET /blobs/<sha256>` 取得并核对哈希（节点令牌此前就可读 blob，没有新增权限）。节点同一时间只执行一项这类操作。
+- 结果：
+  - `project_plan`：`result` 为计划（`changes`、`summary`、`base_manifest_sha256`、`manifest_sha256`、`root_name`），没有 `root`。过长时截断：冲突排在前面保留，带 `truncated` 与原条数 `counts`。
+  - `project_apply` 与非 status 的 `project_recover`：`result.application = {"status", "detail"}`，controller 用它结束应用记录，规则同 §13.4：`integration_status` 只有 `applied` 置 `integrated`，`partial`、`conflict` 置 `conflict`，`applied` 更新项目的 `applied`。回滚全部完成记 `failed` 并带 `rolled_back: true`。
+  - `detail` 只含相对路径与原因：`changed`、`already`、`pending`、`conflicts`、`errors`、`restored`、`kept`、`written`、`remaining`、`diverged`、`summary`（节点上报到哪些就有哪些），没写入就结束的带 `reason`、`message` 与 `written: []`，另加 `operation_id`；过长时同样截断。不含任何绝对路径：备份目录不上报，错误文本里的本机目录换成目录名、节点数据目录换成 `<node-data>`。
+  - `project_recover` 的 `status`：`result.report` 是目录现状（`interrupted`、`written`、`remaining`、`diverged`），不改变应用记录。`abandon` 而节点上没有这次写回的本机记录时记 `unknown`（`reason: no_local_record`）。
+  - 第一次写入之前出错（未绑定、超出 `integration_roots`、目录上有未完成的应用、取内容失败、空间不足等）：操作 `failed`，应用 `failed`，`detail.written` 为空。写入开始后出错且本机日志没有最终结果：操作 `failed`，应用保持 `started`（结果待确认），用 recover 处理。
+- 时限与对账：三种操作的时限都是 `project_operation_timeout_s`（controller 配置，缺省 1800 秒）。
+  - 节点从未上报 `received` 就到期：操作 `timed_out`，写回的应用记录结束为 `failed`（`detail.reason: not_received`，`written: []`）。节点之后上报 `received` 得到 `timed_out`，按约定放弃，不再执行。
+  - 已上报 `received` 但到期没有结果：操作 `timed_out`，应用保持 `started`（结果待确认），不当作失败。节点之后上报的结果仍更新应用记录（这是对账，不是重复执行）；操作状态仍为 `timed_out`，另带 `reported_status`、`reported_late_at` 与结果。应用待确认期间这项操作不被清除，对账之后再保留一天。
+  - 节点离线时不会有任何一项显示为成功。
+- 不重复执行：节点在确认领取之前把操作落盘到 `<节点数据目录>/operations/<op_id>.json`，开始执行之前记为 `running`。进程重启后见到 `running` 的操作不再执行：写回类按本机应用日志补报能确定的结果（没有日志说明一个文件都没写，应用记 `failed`、`reason: interrupted_before_write`；日志已有最终结果就补报它；日志停在写入中就报告操作失败，应用保持 `started`）。结果上报失败时留在本地，之后补报；见过的 `op_id` 不再处理。管理请求超时、客户端重试与节点重启都不会让同一次写回写第二次。
+- 已知限制：节点重启后第一次注册不带绑定，紧接着的那次注册带上，其间指向该节点的请求得到 `not_bound`。
+
+## 14. 不在 v1 承诺范围
 
 活进程迁移、模型内部推理状态、未上传的本地改动、任意 Shell 或模型调用的 exactly-once、控制面高可用。见 README 的保障说明。

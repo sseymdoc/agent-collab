@@ -428,6 +428,8 @@ class App:
         record = self.store.get('pairing', hashed)
         if not record or not hmac.compare_digest(record['hash'], hashed) or record['expires'] <= self.clock() or record['node_id'] != data['node_id']:
             raise APIError('unauthorized', 'invalid or expired pairing code')
+        if (self.store.get('node', data['node_id']) or {}).get('retired_at'):
+            raise APIError('node_retired', 'this node identity is retired; restore it before pairing again')
         self.store.delete('pairing', hashed)
         for credential in self.store.all('node_token'):
             if credential['node_id'] == data['node_id']:
@@ -445,7 +447,9 @@ class App:
     def controller_info(self):
         meta = self.meta()
         return {'controller_id': meta['controller_id'], 'authority_generation': meta['authority_generation'],
-                'version': RELEASE['version'], 'git_commit': RELEASE['git_commit'], 'features': list(p.FEATURES)}
+                'version': RELEASE['version'], 'git_commit': RELEASE['git_commit'], 'features': list(p.FEATURES),
+                # 客户端在扫描本地输入时据此判断哪些文件超出上传上限（§13.2）。
+                'limits': {k: self.config[k] for k in ('max_blob_bytes', 'max_json_bytes')}}
 
     def pair_client(self, data):
         name, kind = data.get('name'), data.get('kind')
@@ -477,15 +481,20 @@ class App:
         return client
 
     def model_settings(self):
-        return self.store.get('settings', 'models')
+        settings = self.store.get('settings', 'models')
+        settings['codex'].setdefault('unverified_nodes', 'wait')  # 此前版本写下的设置没有这一项
+        return settings
 
     def root_policy(self, root_id):
         """根工作包冻结的模型策略；升级前创建的根按原行为推导（§12.4）。"""
         policy = self.get('root', root_id).get('model_policy')
         return policy or d.legacy_root_policy(next(j for j in self.store.all('job') if j['work_package_id'] == root_id))
 
-    def _resolve_contract(self, value, root_id):
-        """受理时把 codex 的 model/effort 解析成确定值并校验契约；返回 (契约, model_policy)。"""
+    def _resolve_contract(self, value, root_id, project=None):
+        """受理时把 codex 的 model/effort 解析成确定值并校验契约；返回 (契约, model_policy)。
+
+        新的根工作包：任务显式给出的值 > 项目默认值 > 工作区默认值（§13.1）。已有根的后续修订只读根冻结的策略。
+        """
         policy = None
         if isinstance(value, dict) and value.get('harness') == 'codex' and isinstance(value.get('harness_params', {}), dict):
             if root_id and self.store.get('root', root_id):
@@ -495,22 +504,35 @@ class App:
                 asked = value.get('harness_params', {}).get('model')
                 if asked is not None and base['model'] is not None and asked != base['model']:
                     raise d.PolicyError('model_not_allowed', 'revisions of a work package keep the model frozen at its root')
+                unverified, project_revision = base.get('unverified_nodes', 'wait'), frozen.get('project_revision')
             else:
                 settings = self.model_settings()
-                base = dict(settings['codex']['default'], allowed=settings['codex']['allowed'])
-                source, revision = 'workspace_default', settings['revision']
+                pair, source, unverified = d.project_base(settings, project)
+                base, revision = dict(pair, allowed=settings['codex']['allowed']), settings['revision']
+                project_revision = project['revision'] if project else None
             resolved, requested, sources = d.resolve_codex(value.get('harness_params', {}), base, source)
             value = dict(value, harness_params=dict(value.get('harness_params', {}), **resolved))
-            policy = {'schema': 1, 'settings_revision': revision, 'requested': requested, 'resolved': resolved, 'source': sources}
+            # unverified_nodes 与模型一起在受理时冻结：之后改设置不会让已受理的任务悄悄换一种派单策略（§12.5）。
+            policy = {'schema': 1, 'settings_revision': revision, 'requested': requested, 'resolved': resolved, 'source': sources,
+                      'unverified_nodes': unverified}
+            if project_revision is not None:
+                policy['project_revision'] = project_revision  # 受理时所用的项目配置版本
         return d.validate_contract(value), policy
 
     def _model_settings_view(self):
-        settings, nodes = self.model_settings(), self.store.all('node')
+        # 已退役的节点不进目录视图，也不计入可选组合（§13.5）。
+        settings, nodes = self.model_settings(), [n for n in self.store.all('node') if not n.get('retired_at')]
+        now, max_age = self.clock(), self.config['catalog_max_age_s']
         unknown = {'status': 'unknown', 'source': None, 'fetched_at': None, 'cli_version': None,
                    'reason': 'no_catalog_interface', 'models': []}
-        catalog = {n['node_id']: {'codex': d.codex_catalog(n), 'claude': (n['capabilities'].get('models') or {}).get('claude') or unknown}
-                   for n in nodes}
-        return response({'settings': settings, 'catalog': {'nodes': catalog}, 'selectable': d.selectable_codex(settings, nodes),
+        catalog = {}
+        for n in nodes:
+            codex = d.codex_catalog(n)
+            # state 是按有效期算出的当前状态：expired 的目录仍照原样列出，但不再当作当前能力。
+            catalog[n['node_id']] = {'codex': dict(codex, state=d.catalog_state(codex, now, max_age)),
+                                     'claude': (n['capabilities'].get('models') or {}).get('claude') or unknown}
+        return response({'settings': settings, 'catalog': {'nodes': catalog, 'max_age_s': max_age},
+                         'selectable': d.selectable_codex(settings, nodes, now, max_age),
                          'history': self.store.all('settings_history')[-20:]})
 
     def _put_model_settings(self, data, identity):
@@ -521,7 +543,11 @@ class App:
             raise ValueError('expected_revision is required')
         if data['expected_revision'] != current['revision']:
             raise APIError('version_mismatch', 'settings changed', current=current)
-        values = d.validate_model_settings(data.get('codex', current['codex']), data.get('claude', current['claude']))
+        codex = data.get('codex', current['codex'])
+        if isinstance(codex, dict) and 'unverified_nodes' not in codex:
+            # 不认识这一项的旧客户端保存 codex 设置时保持它原来的值，不把显式开启的策略悄悄改回缺省。
+            codex = dict(codex, unverified_nodes=current['codex']['unverified_nodes'])
+        values = d.validate_model_settings(codex, data.get('claude', current['claude']))
         updated = dict(values, revision=current['revision'] + 1, updated_at=d.timestamp(now), updated_by=self.actor(identity))
         self.store.put('settings', 'models', updated)
         self.store.put('settings_history', '%012d' % updated['revision'], {
@@ -540,44 +566,657 @@ class App:
         manifest = p.validate_manifest(data['manifest'])
         if manifest['base'] is not None:
             raise ValueError('baseline manifest must not have a base')
+        if set(data) - {'request_id', 'name', 'manifest', 'project_id', 'source'}:
+            raise ValueError('unknown baseline fields')
+        project = self._project(data['project_id'], usable=True) if data.get('project_id') is not None else None
+        # source：这份输入从哪里来（哪台设备、目录名、Git 状态、排除规则、被跳过的文件数）。只作说明，不含绝对路径之外的机密；
+        # 本机目录的绝对路径不放在这里，它属于那台设备上的绑定（§13.2）。
+        source = data.get('source')
+        if source is not None and (not isinstance(source, dict) or len(p.canonical_json(source)) > 16384):
+            raise ValueError('baseline source must be an object of at most 16 KiB')
         ident, now = new_id(), self.clock()
         # 记入 manifest_refs，备份按它收集基线的 manifest 与已上传的 blob。
         digest = self.remember_manifest('baseline:' + ident, manifest)
         record = {'baseline_id': ident, 'name': name.strip(), 'manifest_sha256': digest, 'files': len(manifest['files']),
-                  'bytes': sum(f['size'] for f in manifest['files']), 'created_at': d.timestamp(now), 'created_by': self.actor(identity)}
+                  'bytes': sum(f['size'] for f in manifest['files']), 'created_at': d.timestamp(now), 'created_by': self.actor(identity),
+                  'project_id': project['project_id'] if project else None, 'source': clean(source)}
         self.store.put('baseline', ident, record)
+        if project:
+            # 项目记下它最近登记的输入基线；这不是配置变更，不递增 revision。
+            self.store.put('project', project['project_id'], dict(project, baseline={
+                'baseline_id': ident, 'manifest_sha256': digest, 'files': record['files'], 'bytes': record['bytes'], 'at': record['created_at']}))
         self.emit('baseline.created', record, now)
         return response(self._baseline_view(record), 201)
 
     def _draft(self, data):
         """§12.6：模板 + 目标 → 可提交的契约；不改变状态。"""
         manifest, warnings = data.get('inputs_manifest'), []
-        if data.get('baseline_id') is not None:
+        project = self._project(data['project_id'], usable=True) if data.get('project_id') is not None else None
+        baseline_id = data.get('baseline_id')
+        if baseline_id is None and manifest is None and project and project.get('baseline'):
+            baseline_id = project['baseline']['baseline_id']  # 没有另行指定时用项目最近登记的输入
+        if baseline_id is not None:
             if manifest is not None:
                 raise ValueError('give baseline_id or inputs_manifest, not both')
-            manifest = self.manifest(self.get('baseline', data['baseline_id'])['manifest_sha256'])
+            baseline = self.get('baseline', baseline_id)
+            if project and baseline.get('project_id') not in (None, project['project_id']):
+                raise ValueError('baseline belongs to another project')
+            manifest = self.manifest(baseline['manifest_sha256'])
         if manifest is None:
             manifest = {'version': 1, 'base': None, 'files': [], 'deleted': []}
             warnings.append({'code': 'empty_inputs', 'detail': 'no input baseline was chosen; the workspace starts empty'})
         elif self.blobs.missing(p.validate_manifest(manifest)):
             warnings.append({'code': 'missing_blobs', 'detail': 'some input files are not uploaded yet; the job waits until they are'})
         title, request = d.draft_contract(data, manifest)
-        contract, policy = self._resolve_contract(request, None)
+        if project and project['defaults']['exclude'] is not None:
+            # 项目的排除规则同时用于节点上的检查点与成果应用：被排除的文件不会因快照里没有它而被当作删除。
+            request['workspace'] = {'exclude': list(project['defaults']['exclude'])}
+        contract, policy = self._resolve_contract(request, None, project)
         settings = self.model_settings()
         if policy:
-            choice = d.selectable_codex(settings, self.store.all('node'))
+            choice = d.selectable_codex(settings, self.store.all('node'), self.clock(), self.config['catalog_max_age_s'])
             supported = any(e['model'] == policy['resolved']['model'] and policy['resolved']['effort'] in e['efforts'] for e in choice['codex'])
             if not supported and not choice['unknown_nodes']:
                 warnings.append({'code': 'no_node_supports_model', 'detail': 'no registered node lists this model and effort; the job would wait'})
+            elif not supported and policy['unverified_nodes'] == 'allow':
+                warnings.append({'code': 'unverified_node_attempt', 'detail': 'no node with a verified catalog lists this model and effort; '
+                                 'the job may be tried on a node whose catalog is unverified, as the settings allow'})
+            elif not supported:
+                warnings.append({'code': 'no_verified_node_supports_model', 'detail': 'no node with a verified catalog lists this model and effort; '
+                                 'the job waits until one does, or until unverified attempts are enabled in the settings'})
+        # 提交时带回这两个版本：工作区设置或项目默认值在草拟后变了，受理会被拒绝而不是按没看过的解析结果进行。
         return response({'title': title, 'contract': request, 'preview': contract, 'model_policy': policy,
-                         'settings_revision': settings['revision'], 'warnings': warnings})
+                         'settings_revision': settings['revision'], 'project_id': project['project_id'] if project else None,
+                         'project_revision': project['revision'] if project else None, 'baseline_id': baseline_id, 'warnings': warnings})
 
     def _submit(self, data, identity):
         expected = data.get('expected_settings_revision')
         if expected is not None and expected != self.model_settings()['revision']:
             # 草拟时看到的解析结果已过期：让客户端重新草拟，而不是按新默认值悄悄受理。
             raise APIError('version_mismatch', 'model settings changed since the contract was drafted', current=self.model_settings())
-        return self._create_job(data, created_by=self.actor(identity))
+        project = self._project(data['project_id'], usable=True) if data.get('project_id') is not None else None
+        root = self.store.get('root', data['work_package_id']) if isinstance(data.get('work_package_id'), str) else None
+        if project is None and root and root.get('project_id'):
+            # 修订属于根所在的项目：没带 project_id 也按那个项目受理（归档、版本与验收运行检查都用它）。
+            project = self._project(root['project_id'], usable=True)
+        expected = data.get('expected_project_revision')
+        if expected is not None and (project is None or expected != project['revision']):
+            raise APIError('version_mismatch', 'project settings changed since the contract was drafted', current=project)
+        acceptance_run = self._intake_check(data, identity, project)
+        return self._create_job(data, created_by=self.actor(identity), project=project, acceptance_run=acceptance_run)
+
+    # ------------------------------------------------------------ 提交闸门与切换（§13.9）
+
+    def intake(self):
+        return self.meta().get('intake') or {'mode': 'open', 'reason': None, 'by': None, 'at': None}
+
+    def _intake_check(self, data, identity, project=None):
+        """普通提交是否开放由 controller 决定，不靠约定。返回这次提交是否是验收运行。
+
+        acceptance 模式只接受带 acceptance_run 标记、由有 maintain 权限的主体提交、且不产生外部写入的任务：
+        不属于项目、没有回写目标、不声明外部副作用。这样的任务带标记保存，事后可以整批识别。
+        """
+        mode, marked = self.intake()['mode'], data.get('acceptance_run') is True
+        if 'acceptance_run' in data and type(data['acceptance_run']) is not bool:
+            raise ValueError('acceptance_run must be boolean')
+        if mode == 'closed':
+            raise APIError('intake_closed', 'the controller is not accepting new jobs', intake=self.intake())
+        if mode == 'acceptance' and not marked:
+            raise APIError('intake_closed', 'only acceptance runs are accepted for now', intake=self.intake())
+        if marked:
+            self.allow(identity, 'maintain')
+            contract = data.get('contract') if isinstance(data.get('contract'), dict) else {}
+            integration = contract.get('integration') if isinstance(contract.get('integration'), dict) else {}
+            recovery = contract.get('recovery') if isinstance(contract.get('recovery'), dict) else {}
+            if project is not None or data.get('project_id') is not None or integration.get('target_node_id') or recovery.get('side_effects', 'none') != 'none':
+                raise ValueError('an acceptance run must not belong to a project, write back to a node, or declare side effects')
+        return marked
+
+    def _set_intake(self, data, identity):
+        meta, now = self.meta(), self.clock()
+        self.version(data, meta)
+        mode, reason = data.get('mode'), data.get('reason')
+        if mode not in ('open', 'acceptance', 'closed') or (mode != 'open' and (not isinstance(reason, str) or not reason.strip())):
+            raise ValueError('mode must be open, acceptance or closed; closing or restricting intake requires a reason')
+        meta = self.change('meta', meta, now, intake={'mode': mode, 'reason': reason.strip() if isinstance(reason, str) and reason.strip() else None,
+                                                     'by': self.actor(identity), 'at': d.timestamp(now)})
+        self.emit('controller.intake', meta['intake'], now)
+        return response(meta)
+
+    def _activity(self, after):
+        """序号大于 after 的事件里产生了什么：用来判断一份备份之后是否已有不能丢弃的状态。"""
+        jobs, counts = {}, {}
+        rows = self.store.db.execute('SELECT data FROM events WHERE seq>? ORDER BY seq', (after,))
+        last, started = after, {}
+        for row in rows:
+            event = json.loads(row[0])
+            last = event['seq']
+            kind, payload = event['type'], event['payload'] or {}
+            if kind == 'job.created':
+                jobs[event['job_id']] = {'job_id': event['job_id'], 'title': payload.get('title'), 'acceptance_run': bool(payload.get('acceptance_run')),
+                                         'coordinates': bool((payload.get('contract') or {}).get('coordinates')), 'project_id': payload.get('project_id')}
+            elif kind in ('checkpoint.durable', 'job.published', 'job.assessed', 'job.downloaded', 'baseline.created', 'project.created',
+                          'client.paired', 'node.registered', 'node.retired'):
+                counts[kind] = counts.get(kind, 0) + 1
+            elif kind == 'job.integration' and payload.get('status') == 'integrated':
+                counts['integrated'] = counts.get('integrated', 0) + 1
+            elif kind == 'project.application':
+                if payload.get('status') in ('applied', 'partial', 'unknown'):  # 结果未知也可能写了文件
+                    counts['applications_written'] = counts.get('applications_written', 0) + 1
+                started[payload.get('application_id')] = payload.get('status') == 'started'
+        # 协调回合跟随它协调的目标：目标是验收运行，它也算验收运行。
+        targets = {j['job_id']: j for j in self.store.all('job')}
+        for entry in jobs.values():
+            job = targets.get(entry['job_id'])
+            target = job and job['contract'].get('coordinates')
+            if target and (targets.get(target['job_id']) or {}).get('acceptance_run'):
+                entry['acceptance_run'] = True
+        ordinary = [j for j in jobs.values() if not j['acceptance_run']]
+        # 还没有最终结果的应用可能已经写了一部分文件：同样不可丢弃。
+        counts['applications_unsettled'] = sum(started.values())
+        written = counts.get('integrated', 0) + counts.get('applications_written', 0) + counts['applications_unsettled']
+        return response({'after': after, 'last_seq': last, 'jobs': list(jobs.values()), 'ordinary_jobs': len(ordinary),
+                         'acceptance_jobs': len(jobs) - len(ordinary), 'counts': counts,
+                         # 只有验收运行、且没有任何写回：恢复这份备份只丢掉可丢弃的验收状态。
+                         'disposable': not ordinary and not written})
+
+    # ------------------------------------------------------------ 节点管理（§13.5、§13.6）
+
+    def active_nodes(self):
+        """未退役的节点。退役的节点只保留记录，供历史任务引用（§13.5）。"""
+        return [n for n in self.store.all('node') if not n.get('retired_at')]
+
+    def coordination_profile(self):
+        return d.managed_profile(self.config, self.model_settings()['claude']['default'], self.store.get('settings', 'coordination'))
+
+    def _node_code(self, data, identity):
+        """签发节点配对码。与客户端配对码一样只在这一次响应里出现，重复的 request_id 被拒绝。"""
+        ident, now = require_uuid(data.get('request_id'), 'request_id'), self.clock()
+        if self.store.get('node_code_request', ident):
+            raise APIError('conflict', 'request_id was already used to issue a pairing code')
+        node_id, ttl = p.check_node_id(data.get('node_id')), data.get('ttl_s', 600)
+        if type(ttl) is not int or not 0 < ttl <= 3600:
+            raise ValueError('ttl_s must be between 1 and 3600 seconds')
+        existing = self.store.get('node', node_id)
+        if existing and existing.get('retired_at'):
+            raise APIError('node_retired', 'this node identity is retired; restore it before pairing again')
+        # 用配对码配对会替换该节点原有的凭据：对已登记的节点必须明确要求更换，避免无意中顶掉一台在用的设备。
+        if existing and data.get('replace') is not True:
+            raise APIError('node_exists', 'node is already registered; pass replace=true to issue a code that replaces its credential')
+        code = secrets.token_hex(18)
+        self.store.put('pairing', digest_token(code), {'hash': digest_token(code), 'node_id': node_id, 'expires': now + ttl})
+        self.store.put('node_code_request', ident, {'at': d.timestamp(now)})
+        self.store.event('audit.action', {'actor': self.actor(identity), 'action': 'POST /nodes/codes', 'request_id': ident,
+                                          'node_id': node_id, 'replace': bool(existing)}, d.timestamp(now), node_id=node_id)
+        return response({'code': code, 'node_id': node_id, 'expires_at': d.timestamp(now + ttl)}, 201)
+
+    def _maintenance(self, node, data, identity):
+        """受控维护：停止向该节点派单并标明原因；已在运行的任务不受影响。结束维护时恢复进入维护前的接单状态。"""
+        self.version(data, node)
+        if node.get('retired_at'):
+            raise APIError('node_retired', 'node is retired')
+        if type(data.get('active')) is not bool:
+            raise ValueError('active must be boolean')
+        now, current = self.clock(), node.get('maintenance')
+        if data['active']:
+            reason = data.get('reason')
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > 300:
+                raise ValueError('maintenance requires a reason')
+            maintenance = {'reason': reason.strip(), 'by': self.actor(identity), 'at': current['at'] if current else d.timestamp(now),
+                           'drain_before': current['drain_before'] if current else node['drain']}
+            node = self.change('node', node, now, drain=True, maintenance=maintenance)
+        elif current:
+            node = self.change('node', node, now, drain=current['drain_before'], maintenance=None)
+            self._schedule(now)
+        return response(node)
+
+    def _retire_blockers(self, node):
+        node_id, blockers = node['node_id'], {}
+        active = [a['attempt_id'] for a in self.store.all('attempt') if a['node_id'] == node_id and a['status'] in p.ATTEMPT_ACTIVE]
+        if active:
+            blockers['active_attempts'] = active
+        # 仍等着对账、恢复或确认停止的任务，其当前 attempt 在这台节点上：退役前先处理，否则状态再也无法由它确认。
+        unsettled = [j['job_id'] for j in self.store.all('job')
+                     if j['status'] in ('waiting_reconcile', 'recovering', 'cancel_requested') and j['current_attempt_id']
+                     and (self.store.get('attempt', j['current_attempt_id']) or {}).get('node_id') == node_id]
+        if unsettled:
+            blockers['unsettled_jobs'] = unsettled
+        pending = [r['pending']['job_id'] for r in self.store.all('integration_target') if r['target_node_id'] == node_id and r.get('pending')]
+        if pending:
+            blockers['pending_integrations'] = pending
+        operations = [op['op_id'] for op in self.store.all('node_op') if op['node_id'] == node_id and op['status'] in ('requested', 'received')]
+        if operations:
+            blockers['pending_operations'] = operations
+        # 远端写回结果待确认：退役后节点不能再补报，先在节点上用 recover 处理。
+        applications = [a['application_id'] for a in self.store.all('application')
+                        if a.get('target_node_id') == node_id and a['status'] == 'started']
+        if applications:
+            blockers['unsettled_applications'] = applications
+        profile = self.coordination_profile()
+        if profile['profile'] and node_id in profile['profile']['node_ids']:
+            blockers['coordination_profile'] = profile['profile_id']
+        return blockers
+
+    def _retire(self, node, data, identity):
+        """退役：节点记录留下（历史任务仍引用它），凭据作废，不再参与调度、目录视图与能力统计。不删除记录。"""
+        self.version(data, node)
+        if type(data.get('retired')) is not bool:
+            raise ValueError('retired must be boolean')
+        now = self.clock()
+        if not data['retired']:
+            if node.get('retired_at'):
+                # 恢复身份：仍需重新配对才有凭据；保持不接单，由操作者确认后再打开。
+                node = self.change('node', node, now, retired_at=None, retired_by=None, retire_reason=None, drain=True)
+                self.emit('node.restored', {'node_id': node['node_id'], 'actor': self.actor(identity)}, now, node=node['node_id'])
+            return response(node)
+        if node.get('retired_at'):
+            return response(node)
+        reason = data.get('reason')
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 300:
+            raise ValueError('retirement requires a reason')
+        blockers = self._retire_blockers(node)
+        if blockers:
+            raise APIError('retire_blocked', 'node still has work or dependants that must be settled first', blockers=blockers)
+        for kind in ('node_token', 'pairing'):
+            for credential in self.store.all(kind):
+                if credential['node_id'] == node['node_id']:
+                    self.store.delete(kind, credential['hash'])
+        node = self.change('node', node, now, retired_at=d.timestamp(now), retired_by=self.actor(identity),
+                           retire_reason=reason.strip(), drain=True, maintenance=None)
+        self.emit('node.retired', {'node_id': node['node_id'], 'reason': reason.strip(), 'actor': self.actor(identity)}, now, node=node['node_id'])
+        return response(node)
+
+    def _request_operation(self, node, kind, params, identity, data=None):
+        """登记一项节点管理操作；节点在下一次心跳领取，执行后上报。种类是封闭集合，没有任意命令。"""
+        if data is not None and set(data) - {'request_id', 'kind', 'params'}:
+            raise ValueError('unknown operation fields')
+        if data is not None and kind in p.PROJECT_OPERATIONS:
+            # 远端写回的参数只能由 controller 按任务记录填写（§13.10），通用端点不接受客户端给的路径或哈希。
+            raise ValueError('project operations are requested through the project endpoints')
+        if data is not None and kind == 'log_tail':
+            # 原始输出按任务取：POST /jobs/{id}/logs 核对 attempt 属于该任务、流名与大小上限（§13.6）。
+            raise ValueError('log_tail is requested through POST /jobs/{job_id}/logs')
+        return response(self._new_operation(node, kind, params, identity), 201)
+
+    def _new_operation(self, node, kind, params, identity):
+        if node.get('retired_at'):
+            raise APIError('node_retired', 'node is retired')
+        if kind not in p.NODE_OPERATIONS or not isinstance(params, dict):
+            raise ValueError('kind must be one of: ' + ', '.join(p.NODE_OPERATIONS))
+        if kind == 'probe' and params:
+            raise ValueError('probe takes no parameters')
+        now = self.clock()
+        timeout = self.config['project_operation_timeout_s' if kind in p.PROJECT_OPERATIONS else 'node_operation_timeout_s']
+        op = {'op_id': new_id(), 'node_id': node['node_id'], 'kind': kind, 'params': params, 'status': 'requested',
+              'requested_by': self.actor(identity), 'requested_at': d.timestamp(now), 'received_at': None, 'finished_at': None,
+              'deadline_at': d.timestamp(now + timeout), 'result': None, 'error': None}
+        self.store.put('node_op', op['op_id'], op)
+        self.emit('node.operation', {k: op[k] for k in ('op_id', 'node_id', 'kind', 'status')}, now, node=node['node_id'])
+        return op
+
+    def _request_log(self, job, data, identity):
+        """按任务取回节点上的原始输出片段：只能指名该任务的 attempt 与固定的输出流，大小有上限，分块读取。"""
+        if set(data) - {'request_id', 'attempt_id', 'stream', 'offset', 'max_bytes'}:
+            raise ValueError('unknown log fields')
+        attempt = self.get('attempt', data.get('attempt_id'))
+        if attempt['job_id'] != job['job_id']:
+            raise APIError('conflict', 'attempt belongs to another job')
+        stream, offset, limit = data.get('stream', 'index'), data.get('offset', 0), data.get('max_bytes', 65536)
+        if not isinstance(stream, str) or not re.fullmatch(r'index|harness\.(stdout|stderr)|(check|step)\.[0-9]{1,2}\.(stdout|stderr)', stream):
+            raise ValueError('stream must be index, harness.stdout|stderr, check.<n>.stdout|stderr or step.<n>.stdout|stderr')
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 262144:
+            raise ValueError('offset must be nonnegative and max_bytes between 1 and 262144')
+        return self._request_operation(self.get('node', attempt['node_id']), 'log_tail',
+                                       {'attempt_id': attempt['attempt_id'], 'stream': stream, 'offset': offset, 'max_bytes': limit}, identity)
+
+    def _operation_report(self, node_id, op_id, data, identity):
+        self.node(identity, node_id)
+        op = self.get('node_op', require_uuid(op_id, 'op_id'))
+        if op['node_id'] != node_id:
+            raise APIError('not_found', 'operation not found')
+        status, now = data.get('status'), self.clock()
+        if status not in ('received', 'succeeded', 'failed'):
+            raise ValueError('status must be received, succeeded or failed')
+        # 已领取但超时的远端写回：节点之后报来的结果仍要落到应用记录上。这是对账，不是重复执行（§13.10）。
+        # 从备份恢复后保留的写回（restored）在恢复后的数据里没有 received_at，但节点可能在备份之后已经执行过，同样接受。
+        late = (op['status'] == 'timed_out' and (op['received_at'] or op.get('restored')) and status != 'received'
+                and op['kind'] in ('project_apply', 'project_recover'))
+        if op['status'] in ('succeeded', 'failed', 'timed_out') and not late:
+            return response({'op_id': op_id, 'status': op['status']})  # 重发或迟到的上报不改变已定的结果
+        result, error = data.get('result'), data.get('error')
+        if result is not None and (not isinstance(result, dict) or len(p.canonical_json(result)) > 786432):
+            raise APIError('too_large', 'operation result exceeds 768 KiB', limit=786432)
+        if error is not None and not isinstance(error, str):
+            raise ValueError('error must be a string')
+        if late:
+            self.store.put('node_op', op_id, dict(op, result=clean(result), error=clean(error)[:2000] if error else None,
+                                                  reported_late_at=d.timestamp(now), reported_status=status))
+            self._settle_remote(op, result, now)
+            return response({'op_id': op_id, 'status': op['status']})
+        if status == 'received':
+            op = dict(op, status='received', received_at=op['received_at'] or d.timestamp(now))
+        else:
+            op = dict(op, status=status, received_at=op['received_at'] or d.timestamp(now), finished_at=d.timestamp(now),
+                      result=clean(result), error=clean(error)[:2000] if error else None)
+        self.store.put('node_op', op_id, op)
+        self.emit('node.operation', {k: op[k] for k in ('op_id', 'node_id', 'kind', 'status')}, now, node=node_id)
+        if status != 'received':
+            self._settle_remote(op, result, now)
+        return response({'op_id': op_id, 'status': op['status']})
+
+    # ------------------------------------------------------------ 协调设置（§13.7）
+
+    def _coordination_view(self):
+        saved = self.store.get('settings', 'coordination')
+        effective = self.coordination_profile()
+        if not saved:
+            # 还没有经 API 保存过：给出 config.json 里当前生效的值，revision 为 0。
+            profile = d.managed_profile(self.config)
+            saved = {'revision': 0, 'updated_at': None, 'updated_by': None, 'enabled': profile['status'] == 'ready',
+                     'node_ids': list(profile['profile']['node_ids']) if profile['profile'] else []}
+        known = {n['node_id'] for n in self.active_nodes()}
+        return response({'settings': saved, 'effective': effective,
+                         'unknown_nodes': [n for n in saved['node_ids'] if n not in known],
+                         'history': self.store.all('coordination_history')[-20:]})
+
+    def _put_coordination(self, data, identity):
+        if set(data) - {'request_id', 'expected_revision', 'enabled', 'node_ids'}:
+            raise ValueError('unknown coordination fields')
+        current = self.store.get('settings', 'coordination') or {'revision': 0}
+        if type(data.get('expected_revision')) is not int:
+            raise ValueError('expected_revision is required')
+        if data['expected_revision'] != current['revision']:
+            raise APIError('version_mismatch', 'coordination settings changed', current=json.loads(self._coordination_view().body)['settings'])
+        enabled, node_ids = data.get('enabled'), data.get('node_ids')
+        if type(enabled) is not bool or not isinstance(node_ids, list) or len(node_ids) > 64 or len(set(map(str, node_ids))) != len(node_ids):
+            raise ValueError('enabled must be boolean and node_ids a list of distinct node ids')
+        retired = {n['node_id'] for n in self.store.all('node') if n.get('retired_at')}
+        for node_id in node_ids:
+            if p.check_node_id(node_id) in retired:
+                raise APIError('node_retired', 'a retired node cannot run coordination rounds', node_id=node_id)
+        now = self.clock()
+        before = json.loads(self._coordination_view().body)['settings']
+        updated = {'revision': current['revision'] + 1, 'updated_at': d.timestamp(now), 'updated_by': self.actor(identity),
+                   'enabled': enabled, 'node_ids': list(node_ids)}
+        self.store.put('settings', 'coordination', updated)
+        self.store.put('coordination_history', '%012d' % updated['revision'], {
+            'revision': updated['revision'], 'at': updated['updated_at'], 'actor': updated['updated_by'],
+            'before': {k: before[k] for k in ('enabled', 'node_ids')}, 'after': {k: updated[k] for k in ('enabled', 'node_ids')}})
+        self.emit('settings.updated', {'kind': 'coordination', 'revision': updated['revision'], 'actor': updated['updated_by']}, now)
+        return response(updated)
+
+    # ------------------------------------------------------------ 项目（§13.1）
+
+    def _project(self, ident, usable=False):
+        project = self.get('project', require_uuid(ident, 'project_id'))
+        if usable and project['archived_at']:
+            raise APIError('project_archived', 'project is archived; its history stays readable but it takes no new work')
+        return project
+
+    def _project_view(self, project):
+        jobs = [j for j in self.store.all('job') if j.get('project_id') == project['project_id']]
+        return dict(project, jobs=len(jobs), active_jobs=sum(j['status'] not in ('completed', 'failed', 'cancelled') for j in jobs),
+                    remote_targets=self._remote_targets(project['project_id']))
+
+    def _remote_targets(self, project_id):
+        """节点声明它在本机为这个项目绑定了目录（§13.10）：只有目录名，路径留在节点上。已退役的节点不算。"""
+        return [{'node_id': n['node_id'], 'root_name': b['root_name'], 'status': n['status']} for n in self.active_nodes()
+                for b in n['capabilities'].get('project_bindings') or [] if b['project_id'] == project_id]
+
+    def _put_project(self, data, identity, current=None):
+        """新建（current 为 None）或修改项目。名称、默认策略与归档是配置：每次改动递增 revision 并留下历史。"""
+        allowed = {'request_id', 'name', 'defaults'} | ({'expected_revision', 'archived'} if current else set())
+        if set(data) - allowed:
+            raise ValueError('unknown project fields')
+        now = self.clock()
+        if current:
+            if type(data.get('expected_revision')) is not int:
+                raise ValueError('expected_revision is required')
+            if data['expected_revision'] != current['revision']:
+                raise APIError('version_mismatch', 'project changed', current=current)
+        name = data.get('name', current['name'] if current else None)
+        if not isinstance(name, str) or not name.strip() or len(name) > 120:
+            raise ValueError('project name is required (at most 120 characters)')
+        defaults = d.validate_project_defaults(data['defaults']) if 'defaults' in data else (
+            current['defaults'] if current else d.validate_project_defaults(None))
+        chosen = defaults['codex']
+        if chosen['model'] is not None and not d.permitted(self.model_settings()['codex']['allowed'], chosen['model'], chosen['effort']):
+            raise d.PolicyError('model_not_allowed', 'project default must be within the deployment\'s permitted set')
+        if defaults != (current['defaults'] if current else d.validate_project_defaults(None)):
+            self.allow(identity, 'settings')  # 默认策略属于设置；建项目、改名与归档只要 tasks
+        archived = data.get('archived', bool(current and current['archived_at']))
+        if type(archived) is not bool:
+            raise ValueError('archived must be boolean')
+        if current:
+            project = dict(current, name=name.strip(), defaults=defaults, revision=current['revision'] + 1, updated_at=d.timestamp(now),
+                           updated_by=self.actor(identity),
+                           archived_at=(current['archived_at'] or d.timestamp(now)) if archived else None)
+        else:
+            project = {'project_id': new_id(), 'name': name.strip(), 'defaults': defaults, 'revision': 1, 'baseline': None, 'applied': None,
+                       'archived_at': None, 'created_at': d.timestamp(now), 'created_by': self.actor(identity),
+                       'updated_at': d.timestamp(now), 'updated_by': self.actor(identity)}
+        self.store.put('project', project['project_id'], project)
+        self.store.put('project_history', '%s:%012d' % (project['project_id'], project['revision']), {
+            'project_id': project['project_id'], 'revision': project['revision'], 'at': project['updated_at'], 'actor': project['updated_by'],
+            'before': {k: current[k] for k in ('name', 'defaults', 'archived_at')} if current else None,
+            'after': {k: project[k] for k in ('name', 'defaults', 'archived_at')}})
+        self.emit('project.updated' if current else 'project.created', project, now)
+        return response(self._project_view(project), 200 if current else 201)
+
+    def _projects_api(self, method, pieces, query, data, identity):
+        route = '/' + '/'.join(pieces)
+        if len(pieces) == 1:
+            if method == 'GET':
+                return response({'projects': [self._project_view(x) for x in self.store.all('project')]})
+            if method == 'POST':
+                return self.idempotent(route, data, lambda: self._put_project(data, identity))
+        elif len(pieces) == 2:
+            project = self._project(pieces[1])
+            if method == 'GET':
+                history = [h for h in self.store.all('project_history') if h['project_id'] == project['project_id']][-20:]
+                return response(dict(self._project_view(project), history=history))
+            if method == 'PUT':
+                return self.idempotent(route, data, lambda: self._put_project(data, identity, project))
+        elif pieces[2] == 'applications':
+            project = self._project(pieces[1])
+            if len(pieces) == 3 and method == 'GET':
+                return response({'applications': [a for a in self.store.all('application') if a['project_id'] == project['project_id']][-200:]})
+            if len(pieces) == 3 and method == 'POST':
+                return self.idempotent(route, data, lambda: self._start_application(project, data, identity))
+            if len(pieces) == 4 and method == 'GET':
+                return response(self._application(project, pieces[3]))
+            if len(pieces) == 4 and method == 'POST':
+                return self.idempotent(route, data, lambda: self._finish_application(project, pieces[3], data, identity))
+            if len(pieces) == 5 and pieces[4] == 'recover' and method == 'POST':
+                return self.idempotent(route, data, lambda: self._recover_remote(project, pieces[3], data, identity))
+        elif pieces[2] == 'plans' and len(pieces) == 3 and method == 'POST':
+            project = self._project(pieces[1])
+            return self.idempotent(route, data, lambda: self._remote_plan(project, data, identity))
+        raise APIError('not_found', 'route not found')
+
+    # ------------------------------------------------------------ 成果下载与应用（§13.4）
+
+    def _record_download(self, job, data, identity):
+        """整包下载完成后由客户端登记。只看文本预览或另存单个文件不登记，所以“已下载”有据可查。"""
+        cp = self.get('checkpoint', data.get('checkpoint_id'))
+        if cp['job_id'] != job['job_id'] or cp['state'] not in ('durable', 'verified'):
+            raise APIError('conflict', 'download must refer to a durable checkpoint of this job')
+        if any(type(data.get(k)) is not int or data[k] < 0 for k in ('files', 'bytes')):
+            raise ValueError('files and bytes must be nonnegative integers')
+        now = self.clock()
+        record = {'download_id': data['request_id'], 'job_id': job['job_id'], 'checkpoint_id': cp['checkpoint_id'],
+                  'manifest_sha256': cp['manifest_sha256'], 'files': data['files'], 'bytes': data['bytes'],
+                  'by': self.actor(identity), 'at': d.timestamp(now)}
+        self.store.put('download', record['download_id'], record)
+        self.emit('job.downloaded', record, now, job=job)
+        return response(record, 201)
+
+    def _start_application(self, project, data, identity):
+        """在写入本机项目目录之前登记意图。基线核对与冲突判断在执行应用的设备上按文件内容进行；
+        这里记下是谁、对哪份成果开始了应用，中断后记录停在 started，不会被当作已完成。"""
+        if 'node_id' in data:
+            return self._start_remote_application(project, data, identity)
+        if project['archived_at']:
+            raise APIError('project_archived', 'project is archived')
+        ident = require_uuid(data.get('application_id'), 'application_id')
+        if self.store.get('application', ident):
+            raise APIError('conflict', 'application_id already exists')
+        job = self.get('job', data.get('job_id'))
+        if job.get('project_id') != project['project_id']:
+            raise APIError('conflict', 'job does not belong to this project')
+        # 只有已发布的成果可以应用到项目：发布已经过了契约规定的检查与验收门禁。
+        if not job['delivery_checkpoint_id'] or data.get('checkpoint_id') != job['delivery_checkpoint_id']:
+            raise APIError('conflict', 'only the published result of the job can be applied to the project')
+        plan = data.get('plan')
+        if not isinstance(plan, dict) or len(p.canonical_json(plan)) > 65536:
+            raise ValueError('plan must be an object of at most 64 KiB')
+        device = data.get('device')
+        if not isinstance(device, str) or not device.strip() or len(device) > 120:
+            raise ValueError('device label is required')
+        cp, now = self.get('checkpoint', job['delivery_checkpoint_id']), self.clock()
+        record = {'application_id': ident, 'project_id': project['project_id'], 'job_id': job['job_id'],
+                  'checkpoint_id': cp['checkpoint_id'], 'manifest_sha256': cp['manifest_sha256'],
+                  'base_manifest_sha256': job['inputs_manifest_sha256'], 'device': device.strip(), 'by': self.actor(identity),
+                  'status': 'started', 'plan': clean(plan), 'detail': None, 'started_at': d.timestamp(now), 'finished_at': None}
+        self.store.put('application', ident, record)
+        self.emit('project.application', record, now, job=job)
+        return response(record, 201)
+
+    def _finish_application(self, project, ident, data, identity):
+        record = self.get('application', require_uuid(ident, 'application_id'))
+        if record['project_id'] != project['project_id']:
+            raise APIError('not_found', 'application not found')
+        if record['status'] != 'started':
+            raise APIError('conflict', 'application already has a final result', current=record)
+        if record.get('target_node_id'):
+            raise APIError('forbidden', 'the target node reports the result of a remote application')
+        if record['by'] != self.actor(identity):
+            raise APIError('forbidden', 'only the client that started an application reports its result')
+        detail = data.get('detail')
+        if data.get('status') not in p.APPLICATION_FINAL or not isinstance(detail, dict) or len(p.canonical_json(detail)) > 262144:
+            raise ValueError('status must be one of %s and detail an object of at most 256 KiB' % ', '.join(p.APPLICATION_FINAL))
+        return response(self._settle_application(record, data['status'], detail, self.clock()))
+
+    def _settle_application(self, record, status, detail, now):
+        """应用的最终结果：本机应用由发起它的客户端上报，远端写回由目标节点上报或由 controller 按超时判定（§13.4、§13.10）。"""
+        record = dict(record, status=status, detail=clean(detail), finished_at=d.timestamp(now))
+        self.store.put('application', record['application_id'], record)
+        job = self.get('job', record['job_id'])
+        # 任务的回写状态只在全部写入完成时记 integrated；部分完成或有冲突记 conflict；失败与结果未知不改它。
+        # 契约指定了回写目标节点的任务，回写状态归那条路径（§11.10），这里不动。
+        current = job['delivery_checkpoint_id'] == record['checkpoint_id'] and not job['contract']['integration']['target_node_id']
+        if current and record['status'] in ('applied', 'partial', 'conflict'):
+            job = self.change('job', job, now, integration_status='integrated' if record['status'] == 'applied' else 'conflict')
+        if record['status'] == 'applied':
+            latest = self.get('project', record['project_id'])
+            self.store.put('project', latest['project_id'], dict(latest, applied={
+                k: record[k] for k in ('application_id', 'job_id', 'checkpoint_id', 'manifest_sha256', 'device', 'finished_at')}))
+        self.emit('project.application', record, now, job=job)
+        return record
+
+    # ------------------------------------------------------------ 远端项目写回（§13.10）
+
+    def _application(self, project, ident):
+        record = self.get('application', require_uuid(ident, 'application_id'))
+        if record['project_id'] != project['project_id']:
+            raise APIError('not_found', 'application not found')
+        return record
+
+    def _remote_target(self, project, data):
+        """远端操作的目标与参数。参数全部由 controller 按任务记录填写：客户端只指名任务与节点，不给路径或哈希。"""
+        job = self.get('job', require_uuid(data.get('job_id'), 'job_id'))
+        if job.get('project_id') != project['project_id']:
+            raise APIError('conflict', 'job does not belong to this project')
+        if not job['delivery_checkpoint_id']:
+            raise APIError('conflict', 'only the published result of the job can be applied to the project')
+        node = self.get('node', p.check_node_id(data.get('node_id')))
+        if node.get('retired_at'):
+            raise APIError('node_retired', 'node is retired')
+        if not any(b['project_id'] == project['project_id'] for b in node['capabilities'].get('project_bindings') or []):
+            raise APIError('not_bound', 'the node has not bound a directory for this project')
+        cp = self.get('checkpoint', job['delivery_checkpoint_id'])
+        return job, node, {'project_id': project['project_id'], 'job_id': job['job_id'], 'checkpoint_id': cp['checkpoint_id'],
+                           'manifest_sha256': cp['manifest_sha256'], 'base_manifest_sha256': job['inputs_manifest_sha256'],
+                           'exclude': job['contract']['workspace']['exclude']}
+
+    def _remote_plan(self, project, data, identity):
+        if set(data) - {'request_id', 'job_id', 'node_id'}:
+            raise ValueError('unknown plan fields')
+        _, node, params = self._remote_target(project, data)
+        return response(self._new_operation(node, 'project_plan', params, identity), 201)
+
+    def _start_remote_application(self, project, data, identity):
+        """登记一次远端写回并下发给目标节点。客户端给出审阅时看到的检查点与输入基线，与任务当前不一致即拒绝。"""
+        if set(data) - {'request_id', 'application_id', 'job_id', 'checkpoint_id', 'node_id', 'expected_base_manifest_sha256',
+                        'skip_conflicts', 'plan'}:
+            raise ValueError('unknown application fields')
+        if project['archived_at']:
+            raise APIError('project_archived', 'project is archived')
+        ident = require_uuid(data.get('application_id'), 'application_id')
+        if self.store.get('application', ident):
+            raise APIError('conflict', 'application_id already exists')
+        job, node, params = self._remote_target(project, data)
+        if 'expected_base_manifest_sha256' not in data:
+            raise ValueError('expected_base_manifest_sha256 is required (null when the job has no inputs)')
+        if data.get('checkpoint_id') != params['checkpoint_id'] or data['expected_base_manifest_sha256'] != params['base_manifest_sha256']:
+            raise APIError('conflict', 'the published result or its input baseline differs from what was reviewed',
+                           current={k: params[k] for k in ('checkpoint_id', 'base_manifest_sha256')})
+        skip, plan = data.get('skip_conflicts', False), data.get('plan', {})
+        if type(skip) is not bool:
+            raise ValueError('skip_conflicts must be boolean')
+        if not isinstance(plan, dict) or len(p.canonical_json(plan)) > 65536:
+            raise ValueError('plan must be an object of at most 64 KiB')
+        op = self._new_operation(node, 'project_apply', dict(params, application_id=ident, skip_conflicts=skip), identity)
+        now = self.clock()
+        record = {'application_id': ident, 'project_id': project['project_id'], 'job_id': job['job_id'],
+                  'checkpoint_id': params['checkpoint_id'], 'manifest_sha256': params['manifest_sha256'],
+                  'base_manifest_sha256': params['base_manifest_sha256'], 'device': node['node_id'], 'by': self.actor(identity),
+                  'status': 'started', 'plan': clean(plan), 'detail': None, 'started_at': d.timestamp(now), 'finished_at': None,
+                  'target_node_id': node['node_id'], 'operation_id': op['op_id'], 'skip_conflicts': skip}
+        self.store.put('application', ident, record)
+        self.emit('project.application', record, now, job=job)
+        return response(record, 201)
+
+    def _recover_remote(self, project, ident, data, identity):
+        """处理目标节点上没有得到最终结果的写回：查看现状、续写、回滚，或按现状结束。"""
+        if set(data) - {'request_id', 'action'}:
+            raise ValueError('unknown recover fields')
+        record = self._application(project, ident)
+        if not record.get('target_node_id'):
+            raise APIError('conflict', 'not a remote application; recover it on the device that applied it')
+        if record['status'] != 'started':
+            raise APIError('conflict', 'application already has a final result', current=record)
+        if data.get('action') not in ('status', 'resume', 'rollback', 'abandon'):
+            raise ValueError('action must be status, resume, rollback or abandon')
+        if data['action'] != 'status':
+            # 节点按顺序执行：原应用或上一个变更型恢复还没被领取或还在执行时，新的变更会排在它后面，
+            # 而先到的那个结果会先结束记录、让后一个的结果被丢弃。等它有了结果（或超时）再处理。
+            for op in self.store.all('node_op'):
+                if (op['params'].get('application_id') == ident and op['status'] in ('requested', 'received')
+                        and (op['kind'] == 'project_apply' or (op['kind'] == 'project_recover' and op['params'].get('action') != 'status'))):
+                    raise APIError('conflict', 'another operation on this application is still pending on the node',
+                                   operation_id=op['op_id'])
+        params = {k: record[k] for k in ('project_id', 'application_id', 'job_id', 'checkpoint_id')}
+        op = self._new_operation(self.get('node', record['target_node_id']), 'project_recover', dict(params, action=data['action']), identity)
+        if data['action'] != 'status':
+            # 从这里起只认这项恢复的结果：超时后晚到的原应用结果不再结束记录。
+            self.store.put('application', ident, dict(record, recovery_operation_id=op['op_id']))
+        return response(op, 201)
+
+    def _settle_remote(self, op, result, now):
+        """目标节点报来的应用结果落到应用记录上；只认这次应用指定的那台节点，已有结果的不改写。"""
+        value = result.get('application') if op['kind'] in ('project_apply', 'project_recover') and isinstance(result, dict) else None
+        if value is None:
+            return
+        record = self.store.get('application', op['params'].get('application_id'))
+        if not record or record['status'] != 'started' or record.get('target_node_id') != op['node_id']:
+            return
+        if record.get('recovery_operation_id') not in (None, op['op_id']):
+            return
+        detail = value.get('detail') if isinstance(value, dict) else None
+        if not isinstance(detail, dict) or value.get('status') not in p.APPLICATION_FINAL or len(p.canonical_json(detail)) > 262144:
+            raise ValueError('application result must have a final status and a detail object of at most 256 KiB')
+        self._settle_application(record, value['status'], dict(detail, operation_id=op['op_id']), now)
 
     def idempotent(self, endpoint, data, operation, creation=False):
         ident = require_uuid(data.get('request_id'), 'request_id')
@@ -720,7 +1359,7 @@ class App:
         elif trigger not in ('completed', 'waiting_reconcile', 'rework'):
             return
         settings = self.model_settings()
-        profile = d.managed_profile(self.config, settings['claude']['default'])
+        profile = self.coordination_profile()
         lease = self.coordinator(job['work_package_id'])
         if profile['status'] != 'ready' or (lease and lease['holder_kind'] == 'interactive'):
             return
@@ -858,7 +1497,8 @@ class App:
             model_policy = {'schema': 1, 'settings_revision': policy['settings_revision'],
                             'requested': {'model': None, 'effort': follow['effort']},
                             'resolved': {k: contract['harness_params'][k] for k in ('model', 'effort')},
-                            'source': {'model': inherited, 'effort': inherited if follow['effort'] is None else 'coordinator_override'}}
+                            'source': {'model': inherited, 'effort': inherited if follow['effort'] is None else 'coordinator_override'},
+                            'unverified_nodes': policy['codex'].get('unverified_nodes', 'wait')}
             root = self.root(target)
             reason = d.budget_reason(dict(target, contract=contract), root['counters'], now, root['created_at'], repair=True)
             if any(v in ('unknown', 'intent') for v in self.store.get('effects', target['work_package_id'], {}).values()):
@@ -920,8 +1560,22 @@ class App:
         self.emit('checkpoint.durable', cp, now, job=job, attempt=self.get('attempt', cp['attempt_id']))
 
     def _expire(self, now):
-        for node in self.store.all('node'):
+        for node in self.active_nodes():
             self.change('node', node, now, status=d.node_status(node, now, self.config))
+        for op in self.store.all('node_op'):
+            if op['status'] in ('requested', 'received') and d.seconds(op['deadline_at']) <= now:
+                # 节点没有在时限内完成：如实记为超时，不重发（节点离线、版本不支持管理操作，或执行卡住）。
+                op = dict(op, status='timed_out', finished_at=d.timestamp(now))
+                self.store.put('node_op', op['op_id'], op)
+                self.emit('node.operation', {k: op[k] for k in ('op_id', 'node_id', 'kind', 'status')}, now, node=op['node_id'])
+                record = self.store.get('application', op['params'].get('application_id')) if op['kind'] == 'project_apply' else None
+                if record and record['status'] == 'started' and not op['received_at'] and not op.get('restored'):
+                    # 节点从未领取：一个文件都没写。节点之后上报 received 会得到 timed_out，按约定放弃、不再执行（§13.10）。
+                    # 已领取而没在时限内给出结果的，应用记录保持 started（结果待确认），等节点之后的上报对账。
+                    self._settle_application(record, 'failed', {'reason': 'not_received', 'written': [], 'operation_id': op['op_id']}, now)
+            elif (op['finished_at'] and now - d.seconds(op.get('reported_late_at') or op['finished_at']) > 86400
+                  and not self._awaiting_report(op)):
+                self.store.delete('node_op', op['op_id'])  # 结果（含取回的日志片段）只保留一天
         for attempt in self.store.all('attempt'):
             if attempt['status'] not in p.ATTEMPT_ACTIVE:
                 continue
@@ -929,6 +1583,21 @@ class App:
             expires = private['claim_until'] if attempt['status'] == 'assigned' else d.seconds(attempt['lease_expires_at'])
             if expires <= now:
                 self._failure(attempt, 'node_lost', 'lease or claim deadline expired', now, 'lost')
+
+    def _replayable(self, op):
+        """从备份恢复后保留、恢复后已到期、结果还没补报上来的写回：继续下发，已经执行过的节点据此补报（不会重新执行：
+        领取得到的是 timed_out，没执行过的节点放弃它）。应用有了结果就不再下发。"""
+        if op['status'] != 'timed_out' or not op.get('restored') or op.get('reported_late_at') or op['kind'] not in p.PROJECT_OPERATIONS:
+            return False
+        record = self.store.get('application', op['params'].get('application_id'))
+        return bool(record and record['status'] == 'started')
+
+    def _awaiting_report(self, op):
+        """远端写回超时后应用仍待确认：保留这项操作，节点晚到的结果还要靠它对账。"""
+        if op['kind'] not in ('project_apply', 'project_recover'):
+            return False
+        record = self.store.get('application', op['params'].get('application_id'))
+        return bool(record and record['status'] == 'started')
 
     def _failure(self, attempt, failure, detail, now, status='failed'):
         self._managed_lease(attempt, release=True)
@@ -1123,11 +1792,20 @@ class App:
         cap = data['capabilities']
         required_cap = {'os', 'arch', 'tools', 'gpu', 'harness', 'labels'}
         if (not isinstance(cap, dict) or not required_cap <= set(cap) or
-                set(cap) - required_cap - {'harness_paths', 'harness_disabled', 'agent', 'models'} or
+                set(cap) - required_cap - {'harness_paths', 'harness_disabled', 'agent', 'models', 'project_bindings'} or
                 cap['os'] not in p.OS_NAMES or cap['arch'] not in ('x86_64', 'arm64')):
             raise ValueError('invalid capabilities')
         if 'models' in cap:
             d.validate_catalogs(cap['models'])
+        if 'project_bindings' in cap:
+            # §13.10：节点本机绑定的项目只报项目 ID 与目录名；路径不离开节点。
+            bindings = cap['project_bindings']
+            if (not isinstance(bindings, list) or len(bindings) > 256 or
+                    any(not isinstance(b, dict) or set(b) != {'project_id', 'root_name'} or not isinstance(b['root_name'], str)
+                        or not 0 < len(b['root_name']) <= 255 or any(c in b['root_name'] for c in '/\\\x00') for b in bindings)):
+                raise ValueError('project_bindings must be a list of {project_id, root_name}')
+            for b in bindings:
+                p.check_uuid(b['project_id'], 'project_id')
         for key in ('tools', 'harness', 'harness_paths', 'harness_disabled'):
             if key not in cap:
                 continue
@@ -1153,7 +1831,7 @@ class App:
             raise ValueError('invalid provider_account_refs')
         old = self.store.get('node', data['node_id'])
         now = self.clock()
-        peers = [n for n in self.store.all('node') if n['physical_host_id'] == data['physical_host_id'] and n['node_id'] != data['node_id']]
+        peers = [n for n in self.active_nodes() if n['physical_host_id'] == data['physical_host_id'] and n['node_id'] != data['node_id']]
         host_ids = {n['node_id'] for n in peers} | {data['node_id']}
         used = sum(self.get('job', a['job_id'])['contract']['resources']['slots'] for a in self.store.all('attempt')
                    if a['node_id'] in host_ids and a['status'] in p.ATTEMPT_ACTIVE)
@@ -1224,7 +1902,10 @@ class App:
                          'dispatch_paused': self.meta()['dispatch_paused'], 'renewed': renewed,
                          'revoked': revoked, 'cancel': cancel, 'reconcile_required': reconcile,
                          'integrations': [r['pending'] for r in self.store.all('integration_target')
-                                          if r['target_node_id'] == node_id and r.get('pending')] if not reconcile else []})
+                                          if r['target_node_id'] == node_id and r.get('pending')] if not reconcile else [],
+                         # §13.6：尚未被节点收到的管理操作。不认识这一项的旧节点会忽略它，操作到期后记 timed_out。
+                         'operations': [{k: op[k] for k in ('op_id', 'kind', 'params')} for op in self.store.all('node_op')
+                                        if op['node_id'] == node_id and (op['status'] == 'requested' or self._replayable(op))]})
 
     def _claim(self, node_id, identity):
         self.node(identity, node_id)
@@ -1301,6 +1982,14 @@ class App:
             if identity[0] == 'session':
                 self.store.delete('session', identity[1])
             return response({}, headers=[('Set-Cookie', 'ac_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict')])
+        if route == '/blobs/missing' and method == 'POST':
+            # 增量上传：一次问清哪些内容 controller 还没有，只传缺的（§13.2）。
+            if identity[0] != 'node':
+                self.allow(identity, 'tasks')
+            wanted = data.get('sha256')
+            if not isinstance(wanted, list) or len(wanted) > 20000:
+                raise ValueError('sha256 must be a list of at most 20000 digests')
+            return response({'missing': sorted({x for x in wanted if not self.blobs.exists(p.check_sha256(x))})})
         if pieces[0] == 'blobs' and len(pieces) == 2:
             digest = p.check_sha256(pieces[1])
             if identity[0] != 'node':
@@ -1321,6 +2010,8 @@ class App:
                 return self._heartbeat(pieces[1], data, identity)
             if pieces[2] == 'claim':
                 return self._claim(pieces[1], identity)
+        if pieces[0] == 'nodes' and len(pieces) == 4 and pieces[2] == 'operations' and method == 'POST' and identity[0] == 'node':
+            return self._operation_report(pieces[1], pieces[3], data, identity)
         if pieces[0] == 'attempts' and len(pieces) == 3 and method == 'POST':
             if pieces[2] == 'events' and self.store.get('attempt', pieces[1]) is None:
                 require_uuid(pieces[1], 'attempt_id')
@@ -1376,15 +2067,19 @@ class App:
         # 其余客户端端点按路由所需权限检查（§12.1）。未列出的变更归入 tasks，未列出的读取归入 read。
         if method == 'GET':
             scope = 'maintain' if route in ('/doctor', '/clients') else 'read'
-        elif route == '/settings/models':
+        elif route in ('/settings/models', '/settings/coordination'):
             scope = 'settings'
         elif pieces[0] == 'nodes':
             scope = 'devices'
-        elif route == '/dispatch' or pieces[0] == 'clients':
+        elif route in ('/dispatch', '/intake') or pieces[0] == 'clients':
             scope = 'maintain'
+        elif pieces[0] == 'jobs' and len(pieces) == 3 and pieces[2] in ('downloads', 'logs'):
+            scope = 'read'  # 能读成果的客户端就能登记“已下载”，也能读它的原始输出
         else:
             scope = 'tasks'
         self.allow(identity, scope)
+        if pieces[0] == 'projects':
+            return self._projects_api(method, pieces, query, data, identity)
         if route == '/clients' and method == 'GET':
             return response({'clients': self.store.all('client')})
         if route == '/clients/codes' and method == 'POST':
@@ -1419,7 +2114,9 @@ class App:
             return self._draft(data)
         if route == '/baselines':
             if method == 'GET':
-                return response({'baselines': [self._baseline_view(b) for b in self.store.all('baseline')]})
+                wanted = query.get('project_id', [''])[0]
+                return response({'baselines': [self._baseline_view(b) for b in self.store.all('baseline')
+                                               if not wanted or b.get('project_id') == wanted]})
             if method == 'POST':
                 return self.idempotent(route, data, lambda: self._create_baseline(data, identity))
         if pieces[0] == 'packages' and len(pieces) == 3 and pieces[2] == 'coordinator':
@@ -1446,12 +2143,17 @@ class App:
             package = query.get('work_package_id', [''])[0]
             if package:
                 jobs = [j for j in jobs if j['work_package_id'] == package]
+            wanted = query.get('project_id', [''])[0]
+            if wanted:
+                jobs = [j for j in jobs if j.get('project_id') == wanted]
+            if query.get('acceptance_run', [''])[0] == '1':
+                jobs = [j for j in jobs if j.get('acceptance_run')]
             return response({'jobs': jobs[:self.limit(query)]})
         if pieces[0] == 'jobs' and len(pieces) in (2, 3):
             job = self.get('job', pieces[1])
             if len(pieces) == 2 and method == 'GET':
                 result = dict(job)
-                for kind in ('attempt', 'checkpoint', 'publication', 'assessment'):
+                for kind in ('attempt', 'checkpoint', 'publication', 'assessment', 'download', 'application'):
                     result[kind + 's'] = [v for v in self.store.all(kind) if v['job_id'] == job['job_id']]
                 result['events'] = self.store.events(job_id=job['job_id'])
                 return response(result)
@@ -1460,6 +2162,10 @@ class App:
             if len(pieces) == 3 and pieces[2] == 'events' and method == 'GET':
                 before = self.cursor(query.get('before', ['0'])[0])
                 return response({'events': self.store.events(job_id=job['job_id'], limit=self.limit(query), before=before or None)})
+            if len(pieces) == 3 and method == 'POST' and pieces[2] == 'downloads':
+                return self.idempotent(route, data, lambda: self._record_download(job, data, identity))
+            if len(pieces) == 3 and method == 'POST' and pieces[2] == 'logs':
+                return self.idempotent(route, data, lambda: self._request_log(job, data, identity))
             if len(pieces) == 3 and method == 'POST' and pieces[2] in ('cancel', 'retry', 'assess'):
                 if pieces[2] != 'cancel':
                     self.coordinator_guard(job['work_package_id'], headers)
@@ -1481,10 +2187,34 @@ class App:
                         raise APIError('conflict', 'diff requires checkpoints of the same job')
                     old = self.manifest(other['manifest_sha256'])
                 return response(p.manifest_diff(old, self.manifest(cp['manifest_sha256'])))
+        if route == '/settings/coordination':
+            if method == 'GET':
+                return self._coordination_view()
+            if method == 'PUT':
+                return self.idempotent(route, data, lambda: self._put_coordination(data, identity))
+        if pieces[0] == 'operations' and len(pieces) == 2 and method == 'GET':
+            return response(self.get('node_op', require_uuid(pieces[1], 'op_id')))
+        if route == '/nodes/codes' and method == 'POST':
+            return self._node_code(data, identity)
+        if pieces[0] == 'nodes' and len(pieces) == 3 and pieces[2] == 'operations':
+            node = self.get('node', pieces[1])
+            if method == 'GET':
+                # 列表不带结果正文（取回的日志片段可能很大）；逐个用 GET /operations/{op_id} 读取。
+                return response({'operations': [{k: v for k, v in op.items() if k != 'result'} for op in self.store.all('node_op')
+                                                if op['node_id'] == node['node_id']][-50:]})
+            if method == 'POST':
+                return self.idempotent(route, data, lambda: self._request_operation(node, data.get('kind'), data.get('params', {}), identity, data))
+        if pieces[0] == 'nodes' and len(pieces) == 3 and method == 'POST' and pieces[2] in ('maintenance', 'retire'):
+            node = self.get('node', pieces[1])
+            action = self._maintenance if pieces[2] == 'maintenance' else self._retire
+            return self.idempotent(route, data, lambda: action(node, data, identity))
         if route == '/nodes' and method == 'GET':
+            if query.get('retired', [''])[0] == '1':
+                # 已退役的节点：只保留身份与历史引用，不带调度信息。
+                return response({'nodes': [n for n in self.store.all('node') if n.get('retired_at')]})
             nodes = []
             jobs = [j for j in self.store.all('job') if j['status'] in ('queued', 'recovering', 'waiting_capability')]
-            for node in self.store.all('node'):
+            for node in self.active_nodes():
                 attempts = [a for a in self.store.all('attempt') if a['node_id'] == node['node_id'] and a['status'] in p.ATTEMPT_ACTIVE]
                 reasons = []
                 for job in jobs:
@@ -1496,24 +2226,36 @@ class App:
                                     'status': attempt['status'], 'epoch': attempt['epoch'], 'lease_expires_at': attempt['lease_expires_at'],
                                     'harness': target['contract']['harness'], 'model': attempt['runtime'].get('model'),
                                     'effort': attempt['runtime'].get('effort'), 'coordinates': bool(target['contract'].get('coordinates'))})
-                nodes.append(dict(node, active_attempts=len(attempts), attempts=current, last_rejection_reasons=reasons))
+                maintenance = node.get('maintenance')
+                # 维护：已请求但还有任务在跑是 draining，跑完后是 active。
+                nodes.append(dict(node, active_attempts=len(attempts), attempts=current, last_rejection_reasons=reasons,
+                                  maintenance_state=('draining' if attempts else 'active') if maintenance else 'none'))
             return response({'nodes': nodes})
         if pieces[0] == 'nodes' and len(pieces) == 3 and pieces[2] == 'drain' and method == 'POST':
             return self.idempotent(route, data, lambda: self._drain(pieces[1], data, headers))
         if route == '/dispatch' and method == 'POST':
             return self.idempotent(route, data, lambda: self._dispatch(data))
+        if route == '/intake' and method == 'POST':
+            return self.idempotent(route, data, lambda: self._set_intake(data, identity))
+        if route == '/activity' and method == 'GET':
+            return self._activity(self.cursor(query.get('after', ['0'])[0]))
         if route == '/overview' and method == 'GET':
             from .backup import summary as backup_summary
             jobs = self.store.all('job')
             return response({'counts': {s: sum(j['status'] == s for j in jobs) for s in p.JOB_STATUSES},
-                             'nodes': self.store.all('node'), 'durable_checkpoint_at': max((j['durable_checkpoint_at'] for j in jobs if j['durable_checkpoint_at']), default=None),
+                             'nodes': self.active_nodes(), 'durable_checkpoint_at': max((j['durable_checkpoint_at'] for j in jobs if j['durable_checkpoint_at']), default=None),
                              'controller': dict(self.meta(), version=RELEASE['version'], git_commit=RELEASE['git_commit'],
                                                 metadata_version=self.meta()['version'], features=list(p.FEATURES),
                                                 deployment_profile=self.config['deployment_profile'], guarantees=self.config['guarantees']),
-                             'dispatch_paused': self.meta()['dispatch_paused'],
+                             'dispatch_paused': self.meta()['dispatch_paused'], 'intake': self.intake(),
                              'backup': backup_summary(self.data_dir.parent / 'backups', now),
-                             'managed_coordinator': d.managed_profile(self.config, self.model_settings()['claude']['default'])})
+                             'managed_coordinator': self.coordination_profile(),
+                             'retired_nodes': sum(bool(n.get('retired_at')) for n in self.store.all('node'))})
         if route == '/events' and method == 'GET':
+            if 'before' in query:
+                # 活动页从最新往前翻：before=0 表示从最新一条开始。
+                before = self.cursor(query['before'][0]) or 1 << 62
+                return response({'events': self.store.events(limit=self.limit(query), before=before), 'min_seq': self.min_seq()})
             after = self.cursor(query.get('after', ['0'])[0])
             return response({'events': self.store.events(after, self.limit(query)), 'min_seq': self.min_seq()})
         if route == '/events/stream' and method == 'GET':
@@ -1564,11 +2306,12 @@ class App:
         events = self.store.events(cursor, 1000)
         return [('id: %d\nevent: %s\ndata: ' % (e['seq'], e['type'])).encode() + p.canonical_json(e) + b'\n\n' for e in events] or [b': ping\n\n']
 
-    def _create_job(self, data, managed=None, schedule=True, input_checkpoint=None, created_by=None, model_policy=None):
+    def _create_job(self, data, managed=None, schedule=True, input_checkpoint=None, created_by=None, model_policy=None, project=None,
+                    acceptance_run=False):
         if not isinstance(data.get('title', ''), str):
             raise ValueError('title must be a string')
         if model_policy is None:
-            contract, model_policy = self._resolve_contract(data['contract'], data.get('work_package_id'))
+            contract, model_policy = self._resolve_contract(data['contract'], data.get('work_package_id'), project)
         else:
             # controller 派生的契约（受管修复、协调回合）已按冻结策略或协调设置确定了参数。
             contract = d.validate_contract(data['contract'])
@@ -1588,15 +2331,21 @@ class App:
         require_uuid(root_id, 'work_package_id')
         root = self.store.get('root', root_id)
         if root:
+            # 同一根的修订属于根所在的项目，受理时的项目配置版本也沿用根冻结的那一个。
+            if project and project['project_id'] != root.get('project_id'):
+                raise ValueError('revisions of a work package stay in its project')
             if any(j['work_package_id'] == root_id and j['status'] not in ('completed', 'failed', 'cancelled') for j in self.store.all('job')):
                 raise APIError('conflict', 'work_package revisions must be serial')
         else:
-            # 根受理时冻结模型策略：后续修订与受管修复只读这里，不读之后修改的设置（§12.4）。
+            # 根受理时冻结模型策略：后续修订与受管修复只读这里，不读之后修改的设置或项目默认值（§12.4、§13.1）。
             root = {'counters': dict(attempts=0, infra_retries=0, migrations=0, repairs=0), 'created_at': d.timestamp(now),
+                    'project_id': project['project_id'] if project else None,
                     'model_policy': d.frozen_policy(self.model_settings(),
-                                                    model_policy['resolved'] if contract['harness'] == 'codex' else None)}
+                                                    model_policy['resolved'] if contract['harness'] == 'codex' else None, project)}
         job = {
             'model_policy': model_policy,
+            'project_id': root.get('project_id'), 'project_revision': (root.get('model_policy') or {}).get('project_revision'),
+            'acceptance_run': bool(acceptance_run),
             'created_by': created_by or {'kind': 'controller', 'client_id': None, 'name': None},
             'job_id': ident, 'request_id': data['request_id'], 'request_hash': p.value_hash(data),
             'work_package_id': root_id, 'title': data.get('title', ''), 'contract': contract,
@@ -2149,6 +2898,8 @@ def backup(data_dir, dest, clock=time.time):
         try:
             source.backup(target)
             generation = json.loads(target.execute("SELECT data FROM records WHERE kind='meta' AND id='controller'").fetchone()[0])['authority_generation']
+            # 快照里最后一条事件的序号：之后用 GET /activity?after=<它> 看这份备份之后产生了什么。
+            event_seq = target.execute('SELECT COALESCE(MAX(seq), 0) FROM events').fetchone()[0]
             blobs = BlobStore(data_dir)
             references = database_references(target, blobs)
             output = BlobStore(dest)
@@ -2163,7 +2914,7 @@ def backup(data_dir, dest, clock=time.time):
             database_name = 'controller-' + database_hash + '.db'
             manifest = {'version': 1, 'db_sha256': database_hash, 'database': database_name, 'blobs': [
                 {'sha256': digest, 'size': size} for digest, size in sorted(references.items())],
-                        'authority_generation': generation, 'created_at': d.timestamp(clock())}
+                        'authority_generation': generation, 'event_seq': event_seq, 'created_at': d.timestamp(clock())}
             manifest_stage = dest / ('.manifest-' + new_id())
             with open(str(manifest_stage), 'wb') as f:
                 f.write(p.canonical_json(manifest))
@@ -2191,6 +2942,90 @@ def backup(data_dir, dest, clock=time.time):
     finally:
         store.close()
     return manifest
+
+
+def revoke_execution(store, generation, clock, void_unclaimed=False):
+    """把恢复代次推进到 generation 并撤销此前签发的全部执行权。调用方负责事务。
+
+    之后：所有 attempt 的租约令牌作废，进行中的 attempt 记为失联；未结束的任务停在待对账；协调租约因代次不同而失效；
+    派单暂停；每个节点下次心跳被要求对账（心跳照常返回 reconcile_required 与 revoked），对账前的领取与旧代次的检查点、完成、发布以 stale_generation 被拒绝。
+    节点凭据、客户端凭据、管理令牌与已结束任务的历史不受影响。
+    """
+    meta = store.get('meta', 'controller')
+    meta.update(authority_generation=generation, dispatch_paused=True, version=meta['version'] + 1)
+    store.put('meta', 'controller', meta)
+    for attempt in store.all('attempt'):
+        private = store.get('attempt_private', attempt['attempt_id'])
+        private['revoked'] = True
+        store.put('attempt_private', attempt['attempt_id'], private)
+        if attempt['status'] in p.ATTEMPT_ACTIVE:
+            attempt.update(status='lost', failure_class='node_lost', failure_detail='stale_generation', ended_at=d.timestamp(clock()))
+            store.put('attempt', attempt['attempt_id'], attempt)
+    for job in store.all('job'):
+        jp = store.get('job_private', job['job_id'])
+        jp['pending'] = False
+        store.put('job_private', job['job_id'], jp)
+        if job['status'] not in ('cancelled', 'failed', 'completed'):
+            job = d.transition(job, clock(), status='cancel_requested' if job['cancel']['requested_at'] else 'waiting_reconcile', status_reason='stale_generation')
+            store.put('job', job['job_id'], job)
+            store.event('job.updated', job, d.timestamp(clock()), job_id=job['job_id'])
+    # 屏障（void_unclaimed）作废还没被领取的操作。恢复不这样做：备份里 requested 的写回可能在备份之后
+    # 已被节点执行，记成“失败、没写”就与目录不符；保持 requested，节点之后的上报或 recover 照常对账。
+    # 通用操作（probe、log_tail）没有这个问题，但备份之后节点可能已确认领取过它们，恢复后不会再领：两种情况都作废。
+    for op in store.all('node_op'):
+        if op['status'] == 'requested' and not void_unclaimed and op['kind'] in p.PROJECT_OPERATIONS:
+            # 恢复后保留的写回：到期时不能再推断为“节点没领取、一个文件都没写”（备份之后可能已经写过），应用保持待确认。
+            store.put('node_op', op['op_id'], dict(op, restored=True))
+            continue
+        if op['status'] != 'requested' or (not void_unclaimed and op['kind'] in p.PROJECT_OPERATIONS):
+            continue  # 已领取的操作节点可能正在执行：结果照常对账（远端写回保持待确认，用 recover 处理）
+        # 还没被领取的操作作废：屏障之后它们不会再下发，节点晚到的领取得到终态拒绝。
+        at = d.timestamp(clock())
+        op.update(status='failed', error='stale_generation', finished_at=at)
+        store.put('node_op', op['op_id'], op)
+        store.event('node.operation', {k: op[k] for k in ('op_id', 'node_id', 'kind', 'status')}, at, node_id=op['node_id'])
+        record = store.get('application', op['params'].get('application_id')) if op['kind'] == 'project_apply' else None
+        if record and record['status'] == 'started':
+            record.update(status='failed', detail={'reason': 'stale_generation', 'written': [], 'operation_id': op['op_id']}, finished_at=at)
+            store.put('application', record['application_id'], record)
+            store.event('project.application', record, at, job_id=record['job_id'])
+    for node in store.all('node'):
+        store.put('node_private', node['node_id'], {'reconcile_required': True})
+    return meta
+
+
+def barrier(data_dir, request_id, reason, clock=time.time):
+    """切换屏障：在已停止的 controller 的数据目录上，使屏障之前签发的全部执行权失效（见 revoke_execution）。
+
+    普通的停止再启动保留恢复代次、租约与协调租约；需要让切换前的执行权全部失效时用它，而不是靠重启。
+    前置条件：controller 已停止（取得数据目录的锁），派单已暂停，普通提交已关闭。同一 request_id 重复执行不再推进代次。
+    """
+    require_uuid(request_id, 'request_id')
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('barrier requires a reason')
+    data_dir = Path(data_dir).resolve()
+    if not (data_dir / 'controller.db').is_file():
+        raise ValueError('controller database does not exist')
+    with ControllerLock(data_dir):
+        store = Store(data_dir)
+        try:
+            with store.transaction():
+                done = store.get('barrier', request_id)
+                if done:
+                    return dict(done, replayed=True)
+                meta = store.get('meta', 'controller')
+                if not meta['dispatch_paused'] or (meta.get('intake') or {}).get('mode', 'open') == 'open':
+                    raise ValueError('barrier requires dispatch to be paused and intake to be closed or restricted first')
+                before = meta['authority_generation']
+                active = sum(a['status'] in p.ATTEMPT_ACTIVE for a in store.all('attempt'))
+                meta = revoke_execution(store, before + 1, clock, void_unclaimed=True)
+                record = {'request_id': request_id, 'reason': reason.strip(), 'at': d.timestamp(clock()),
+                          'generation_before': before, 'authority_generation': meta['authority_generation'], 'revoked_active_attempts': active}
+                store.put('barrier', request_id, record)
+                store.event('controller.barrier', record, d.timestamp(clock()))
+                return dict(record, replayed=False)
+        finally:
+            store.close()
 
 
 def restore(data_dir, source_dir, clock=time.time):
@@ -2249,28 +3084,8 @@ def restore(data_dir, source_dir, clock=time.time):
             try:
                 with stage.transaction():
                     stage.db.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='events'", (current_seq,))
-                    meta = stage.get('meta', 'controller')
-                    meta.update(authority_generation=max(current_generation, manifest['authority_generation']) + 1,
-                                dispatch_paused=True, version=meta['version'] + 1)
-                    stage.put('meta', 'controller', meta)
                     # Backup rollback loses live facts; freeze execution until explicit reconciliation.
-                    for attempt in stage.all('attempt'):
-                        private = stage.get('attempt_private', attempt['attempt_id'])
-                        private['revoked'] = True
-                        stage.put('attempt_private', attempt['attempt_id'], private)
-                        if attempt['status'] in p.ATTEMPT_ACTIVE:
-                            attempt.update(status='lost', failure_class='node_lost', failure_detail='stale_generation', ended_at=d.timestamp(clock()))
-                            stage.put('attempt', attempt['attempt_id'], attempt)
-                    for job in stage.all('job'):
-                        jp = stage.get('job_private', job['job_id'])
-                        jp['pending'] = False
-                        stage.put('job_private', job['job_id'], jp)
-                        if job['status'] not in ('cancelled', 'failed', 'completed'):
-                            job = d.transition(job, clock(), status='cancel_requested' if job['cancel']['requested_at'] else 'waiting_reconcile', status_reason='stale_generation')
-                            stage.put('job', job['job_id'], job)
-                            stage.event('job.updated', job, d.timestamp(clock()), job_id=job['job_id'])
-                    for node in stage.all('node'):
-                        stage.put('node_private', node['node_id'], {'reconcile_required': True})
+                    meta = revoke_execution(stage, max(current_generation, manifest['authority_generation']) + 1, clock)
                     stage.db.execute("DELETE FROM records WHERE kind='session'")
                     stage.event('controller.restored', {'authority_generation': meta['authority_generation']}, d.timestamp(clock()))
                 stage.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
@@ -2330,9 +3145,14 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def _write(self, result):
         self.send_response(result.status)
-        for key, value in result.headers:
+        headers = list(result.headers)
+        if urlsplit(getattr(self, 'path', '') or '').path.startswith(p.API_PREFIX + '/') and not any(k == 'X-Controller-Id' for k, _ in headers):
+            # HTTP 层直接拒绝的请求（缺少或不合法的 Content-Length、请求体过大）也来自这个 controller：带上身份，
+            # 客户端才不会把它当成别的 controller 的应答而关闭连接（§12.1）。
+            headers.append(('X-Controller-Id', self.server.app.controller_id))
+        for key, value in headers:
             self.send_header(key, value)
-        if not any(key.lower() == 'content-length' for key, _ in result.headers):
+        if not any(key.lower() == 'content-length' for key, _ in headers):
             self.send_header('Content-Length', str(len(result.body)))
         self.end_headers()
         if self.command != 'HEAD':
@@ -2409,8 +3229,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 result = self.server.app.handle('GET', p.API_PREFIX + '/events/stream?cursor=' + str(cursor), headers, b'')
                 if result.status != 200 or result.stream is None:
                     if result.status in (401, 403):
-                        # 每轮都重新认证：凭据被撤销或权限被收回后，告知客户端再关闭，客户端不必猜测断开原因。
-                        self.wfile.write(b'event: unauthorized\ndata: {}\n\n')
+                        # 每轮都重新认证，告知客户端再关闭，客户端不必猜测断开原因。两种情况分开：
+                        # 401 凭据已撤销或失效（客户端应清理这条连接）；403 凭据仍有效、只是没有读取事件的权限。
+                        self.wfile.write(b'event: unauthorized\ndata: {}\n\n' if result.status == 401
+                                         else b'event: forbidden\ndata: {}\n\n')
                         self.wfile.flush()
                     return
         except APIError as exc:
@@ -2471,7 +3293,7 @@ def serve(data_dir, bind='127.0.0.1:18669', public_origin=None, tls_cert=None, t
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('serve', 'pairing-code', 'client-code', 'admin-token', 'backup', 'restore', 'prune-events'):
+    for name in ('serve', 'pairing-code', 'client-code', 'admin-token', 'backup', 'restore', 'prune-events', 'barrier'):
         command = sub.add_parser(name)
         command.add_argument('--data-dir', required=True)
         if name == 'client-code':
@@ -2494,6 +3316,10 @@ def main(argv=None):
             command.add_argument('--from', dest='source', required=True)
         elif name == 'prune-events':
             command.add_argument('--keep', type=int, required=True)
+        elif name == 'barrier':
+            # 切换屏障：见 barrier()。只在 controller 停止后运行。
+            command.add_argument('--request-id', required=True)
+            command.add_argument('--reason', required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == 'serve':
@@ -2502,6 +3328,8 @@ def main(argv=None):
             print(json.dumps(backup(args.data_dir, args.dest)))
         elif args.command == 'restore':
             print(json.dumps({'authority_generation': restore(args.data_dir, args.source)}))
+        elif args.command == 'barrier':
+            print(json.dumps(barrier(args.data_dir, args.request_id, args.reason), ensure_ascii=False))
         else:
             data_dir = Path(args.data_dir).resolve()
             if not (data_dir / 'controller.db').exists() or not (data_dir / 'admin.token').exists():

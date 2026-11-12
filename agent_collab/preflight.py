@@ -310,7 +310,8 @@ def _controller(root, reader, now, snapshot=None):
         nodes.append(dict(_pick(node, 'agent_version physical_host_id drain last_seen_at'),
                           node_id=node.get('node_id', ident), os=cap.get('os'), arch=cap.get('arch'),
                           runtime_user=_object(node.get('runtime_profile')).get('user'),
-                          harness=cap.get('harness'), models_capability='models' in cap))
+                          harness=cap.get('harness'), models_capability='models' in cap,
+                          retired=bool(node.get('retired_at'))))
     leases = []
     for ident, lease in records.get('coordinator', {}).items():
         try:
@@ -358,7 +359,9 @@ def _controller(root, reader, now, snapshot=None):
                 config=dict(present=(root / 'config.json').exists(), keys=sorted(config or {}),
                             public_origin=_object(config).get('public_origin'),
                             deployment_profile=_object(config).get('deployment_profile'),
-                            managed_coordinator=managed_profile(config or {})),
+                            # 与 controller 相同的优先级：保存过的协调设置与设置里的协调模型优先于 config.json。
+                            managed_coordinator=managed_profile(config or {}, _object(_object(settings).get('claude')).get('default'),
+                                                                _object(records.get('settings', {}).get('coordination')) or None)),
                 jobs=dict(total=len(jobs), by_status=dict(Counter(str(j.get('status', 'unknown')) for j in jobs)),
                           non_terminal=[dict(_pick(j, 'job_id status work_package_id title'),
                                              harness=_object(j.get('contract')).get('harness'))
@@ -448,7 +451,9 @@ def _probe(service):
     else:
         return None
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False)
+        # 同 adapters.commands.NO_WINDOW；这里不导入它：ECS 预检会把本文件配上主机已装的旧版包执行。
+        flags = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False, **flags)
         if result.returncode != 0:
             return None
         if kind == 'systemd':
@@ -704,9 +709,9 @@ def inventory(controller_data_dir=None, node_data_dirs=(), install_roots=(), leg
         ('single_controller_identity', False if 'controller_identity_mismatch' in conflicts else True if identities_known else None,
          '所提供节点与 controller 身份一致'),
         ('no_duplicate_node_ids', False if 'duplicate_node_id' in conflicts else True if node_ids_known else None, '所提供节点 ID 无重复'),
-        # 已排空的节点不会再领任务（如早已停用但记录还在的节点），不让它们卡住这一项。
-        ('nodes_declare_models', all(n['models_capability'] for n in controller['nodes'] if not n['drain']) if readable else None,
-         '未排空的已登记节点全部声明 models 能力'),
+        # 已排空或已退役的节点不会再领任务（如早已停用但记录还在的节点），不让它们卡住这一项。
+        ('nodes_declare_models', all(n['models_capability'] for n in controller['nodes'] if not n['drain'] and not n['retired'])
+         if readable else None, '仍参与运行（未排空、未退役）的节点全部声明 models 能力'),
         ('legacy_tasks_idle', False if legacy_active else True if legacy_known else None,
          '所提供旧 launcher 无运行或未知任务；不验证进程存活'),
     ]

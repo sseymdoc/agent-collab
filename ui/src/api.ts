@@ -1,4 +1,4 @@
-// 只对接真实 controller API（docs/protocol.md §5、§8、§12）；没有 mock。传输见 transport.ts。
+// 只对接真实 controller API（docs/protocol.md §5、§8、§12、§13）；没有 mock。传输见 transport.ts。
 import { currentEpoch, request, setCsrf, type Rsp } from './transport'
 
 export type J = Record<string, any>
@@ -81,7 +81,8 @@ async function send(method: string, path: string, body?: string, extra: Record<s
     throw new ApiError(0, code, typeof e?.message === 'string' ? e.message : '无法连接 controller')
   }
   if (r.status < 200 || r.status >= 300) {
-    if (r.status === 401) { setCsrf(null); unauthorized('unauthorized') }
+    // 与上面相同：只有当前连接代次的请求得到 401 才回到登录或连接页，旧流程迟到的 401 不关掉新连接。
+    if (r.status === 401 && mine === currentEpoch()) { setCsrf(null); unauthorized('unauthorized') }
     let data: any = null
     try { data = JSON.parse(r.body) } catch { /* 不是 JSON 错误体 */ }
     const e = data?.error ?? {}
@@ -107,7 +108,8 @@ export const api = {
   whoami: () => call('GET', '/client'),
   overview: () => call('GET', '/overview'),
   // 按创建时间倒序分页：before 为上一页最后一个 job_id。
-  jobs: (status = '', before = '') => call('GET', '/jobs?limit=' + JOBS_PAGE + (status ? '&status=' + encodeURIComponent(status) : '') + (before ? '&before=' + encodeURIComponent(before) : '')),
+  jobs: (status = '', before = '', project = '') => call('GET', '/jobs?limit=' + JOBS_PAGE + (status ? '&status=' + encodeURIComponent(status) : '') + (before ? '&before=' + encodeURIComponent(before) : '')
+    + (project ? '&project_id=' + encodeURIComponent(project) : '')),
   job: (id: string) => call('GET', '/jobs/' + id),
   jobEvents: (id: string, before: number) => call('GET', '/jobs/' + id + '/events?limit=200&before=' + before),
   explain: (id: string) => call('GET', '/jobs/' + id + '/explain'),
@@ -124,10 +126,41 @@ export const api = {
   saveModels: (revision: number, codex: J | undefined, claude: J | undefined, requestId: string) =>
     call('PUT', '/settings/models', { request_id: requestId, expected_revision: revision, codex, claude }),
   templates: () => call('GET', '/templates'),
-  baselines: () => call('GET', '/baselines'),
+  baselines: (project = '') => call('GET', '/baselines' + (project ? '?project_id=' + encodeURIComponent(project) : '')),
   draft: (body: J) => call('POST', '/contracts/draft', body),
-  // 提交带上草拟时的设置版本：期间默认模型被改动则被拒绝，不会按没看过的解析结果受理。
-  submit: (title: string, contract: J, revision: number) => call('POST', '/jobs', { request_id: uuid(), title, contract, expected_settings_revision: revision }),
+  // 提交带上草拟时的设置版本（属于项目时再带项目配置版本）：期间默认值被改动则被拒绝，不会按没看过的解析结果受理。
+  submit: (title: string, contract: J, revision: number, project?: { id: string; revision: number }) => call('POST', '/jobs', {
+    request_id: uuid(), title, contract, expected_settings_revision: revision,
+    ...(project ? { project_id: project.id, expected_project_revision: project.revision } : {}) }),
+  // 全局事件从新到旧翻看：序号小于 before 的最近 limit 条（升序）；before=0 从最新一条开始。
+  eventsBefore: (before: number, limit = 200) => call('GET', '/events?before=' + before + '&limit=' + limit),
+  // 项目（§13.1）：配置改动带读到的 revision；登记基线与应用成果不改变 revision。
+  projects: () => call('GET', '/projects'),
+  project: (id: string) => call('GET', '/projects/' + id),
+  createProject: (name: string) => call('POST', '/projects', { request_id: uuid(), name }),
+  updateProject: (id: string, revision: number, patch: J) => call('PUT', '/projects/' + id, { request_id: uuid(), expected_revision: revision, ...patch }),
+  applications: (id: string) => call('GET', '/projects/' + id + '/applications'),
+  // 远端项目写回（§13.10）：controller 按任务记录填写参数，这里只指名任务与节点；结果在应用记录里。
+  application: (project: string, id: string) => call('GET', '/projects/' + project + '/applications/' + id),
+  remotePlan: (project: string, job: string, node: string) => call('POST', '/projects/' + project + '/plans', { request_id: uuid(), job_id: job, node_id: node }),
+  remoteApply: (project: string, body: J) => call('POST', '/projects/' + project + '/applications', { request_id: uuid(), ...body }),
+  remoteRecover: (project: string, id: string, action: string) =>
+    call('POST', '/projects/' + project + '/applications/' + id + '/recover', { request_id: uuid(), action }),
+  // 协调设置（§13.7），与模型设置是两条记录，各自带 revision。
+  coordination: () => call('GET', '/settings/coordination'),
+  saveCoordination: (revision: number, enabled: boolean, nodeIds: string[], requestId: string) =>
+    call('PUT', '/settings/coordination', { request_id: requestId, expected_revision: revision, enabled, node_ids: nodeIds }),
+  // 节点管理（§13.5、§13.6）。
+  retiredNodes: () => call('GET', '/nodes?retired=1'),
+  nodeCode: (nodeId: string, replace: boolean) => call('POST', '/nodes/codes', { request_id: uuid(), node_id: nodeId, ...(replace ? { replace: true } : {}) }),
+  maintenance: (id: string, v: number, active: boolean, reason: string) =>
+    call('POST', '/nodes/' + id + '/maintenance', { request_id: uuid(), expected_version: v, active, ...(reason ? { reason } : {}) }),
+  retire: (id: string, v: number, retired: boolean, reason: string) =>
+    call('POST', '/nodes/' + id + '/retire', { request_id: uuid(), expected_version: v, retired, ...(reason ? { reason } : {}) }),
+  nodeOperation: (id: string, kind: string, params: J = {}) => call('POST', '/nodes/' + id + '/operations', { request_id: uuid(), kind, params }),
+  operation: (op: string) => call('GET', '/operations/' + op),
+  // 原始输出取回：节点在心跳里领取，结果经 GET /operations/{op_id} 读取。
+  logs: (job: string, body: J) => call('POST', '/jobs/' + job + '/logs', { request_id: uuid(), ...body }),
   clients: () => call('GET', '/clients'),
   revokeClient: (id: string, v: number) => call('POST', '/clients/' + id + '/revoke', { request_id: uuid(), expected_version: v }),
   issueCode: (scopes: string[]) => call('POST', '/clients/codes', { request_id: uuid(), scopes, ttl_s: 600 }),
@@ -152,6 +185,19 @@ export const api = {
   drain: (node: string, v: number, drain: boolean, migrate = false) =>
     call('POST', '/nodes/' + node + '/drain', { request_id: uuid(), expected_version: v, drain, ...(drain && migrate ? { migrate: true } : {}) }),
   dispatch: (paused: boolean, v: number) => call('POST', '/dispatch', { request_id: uuid(), paused, expected_version: v }),
+}
+
+// 管理操作是异步记录：轮询到结果确定（succeeded / failed / timed_out）。alive() 为 false 时（页面已离开）停止。
+export const OP_DONE = ['succeeded', 'failed', 'timed_out']
+export async function waitOperation(opId: string, on: (op: J) => void, alive: () => boolean): Promise<J | null> {
+  for (let delay = 500; alive(); delay = Math.min(delay * 1.5, 3000)) {
+    const op = await api.operation(opId)
+    if (!alive()) return null
+    on(op)
+    if (OP_DONE.includes(op.status)) return op
+    await new Promise(r => setTimeout(r, delay))
+  }
+  return null
 }
 
 function coordHeader(wp: string): Record<string, string> {

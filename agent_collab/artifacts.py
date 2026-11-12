@@ -9,6 +9,7 @@ import stat
 import uuid
 
 from . import protocol as p
+from .adapters.commands import NO_WINDOW
 
 
 EMPTY = {'version': 1, 'base': None, 'files': [], 'deleted': []}
@@ -56,7 +57,7 @@ def _current_user():
     import csv
     import re
     import subprocess
-    whoami = subprocess.run([_system_tool('whoami.exe'), '/user', '/fo', 'csv', '/nh'], capture_output=True, text=True, errors='replace', check=True)
+    whoami = subprocess.run([_system_tool('whoami.exe'), '/user', '/fo', 'csv', '/nh'], capture_output=True, text=True, errors='replace', check=True, **NO_WINDOW)
     row = next(csv.reader(whoami.stdout.splitlines()), [])
     if len(row) < 2 or not row[0] or not re.fullmatch(r'S-1-(?:[0-9]+-)+[0-9]+', row[1]):
         raise OSError('cannot determine the current user')
@@ -66,7 +67,7 @@ def _current_user():
 def _principals(path):
     """icacls 列出的 DACL 中每条 ACE 的主体名（第一行带文件路径前缀，末尾的处理汇总行不含 ACE）。"""
     import subprocess
-    listing = subprocess.run([_system_tool('icacls.exe'), str(path)], capture_output=True, text=True, errors='replace', check=True).stdout
+    listing = subprocess.run([_system_tool('icacls.exe'), str(path)], capture_output=True, text=True, errors='replace', check=True, **NO_WINDOW).stdout
     names = []
     for line in listing.splitlines():
         if ':(' not in line:
@@ -89,11 +90,11 @@ def owner_only(path):
     name, sid = _current_user()
     icacls = _system_tool('icacls.exe')
     try:
-        subprocess.run([icacls, str(path), '/inheritance:r', '/grant:r', '*%s:F' % sid], capture_output=True, check=True)
+        subprocess.run([icacls, str(path), '/inheritance:r', '/grant:r', '*%s:F' % sid], capture_output=True, check=True, **NO_WINDOW)
         others = [n for n in _principals(path) if n.casefold() != name.casefold()]
         for other in dict.fromkeys(others):
             # 解析不出账户名的主体，icacls 显示为原始 SID，按 SID 删除要加 *；/remove 同时删除授权与拒绝 ACE。
-            subprocess.run([icacls, str(path), '/remove', '*' + other if other.startswith('S-1-') else other], capture_output=True, check=True)
+            subprocess.run([icacls, str(path), '/remove', '*' + other if other.startswith('S-1-') else other], capture_output=True, check=True, **NO_WINDOW)
         remaining = _principals(path)
     except subprocess.CalledProcessError as exc:
         raise OSError('icacls failed to restrict %s' % path) from exc

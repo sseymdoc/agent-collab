@@ -337,6 +337,9 @@ class HTTPAndCLITest(ControllerCase):
             handler._request()
             self.assertIn(handler.send_response.call_args.args[0], (400, 413))
             self.assertEqual(handler.rfile.tell(), 0)
+            # HTTP 层直接拒绝的应答同样带 controller 身份：客户端据此知道是同一个 controller 拒绝了请求，
+            # 而不是把它当成别的 controller 的应答关闭连接（曾导致桌面端上传空文件时断开）。
+            self.assertIn(mock.call('X-Controller-Id', self.app.controller_id), handler.send_header.call_args_list)
         handler = self.handler('POST', '/api/v1/jobs', b'{}', {'Content-Length': '5'})
         handler._request()
         handler.send_response.assert_called_once_with(400)

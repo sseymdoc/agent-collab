@@ -11,6 +11,13 @@ from .. import protocol as p
 
 CREATE_SUSPENDED = 0x00000004  # Windows CreateProcess 标志
 
+# 执行与模型目录探测共用的模型 provider（protocol §12.5）。
+# 执行用 `exec --ignore-user-config`：不读 $CODEX_HOME/config.toml，provider 是 CLI 内置的缺省值。
+# `app-server` 没有这个选项，会读用户配置；所以两边都显式带上同一条 provider 覆盖，探测时再读回生效值核对。
+# 这样不会出现“目录来自用户自定义 provider、执行却走缺省 provider”。认证两边都取自同一个 CODEX_HOME。
+PROVIDER = 'openai'
+PROVIDER_OVERRIDE = ['-c', 'model_provider="%s"' % PROVIDER]
+
 
 def build_argv(command, cwd, output_dir, params=None, session_id=None, structured_report=False,
                system=None, windows_sandbox='elevated'):
@@ -22,7 +29,7 @@ def build_argv(command, cwd, output_dir, params=None, session_id=None, structure
     if sandbox not in ('read-only', 'workspace-write'):
         raise ValueError('invalid sandbox')
     command = [command] if isinstance(command, str) else list(command)
-    argv = command + ['exec', '--ignore-user-config', '-C', str(cwd), '--sandbox', sandbox,
+    argv = command + ['exec', '--ignore-user-config'] + PROVIDER_OVERRIDE + ['-C', str(cwd), '--sandbox', sandbox,
         '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort="' + effort + '"',
         '-c', 'sandbox_workspace_write.writable_roots=[]',
         '-c', 'sandbox_workspace_write.network_access=false',
@@ -46,16 +53,19 @@ def model_catalog(argv, env=None, timeout=20, popen=subprocess.Popen):
 
     经 stdio 交互，不监听端口，不调用模型；在调用方的用户、CODEX_HOME 与登录上下文里运行，
     所以目录反映的是这个节点上这个账户能看到的模型。取不到时 status 为 unknown 并给出原因。
+
+    provider：带着与执行相同的 provider 覆盖启动，再用 config/read 读回生效的 model_provider。
+    读不回或与执行用的不一致时不采用这份目录（provider_unverified / provider_mismatch），不把别的 provider 的目录当作执行能力。
     """
     import queue
     import threading
     result = {'status': 'unknown', 'source': 'app-server:model/list', 'fetched_at': None, 'cli_version': None,
-              'reason': None, 'models': []}
+              'reason': None, 'models': [], 'provider': None}
     if not argv:
         return dict(result, reason='command_missing')
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {'start_new_session': True}
     try:
-        process = popen(list(argv) + ['app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        process = popen(list(argv) + PROVIDER_OVERRIDE + ['app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.DEVNULL, env=env, **options)
     except OSError:
         return dict(result, reason='spawn_failed')
@@ -92,6 +102,14 @@ def model_catalog(argv, env=None, timeout=20, popen=subprocess.Popen):
         send({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'agent-collab', 'version': '1'}}})
         reply(1)
         send({'method': 'initialized'})
+        send({'id': 100, 'method': 'config/read', 'params': {'includeLayers': False}})
+        effective = reply(100).get('result')
+        provider = effective.get('config', {}).get('model_provider') if isinstance(effective, dict) and isinstance(effective.get('config'), dict) else None
+        if not isinstance(provider, str) or not provider or len(provider) > 200:
+            return dict(result, reason='provider_unverified')
+        result['provider'] = provider
+        if provider != PROVIDER:
+            return dict(result, reason='provider_mismatch')
         models, cursor = [], None
         for ident in range(2, 12):  # 目录分页；十页以上按异常处理，不无限翻页
             send({'id': ident, 'method': 'model/list', 'params': {'cursor': cursor, 'includeHidden': False}})

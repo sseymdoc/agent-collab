@@ -3,10 +3,14 @@ import { api, coordHeld, pendingTakeOf } from '../api'
 import { can, session } from '../session'
 import { saveBlob } from '../transport'
 import { Action, Badge, Json, MODEL_SOURCE, ORIGIN, Section, errText, show, short, useData, when } from '../ui'
+import { JobLogs } from './JobLogs'
+import { JobResult, ResultFacts } from './JobResult'
 
 export function JobDetail({ id, tick }: { id: string; tick: number }) {
   const { data: d, error } = useData(() => api.job(id), [id, tick])
   const explain = useData(() => api.explain(id).catch(() => null), [id, tick])
+  // 只为显示项目名；读不到时显示 ID。
+  const project = useData(() => d?.job?.project_id ?? d?.project_id ? api.project(d.job?.project_id ?? d.project_id).catch(() => null) : Promise.resolve(null), [d?.job?.project_id ?? d?.project_id])
   const [older, setOlder] = useState<any[]>([])
   const [olderErr, setOlderErr] = useState<string | null>(null)
   const [olderDone, setOlderDone] = useState(false)
@@ -33,6 +37,7 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
       ? ['good', '全部通过'] : ['bad', '未通过']
   const rounds = events.filter(e => e.type === 'coordinator.triggered').map(e => e.payload?.coordinator_job_id).filter(Boolean)
   const tasks = can('tasks')
+  const projectName = project.data?.name
   return <>
     {error && <p className="err">刷新失败，以下为上次成功加载的内容：{error}</p>}
     <Section title={job.title || '任务 ' + short(job.job_id)} extra={<a href="#/jobs">返回列表</a>}>
@@ -41,10 +46,10 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
         <span>运行 <Badge v={job.status} /></span>
         <span>检查 <span className={'badge ' + checks[0]}>{checks[1]}</span></span>
         <span>验收 <Badge v={job.acceptance?.status} /></span>
-        <span>发布 {job.delivery_version ? <span className="badge good">已发布（交付版本 {job.delivery_version}）</span> : <span className="badge muted">未发布</span>}</span>
         <span>回写 <Badge v={job.integration_status} /></span>
         <span>恢复保护 <Badge v={job.protection} /></span>
       </div>
+      <ResultFacts job={job} d={d} finals={finals} />
       {job.status_reason && <p className="warn-text">原因：{show(job.status_reason)}</p>}
       {job.acceptance?.requested_status && job.acceptance.requested_status !== job.acceptance.status &&
         <p className="warn-text">审核者请求“{show(job.acceptance.requested_status)}”，但缺少契约要求的执行证据，验收记为未验收：
@@ -61,6 +66,8 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
             : <small className="muted">（升级前受理，未记录来源）</small>}
           <br /><small>请求 {mp ? `${mp.requested?.model ?? '未指定'} / ${mp.requested?.effort ?? '未指定'}` : '未知'} ·
             CLI 实际观测 {show(current?.runtime?.observed?.model)} / {show(current?.runtime?.observed?.effort ?? current?.runtime?.observed?.reasoning_effort)}</small></>}</dd>
+        {job.project_id && <><dt>项目</dt><dd><a href={'#/projects/' + job.project_id}>{projectName ?? short(job.project_id)}</a>
+          <small className="muted"> · 受理时项目配置第 {show(job.project_revision ?? mp?.project_revision)} 版</small></dd></>}
         <dt>来源</dt><dd>{job.created_by ? (job.created_by.name ?? ORIGIN[job.created_by.kind] ?? job.created_by.kind) : '未知（升级前受理）'} · 创建 {when(job.created_at)}</dd>
         <dt>job_id / 根工作包</dt><dd><code>{job.job_id}</code> / <code>{job.work_package_id}</code></dd>
         <dt>可计数进度</dt><dd>{progress?.payload?.total ? `${progress.payload.done} / ${progress.payload.total}` : '无可计数阶段（不根据模型文本推测）'}</dd>
@@ -72,16 +79,16 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
       </dl>
     </Section>
 
-    {tasks && <Section title="操作">
+    <Section title="操作" extra={!tasks && <span className="muted">这条连接没有任务权限（tasks），以下操作不可用</span>}>
       <div className="actions">
-        <Action label="请求取消" danger disabled={['cancelled', 'failed', 'completed', 'cancel_requested'].includes(job.status)} confirm="取消不会触发自动恢复。确定请求取消？" run={() => api.cancel(job.job_id, job.version)} />
+        <Action label="请求取消" scope="tasks" danger disabled={['cancelled', 'failed', 'completed', 'cancel_requested'].includes(job.status)} confirm="取消不会触发自动恢复。确定请求取消？" run={() => api.cancel(job.job_id, job.version)} />
         <Retry job={job} />
         {finals.map(k => <Action key={k.checkpoint_id} label={'发布检查点 ' + short(k.checkpoint_id) + '（基于交付版本 ' + job.delivery_version + '）'}
-          disabled={!current || job.delivery_checkpoint_id === k.checkpoint_id} run={() => api.publish(job.job_id, job.work_package_id, job.version, current, k.checkpoint_id, job.delivery_version)} />)}
+          scope="tasks" disabled={!current || job.delivery_checkpoint_id === k.checkpoint_id} run={() => api.publish(job.job_id, job.work_package_id, job.version, current, k.checkpoint_id, job.delivery_version)} />)}
       </div>
       {c.publish?.requires_acceptance && !job.delivery_version && <p className="muted">本任务要求验收通过后才能发布；验收通过不会自动发布。</p>}
-      <Assess job={job} checkpoints={checkpoints} />
-    </Section>}
+      {tasks && <Assess job={job} checkpoints={checkpoints} />}
+    </Section>
 
     <Coordinator job={job} tick={tick} />
 
@@ -90,6 +97,8 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
         <Files key={cp} cp={cp} label={cp === job.delivery_checkpoint_id ? '已发布的交付（版本 ' + job.delivery_version + '）' : '最终检查点 ' + short(cp) + '（未发布）'} />)
         : <p className="muted">还没有最终检查点。</p>}
     </Section>
+
+    <JobResult job={job} finals={finals} tick={tick} />
 
     <Section title="契约（受理后不可变）">
       <dl className="kv">
@@ -120,10 +129,13 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
         </tr>)}</tbody></table>
     </Section>
 
-    <Section title="执行报告" extra={<span className="muted">设备上报的事实（已脱敏、限长）；不是验收结论</span>}>
+    <Section title="执行报告与检查摘要" extra={<span className="muted">设备上报的事实（已脱敏、限长）；不是验收结论</span>}>
+      <p className="muted">检查摘要是每项检查的退出码与标准输出、标准错误的尾部（各不超过 4 KiB，可能被截断）；完整输出见下面“原始输出”。</p>
       {attempts.filter(a => a.report).length ? attempts.filter(a => a.report).map(a => <Report key={a.attempt_id} a={a} />)
         : <p className="muted">尚无执行报告。</p>}
     </Section>
+
+    <JobLogs job={job} attempts={attempts} />
 
     <Section title="检查点">
       <table><thead><tr><th>检查点</th><th>attempt / epoch</th><th>类型</th><th>状态</th><th>缺失 blob</th><th>已完成 / 未完成</th><th>时间</th><th></th></tr></thead>
@@ -159,7 +171,8 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
         </tr>)}</tbody></table> : <p className="muted">无调度解释。</p>}
     </Section>
 
-    <Section title="事件时间线" extra={<span className="muted">已载入 {events.length} 条；stale 为旧 epoch 迟到事件，仅存档</span>}>
+    <Section title="产品事件" extra={<span className="muted">已载入 {events.length} 条；stale 为旧 epoch 迟到事件，仅存档</span>}>
+      <p className="muted">controller 记录的状态变化与节点上报的进度，不是 CLI 的完整输出。</p>
       <ol className="timeline">{[...events].reverse().map(e => <li key={e.seq} className={e.stale ? 'stale' : ''}>
         <span className="muted">#{e.seq} {when(e.created_at)}</span> <b>{e.type}</b> {e.attempt_id ? <code>{short(e.attempt_id)}</code> : null} {e.stale ? <span className="badge warn">stale</span> : null}
         {e.payload && Object.keys(e.payload).length ? <details><summary>payload</summary><Json v={e.payload} /></details> : null}
@@ -281,7 +294,7 @@ function Retry({ job }: { job: any }) {
   return <span className="inline-form">
     <input placeholder="迁移/续接原因（必填）" value={reason} onChange={e => setReason(e.target.value)} />
     <input placeholder="排除设备，逗号分隔" value={exclude} onChange={e => setExclude(e.target.value)} />
-    <Action label="明确迁移/续接" disabled={!reason.trim()} confirm="将计入迁移预算，从最近确认检查点在新 attempt 中继续。确定？"
+    <Action label="明确迁移/续接" scope="tasks" disabled={!reason.trim()} confirm="将计入迁移预算，从最近确认检查点在新 attempt 中继续。确定？"
       run={() => api.retry(job.job_id, job.work_package_id, job.version, reason.trim(), exclude.split(',').map(s => s.trim()).filter(Boolean))} />
   </span>
 }

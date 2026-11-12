@@ -1,7 +1,8 @@
 // 两种传输，同一套页面：浏览器经 Cookie + CSRF 直接访问 controller；桌面端经原生桥（docs/desktop.md），
 // 页面拿不到客户端凭据。事件流在两种传输下都只负责送达，重连与续读在 live.ts。
 export type Rsp = { status: number; body: string }
-export type StreamEvent = { kind: 'open' | 'event' | 'snapshot_required' | 'unauthorized' | 'closed'; id?: number | null; type?: string | null; data?: string | null }
+// unauthorized：凭据失效或被撤销（401）；forbidden：凭据有效但没有读取事件的权限（403），两者处理不同。
+export type StreamEvent = { kind: 'open' | 'event' | 'snapshot_required' | 'unauthorized' | 'forbidden' | 'closed'; id?: number | null; type?: string | null; data?: string | null }
 export type BridgeError = { code: string; message: string }
 
 const P = '/api/v1'
@@ -15,6 +16,20 @@ export const currentEpoch = () => epoch
 
 export function invoke<T = any>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   return tauri.core.invoke(command, args)
+}
+
+// 带当前连接代次的原生桥命令（项目目录、输入与成果）；切换连接后旧页面发出的被外壳拒绝。
+export const bridge = <T = any>(command: string, args: Record<string, unknown> = {}) => invoke<T>(command, { epoch, ...args })
+
+// 项目操作的进度（事件 ac-project）。只在桌面端有；只接收订阅时这一代连接的事件。
+// phase 是封闭集合（docs/desktop.md“项目操作的进度”）：scan、rescan、stage、upload、register、download、write、report、cancel_requested。
+export type ProjectProgress = { op: 'scan' | 'upload' | 'download' | 'apply' | 'recover'; phase: string; done?: number; total?: number; files?: number; bytes?: number }
+export function onProject(f: (p: ProjectProgress) => void): () => void {
+  if (!isDesktop) return () => {}
+  const mine = epoch
+  let stopped = false
+  const unlisten: Promise<() => void> = tauri.event.listen('ac-project', (e: any) => { if (!stopped && e.payload?.epoch === mine) f(e.payload) })
+  return () => { stopped = true; void unlisten.then(u => u()) }
 }
 
 // 浏览器：CSRF 令牌只在内存和本标签页的 sessionStorage 里。
@@ -69,11 +84,13 @@ export function openStream(cursor: number, on: (e: StreamEvent) => void): () => 
   void (async () => {
     try {
       const r = await fetch(P + '/events/stream?cursor=' + cursor, { credentials: 'same-origin', signal: abort.signal, headers: { Accept: 'text/event-stream' } })
-      if (r.status === 401 || r.status === 403) return on({ kind: 'unauthorized' })
+      if (r.status === 401) return on({ kind: 'unauthorized' })
+      if (r.status === 403) return on({ kind: 'forbidden' })
       if (!r.ok || !r.body) return on({ kind: 'closed', data: 'http_' + r.status })
       on({ kind: 'open' })
       const feed = frames(f => {
         if (f.event === 'unauthorized') on({ kind: 'unauthorized' })
+        else if (f.event === 'forbidden') on({ kind: 'forbidden' })
         else if (f.event === 'snapshot_required') on({ kind: 'snapshot_required', data: f.data })
         else on({ kind: 'event', id: f.id, type: f.event, data: f.data })
       })

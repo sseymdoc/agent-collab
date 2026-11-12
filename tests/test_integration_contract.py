@@ -50,13 +50,13 @@ class ContractTest(unittest.TestCase):
         domain.validate_contract(contract)
 
     def test_duplicate_catalog_entries_for_one_model_are_merged(self):
-        catalog = {'codex': {'status': 'ok', 'source': 't', 'fetched_at': None, 'cli_version': None, 'reason': None, 'models': [
+        catalog = {'codex': {'status': 'ok', 'source': 't', 'fetched_at': '2026-11-09T00:00:00Z', 'cli_version': None, 'reason': None, 'models': [
             {'id': 'gpt-6-astra', 'efforts': ['high'], 'default_effort': None},
             {'id': 'gpt-6-astra', 'efforts': ['xhigh'], 'default_effort': None}]}}
         n = node(harness={'stub': '0.1', 'codex': '0.167.0'}, models=catalog)
         self.assertEqual([r for r in reasons(job('codex'), n) if 'unsupported' in r], [])
         settings = {'codex': {'allowed': None}}
-        self.assertEqual(domain.selectable_codex(settings, [n])['codex'],
+        self.assertEqual(domain.selectable_codex(settings, [n], domain.seconds('2026-11-09T00:00:01Z'), 3600)['codex'],
                          [{'model': 'gpt-6-astra', 'efforts': ['high', 'xhigh'], 'nodes': ['n1']}])
 
 

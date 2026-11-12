@@ -112,7 +112,8 @@ def rehearse(backup_dir, work_dir, config=None):
         had = ('settings', 'models') in before
         detail = {'carried_over': had, 'settings': {k: settings[k] for k in ('revision', 'codex', 'claude')}}
         if had:
-            ok = settings == before[('settings', 'models')]
+            # 比较库里的记录本身：model_settings() 读取时会为此前版本的记录补上缺省项，那不是对数据的改动。
+            ok = app.store.get('settings', 'models') == before[('settings', 'models')]
         elif jobs_before or _of(before, 'node'):
             # 升级前的部署：迁移值必须就是 §12.3 规定的组合与当时生效的协调 profile。profile 在 config.json 里，
             # 而它不在备份集中；没给 --config 时无法确认，不算通过。
@@ -139,7 +140,8 @@ def rehearse(backup_dir, work_dir, config=None):
         check('backup_content_unchanged', (backup_dir / 'backup-manifest.json').read_bytes() == manifest_bytes and
               file_hash(backup_dir / manifest.get('database', 'controller.db')) == manifest['db_sha256'], manifest['db_sha256'])
         nodes = _of(after, 'node').values()
-        without = sorted(n['node_id'] for n in nodes if 'models' not in n['capabilities'])
+        # 只看仍参与运行的节点：已排空或已退役的记录不会再领任务，不要求它们上报目录。
+        without = sorted(n['node_id'] for n in nodes if 'models' not in n['capabilities'] and not n.get('drain') and not n.get('retired_at'))
         report = {'schema': 1, 'backup': {k: manifest.get(k) for k in ('db_sha256', 'created_at', 'authority_generation')},
                   'work': str(work), 'counts': {k: len(_of(after, k)) for k in ('job', 'attempt', 'node', 'checkpoint', 'client', 'baseline')},
                   'checks': checks, 'ok': all(c['ok'] for c in checks),

@@ -1,6 +1,5 @@
 import { api } from '../api'
-import { can } from '../session'
-import { Action, Badge, Section, show, useData, when } from '../ui'
+import { Action, Badge, ModelUnset, Section, show, useData, when } from '../ui'
 
 const GROUPS: [string, string[]][] = [
   ['排队', ['queued']], ['执行', ['running']], ['恢复', ['recovering']],
@@ -10,11 +9,13 @@ const GROUPS: [string, string[]][] = [
 
 export function Overview({ tick }: { tick: number }) {
   const { data: o, error, reload } = useData(() => api.overview(), [tick])
+  const models = useData(() => api.models(), [tick])
   if (!o) return error ? <p className="err">{error}</p> : <p className="muted">加载中…</p>
   const counts = o.job_counts ?? o.counts ?? {}
   const ctl = o.controller ?? {}
   return <>
     {error && <p className="err">刷新失败，以下为上次成功加载的内容：{error}</p>}
+    {models.data && !models.data.settings?.codex?.default?.model && <ModelUnset />}
     <div className="tiles">
       {GROUPS.map(([label, keys]) => {
         const n = keys.reduce((s, k) => s + (Number(counts[k]) || 0), 0)
@@ -54,10 +55,10 @@ export function Overview({ tick }: { tick: number }) {
     </Section>
     <Section title="派单" extra={<Badge v={o.dispatch_paused ? 'blocked' : 'ok'} />}>
       <p>{o.dispatch_paused ? '全局派单已暂停：新任务受理后排队，不分配节点；执行中的任务不受影响。' : '派单正常。'}</p>
-      {can('maintain') && <Action label={o.dispatch_paused ? '恢复派单' : '暂停派单'} danger={!o.dispatch_paused}
-        run={() => api.dispatch(!o.dispatch_paused, ctl.metadata_version).then(reload)} />}
+      <Action label={o.dispatch_paused ? '恢复派单' : '暂停派单'} danger={!o.dispatch_paused} scope="maintain"
+        run={() => api.dispatch(!o.dispatch_paused, ctl.metadata_version).then(reload)} />
     </Section>
-    <Section title="设备" extra={<a href="#/nodes">查看全部</a>}>
+    <Section title="设备" extra={<a href="#/nodes">查看全部{o.retired_nodes ? `（另有 ${o.retired_nodes} 个已退役）` : ''}</a>}>
       <table><thead><tr><th>设备</th><th>物理主机</th><th>状态</th><th>排空</th><th>最近联系</th></tr></thead>
         <tbody>{(o.nodes ?? []).map((n: any) => <tr key={n.node_id}>
           <td>{n.node_id}</td><td>{show(n.physical_host_id)}</td><td><Badge v={n.status} /></td><td>{show(n.drain)}</td><td>{when(n.last_seen_at)}</td>

@@ -71,7 +71,8 @@ class RehearseTests(ControllerCase):
         self.assertEqual(checks['late_results_fenced'], {'attempts': 2, 'reasons': ['stale_generation']})
         settings = checks['model_settings']['settings']
         self.assertEqual((checks['model_settings']['carried_over'], settings['revision']), (False, 1))
-        self.assertEqual(settings['codex'], {'default': {'model': 'gpt-6-astra', 'effort': 'xhigh'}, 'allowed': {'gpt-6-astra': ['high', 'xhigh', 'max']}})
+        self.assertEqual(settings['codex'], {'default': {'model': 'gpt-6-astra', 'effort': 'xhigh'}, 'allowed': {'gpt-6-astra': ['high', 'xhigh', 'max']},
+                                             'unverified_nodes': 'wait'})
         self.assertEqual(settings['claude'], {'default': {'model': 'configured-model', 'effort': 'configured-effort'}})
         self.assertEqual(checks['root_policies_readable'], {'frozen': 0, 'legacy': 2})
         self.assertEqual((report['counts']['job'], report['nodes_without_model_catalog'], report['backup']['db_sha256']), (2, ['worker'], saved['db_sha256']))

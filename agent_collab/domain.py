@@ -294,8 +294,11 @@ class PolicyError(ValueError):
         self.reason = reason
 
 
+# unverified_nodes：模型目录未核实（未知或已过期）的节点能否承接 codex 任务（§12.5）。
+# wait（缺省）只派给目录已确认含该组合的节点；allow 是显式开启的“未核实能力尝试”，仍优先已确认的节点。
+UNVERIFIED_NODES = ('wait', 'allow')
 EMPTY_SETTINGS = {'revision': 0, 'updated_at': None, 'updated_by': None,
-                  'codex': {'default': {'model': None, 'effort': None}, 'allowed': None},
+                  'codex': {'default': {'model': None, 'effort': None}, 'allowed': None, 'unverified_nodes': 'wait'},
                   'claude': {'default': {'model': None, 'effort': None}}}
 
 
@@ -304,7 +307,7 @@ def migrated_settings(profile):
     value = copy.deepcopy(EMPTY_SETTINGS)
     legacy = p.LEGACY_CODEX
     value['codex'] = {'default': {'model': legacy['model'], 'effort': legacy['effort']},
-                      'allowed': {legacy['model']: list(legacy['efforts'])}}
+                      'allowed': {legacy['model']: list(legacy['efforts'])}, 'unverified_nodes': 'wait'}
     try:
         if profile:
             value['claude']['default'] = {'model': p.check_model(profile['model']), 'effort': p.check_effort(profile['effort'])}
@@ -326,8 +329,11 @@ def _model_pair(value, name):
 
 
 def validate_model_settings(codex, claude):
-    if not isinstance(codex, dict) or set(codex) != {'default', 'allowed'}:
-        raise ValueError('codex settings require exactly default and allowed')
+    if not isinstance(codex, dict) or not {'default', 'allowed'} <= set(codex) or set(codex) - {'default', 'allowed', 'unverified_nodes'}:
+        raise ValueError('codex settings require default and allowed, and may set unverified_nodes')
+    unverified = codex.get('unverified_nodes', 'wait')
+    if unverified not in UNVERIFIED_NODES:
+        raise ValueError('codex.unverified_nodes must be wait or allow')
     default, allowed = _model_pair(codex['default'], 'codex.default'), codex['allowed']
     if allowed is not None:
         if not isinstance(allowed, dict) or not allowed or len(allowed) > 64:
@@ -343,7 +349,28 @@ def validate_model_settings(codex, claude):
             raise PolicyError('model_not_allowed', 'codex.default must be within codex.allowed')
     if not isinstance(claude, dict) or set(claude) != {'default'}:
         raise ValueError('claude settings require exactly default')
-    return {'codex': {'default': default, 'allowed': allowed}, 'claude': {'default': _model_pair(claude['default'], 'claude.default')}}
+    return {'codex': {'default': default, 'allowed': allowed, 'unverified_nodes': unverified},
+            'claude': {'default': _model_pair(claude['default'], 'claude.default')}}
+
+
+def validate_project_defaults(value):
+    """项目默认策略（§13.1）：每一项为 null 表示沿用工作区的值。model 与 effort 要么都给、要么都不给。"""
+    value = {} if value is None else value
+    if not isinstance(value, dict) or set(value) - {'codex', 'exclude'}:
+        raise ValueError('project defaults may only set codex and exclude')
+    codex = {} if value.get('codex') is None else value['codex']
+    if not isinstance(codex, dict) or set(codex) - {'model', 'effort', 'unverified_nodes'}:
+        raise ValueError('project codex defaults may only set model, effort and unverified_nodes')
+    pair = _model_pair({'model': codex.get('model'), 'effort': codex.get('effort')}, 'project codex default')
+    unverified = codex.get('unverified_nodes')
+    if unverified is not None and unverified not in UNVERIFIED_NODES:
+        raise ValueError('project unverified_nodes must be wait, allow or null')
+    exclude = value.get('exclude')
+    if exclude is not None:
+        if len(validate_excludes(exclude)) > 200:
+            raise ValueError('too many exclude patterns')
+        exclude = list(exclude)
+    return {'codex': dict(pair, unverified_nodes=unverified), 'exclude': exclude}
 
 
 def resolve_codex(params, base, default_source):
@@ -364,11 +391,29 @@ def resolve_codex(params, base, default_source):
     return resolved, requested, source
 
 
-def frozen_policy(settings, resolved=None):
-    """根工作包受理时冻结；之后的修订与受管修复只读它，不读后来的设置。"""
-    base = resolved or settings['codex']['default']
-    return {'schema': 1, 'settings_revision': settings['revision'],
-            'codex': {'model': base['model'], 'effort': base['effort'], 'allowed': copy.deepcopy(settings['codex']['allowed'])}}
+def project_base(settings, project):
+    """项目默认值叠在工作区默认值之上（§13.1）：返回 (codex 默认 pair, 来源, unverified_nodes)。许可范围始终取工作区的。"""
+    pair, source = dict(settings['codex']['default']), 'workspace_default'
+    unverified = settings['codex'].get('unverified_nodes', 'wait')
+    if project:
+        chosen = project['defaults']['codex']
+        if chosen['model'] is not None:
+            pair, source = {'model': chosen['model'], 'effort': chosen['effort']}, 'project_default'
+        if chosen['unverified_nodes'] is not None:
+            unverified = chosen['unverified_nodes']
+    return pair, source, unverified
+
+
+def frozen_policy(settings, resolved=None, project=None):
+    """根工作包受理时冻结；之后的修订与受管修复只读它，不读后来的工作区设置或项目默认值。"""
+    pair, _, unverified = project_base(settings, project)
+    base = resolved or pair
+    policy = {'schema': 1, 'settings_revision': settings['revision'],
+              'codex': {'model': base['model'], 'effort': base['effort'], 'allowed': copy.deepcopy(settings['codex']['allowed']),
+                        'unverified_nodes': unverified}}
+    if project:
+        policy.update(project_id=project['project_id'], project_revision=project['revision'])
+    return policy
 
 
 def legacy_root_policy(root_job):
@@ -392,15 +437,39 @@ def codex_catalog(node):
                                    'cli_version': None, 'models': []}
 
 
+def catalog_state(catalog, now, max_age_s):
+    """目录在此刻的可用状态（§12.5）。
+
+    ok：最近一次探测成功；stale：最近一次探测失败，沿用上一次成功的目录（节点已核对 CLI 版本与 provider 未变）；
+    legacy：没有上报目录的旧节点，按其适配器的固定集合；unknown：没有可用目录；
+    expired：目录的取得时间早于 max_age_s，不再当作当前能力。ok、stale、legacy 是“已核实”，其余是“未核实”。
+    """
+    status = catalog['status']
+    if status in ('ok', 'stale'):
+        try:
+            if now - seconds(catalog['fetched_at']) > max_age_s:
+                return 'expired'
+        except (TypeError, ValueError, AttributeError):
+            return 'unknown'  # 没有取得时间就无从判断新旧
+    return status
+
+
+VERIFIED_CATALOG = ('ok', 'stale', 'legacy')
+
+
 def validate_catalogs(value):
-    """节点注册里的 capabilities.models（§12.5）。"""
+    """节点注册里的 capabilities.models（§12.5）。provider 是探测与执行共用的模型 provider 身份，可缺省。"""
     if not isinstance(value, dict) or set(value) - {'codex', 'claude'}:
         raise ValueError('invalid models capability')
     for entry in value.values():
-        if (not isinstance(entry, dict) or set(entry) != {'status', 'source', 'fetched_at', 'cli_version', 'reason', 'models'}
-                or entry['status'] not in ('ok', 'unknown') or not isinstance(entry['models'], list) or len(entry['models']) > 200
-                or any(entry[k] is not None and not isinstance(entry[k], str) for k in ('source', 'fetched_at', 'cli_version', 'reason'))):
+        required = {'status', 'source', 'fetched_at', 'cli_version', 'reason', 'models'}
+        if (not isinstance(entry, dict) or not required <= set(entry) or set(entry) - required - {'provider'}
+                or entry['status'] not in ('ok', 'stale', 'unknown') or not isinstance(entry['models'], list) or len(entry['models']) > 200
+                or any(entry.get(k) is not None and (not isinstance(entry[k], str) or len(entry[k]) > 200)
+                       for k in ('source', 'fetched_at', 'cli_version', 'reason', 'provider'))):
             raise ValueError('invalid model catalog')
+        if entry['status'] == 'stale':
+            seconds(entry['fetched_at'])  # 沿用的旧目录必须带它的取得时间，否则无法判断是否过期
         for model in entry['models']:
             if not isinstance(model, dict) or set(model) != {'id', 'efforts', 'default_effort'} or not isinstance(model['efforts'], list):
                 raise ValueError('invalid model catalog entry')
@@ -411,14 +480,14 @@ def validate_catalogs(value):
                 raise ValueError('too many efforts in model catalog entry')
 
 
-def selectable_codex(settings, nodes):
-    """部署策略与节点目录的交集；目录未知的节点单独列出，不计入也不排除。"""
+def selectable_codex(settings, nodes, now, max_age_s):
+    """部署策略与已核实节点目录的交集；目录未核实（未知或过期）的节点单独列出，不计入可选组合。"""
     allowed, combos, unknown = settings['codex']['allowed'], {}, []
     for node in nodes:
-        if node['capabilities']['harness'].get('codex') is None:
+        if node['capabilities']['harness'].get('codex') is None or node.get('retired_at'):
             continue
         catalog = codex_catalog(node)
-        if catalog['status'] not in ('ok', 'legacy'):
+        if catalog_state(catalog, now, max_age_s) not in VERIFIED_CATALOG:
             unknown.append(node['node_id'])
             continue
         for model in catalog['models']:
@@ -444,7 +513,7 @@ TEMPLATES = (
 def draft_contract(data, inputs_manifest):
     """把模板与自然语言目标展开成可提交的契约请求；只做展开，校验与模型解析由受理路径完成。"""
     allowed = {'template', 'title', 'goal', 'acceptance', 'excludes', 'baseline_id', 'inputs_manifest', 'checks',
-               'model', 'effort', 'requirements', 'request_id'}
+               'model', 'effort', 'requirements', 'request_id', 'project_id'}
     if set(data) - allowed:
         raise ValueError('unknown draft fields')
     template = next((t for t in TEMPLATES if t['id'] == data.get('template')), None)
@@ -516,9 +585,25 @@ def repair_contract(target, follow_up, inputs_manifest, policy):
     return contract
 
 
-def managed_profile(config, claude_default=None):
-    """claude_default：设置里的协调模型（§12.3）；给出时覆盖 profile 的 model 与 effort，节点列表仍取 profile。"""
+def managed_profile(config, claude_default=None, coordination=None):
+    """受管协调回合实际使用的配置。
+
+    claude_default：设置里的协调模型（§12.3），给出时覆盖 model 与 effort。
+    coordination：经 API 保存的协调设置（§13.7，revision > 0 时生效）：是否启用与候选节点列表由它决定，
+    config.json 的 profile 只在没有设置模型时提供 model 与 effort；没有这份设置的部署沿用 config.json。
+    """
     result = _managed_profile(config)
+    if coordination and coordination.get('revision', 0) > 0:
+        fallback = result['profile'] or {}
+        model = (claude_default or {}).get('model') or fallback.get('model')
+        effort = (claude_default or {}).get('effort') if (claude_default or {}).get('model') else fallback.get('effort')
+        result = {'status': 'profile_missing', 'profile_id': 'settings', 'profile': None, 'source': 'settings'}
+        if not coordination['enabled']:
+            result['status'] = 'disabled'
+        elif coordination['node_ids'] and model and effort:
+            result.update(status='ready', profile={'harness': 'claude', 'model': model, 'effort': effort,
+                                                   'node_ids': list(coordination['node_ids'])})
+        return result
     if result['status'] == 'ready' and claude_default and claude_default.get('model'):
         result['profile'].update(model=claude_default['model'], effort=claude_default['effort'])
     return result
@@ -610,6 +695,11 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
                    different_failure_domain=20.0, warm_start=1.0)
     weights.update(config.get('score_weights', {}))
     slots = job['contract']['resources']['slots']
+    # 受理时冻结在任务上的策略；此前受理的任务没有这一项，按缺省 wait。
+    unverified_policy = (job.get('model_policy') or {}).get('unverified_nodes', 'wait')
+    max_age = config.get('catalog_max_age_s', p.DEFAULTS['catalog_max_age_s'])
+    # 已退役的节点只保留历史引用：不参与调度、解释和同主机容量的计算。
+    nodes = [n for n in nodes if not n.get('retired_at')]
     result = []
     for node in nodes:
         cap, req = node['capabilities'], job['contract']['requirements']
@@ -624,6 +714,8 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
             reasons.append('dispatch_paused')
         if node['drain']:
             reasons.append('draining')
+        if node.get('maintenance'):
+            reasons.append('maintenance')
         status = node_status(node, now, config)
         if status != 'online':
             reasons.append('node_' + status)
@@ -644,8 +736,10 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
         if cap['harness'].get(harness) is None:
             reasons.append('harness_missing:' + harness)
         catalog = codex_catalog(node) if harness == 'codex' else None
-        if catalog and catalog['status'] in ('ok', 'legacy'):
-            # §12.5：目录明确不含该组合才排除；目录未知不等于不支持，也不等于支持。
+        state = catalog_state(catalog, now, max_age) if catalog else None
+        unverified = False
+        if state in VERIFIED_CATALOG:
+            # §12.5：已核实的目录明确不含该组合就排除。
             model, effort = (job['contract']['harness_params'].get(k) for k in ('model', 'effort'))
             # 目录可能把同一模型列成多条：合并它们的 effort，与 selectable_codex 的口径一致。
             entries = [m for m in catalog['models'] if m['id'] == model]
@@ -653,6 +747,11 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
                 reasons.append('model_unsupported:%s' % model)
             elif not any(effort in m['efforts'] for m in entries):
                 reasons.append('effort_unsupported:%s/%s' % (model, effort))
+        elif state is not None:
+            # 目录未核实不等于不支持，也不等于支持：缺省不派单；任务受理时冻结的策略明确允许时才作为“未核实能力尝试”。
+            unverified = True
+            if unverified_policy != 'allow':
+                reasons.append('model_catalog_unverified:' + state)
         # 只排除已确认过期的认证；unknown 不等于失败，本地登录状态也不等于服务端接受。
         if harness != 'stub' and node['auth_health'].get(harness) == 'expired':
             reasons.append('auth_unhealthy:' + harness)
@@ -680,6 +779,9 @@ def explain(job, nodes, attempts, jobs, now, config, paused=False, quota=None,
         result.append({'node_id': node['node_id'], 'eligible': not reasons, 'reasons': reasons,
                        'score': sum(breakdown.values()), 'breakdown': breakdown,
                        'capability_evidence': capability_evidence(node),
-                       **({'model_catalog': catalog['status']} if catalog else {})})
-    eligible = sorted((row for row in result if row['eligible']), key=lambda r: (-r['score'], r['node_id']))
-    return {'nodes': result, 'selected_node_id': eligible[0]['node_id'] if eligible else None}
+                       **({'model_catalog': state, 'unverified_attempt': unverified} if catalog else {})})
+    # 目录已核实含该组合的节点总是排在未核实的节点之前；同一类里再按分数。
+    eligible = sorted((row for row in result if row['eligible']),
+                      key=lambda r: (bool(r.get('unverified_attempt')), -r['score'], r['node_id']))
+    return {'nodes': result, 'selected_node_id': eligible[0]['node_id'] if eligible else None,
+            'policy': {'unverified_nodes': unverified_policy if job['contract']['harness'] == 'codex' else None}}

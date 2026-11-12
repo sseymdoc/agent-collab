@@ -27,6 +27,7 @@ class CliE2E(unittest.TestCase):
     def cli(self, *argv, expect=0, text=False):
         env = {k: v for k, v in os.environ.items() if not k.startswith('AGENT_COLLAB_')}
         env['AGENT_COLLAB_HOME'] = str(self.tmp / 'cli-home')
+        env['AGENT_COLLAB_CREDENTIAL_STORE'] = 'file'  # 测试不往运行者的系统凭据存储里写；系统后端另有用例
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch.dict(os.environ, env, clear=True), redirect_stdout(stdout), redirect_stderr(stderr):
             try:
