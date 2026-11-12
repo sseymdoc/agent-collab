@@ -35,8 +35,13 @@ def _bindings(directory):
     return data if isinstance(data, dict) else {}
 
 
+MAX_BINDINGS = 256  # 与 controller 注册接口的上限一致：超出会让整个注册被拒绝
+
+
 def root_name(path):
-    return Path(path).name or 'root'
+    # 只作显示用；POSIX 目录名可以含反斜杠，controller 不接受，替换掉而不是让注册失败。
+    name = Path(path).name or 'root'
+    return ''.join('_' if c in '/\\\x00' else c for c in name)
 
 
 def _check_roots(root, config):
@@ -53,6 +58,8 @@ def bind(directory, project_id, folder):
     root = project.resolve_root(folder)
     _check_roots(root, config)
     data = _bindings(directory)
+    if project_id not in data and len(data) >= MAX_BINDINGS:
+        raise project.ProjectError('too_many_bindings', '这台节点已绑定 %d 个项目，先解除不用的绑定' % MAX_BINDINGS)
     data[project_id] = {'path': str(root), 'bound_at': project.now()}
     atomic_write(directory / BINDINGS, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
     return listing(directory)
@@ -109,6 +116,26 @@ def bounded(value, limit):
         value.setdefault('counts', {}).setdefault(key, len(value[key]))
         value[key] = value[key][:len(value[key]) // 2]
         value['truncated'] = True
+    return value
+
+
+def shrink(value, limit):
+    """同 bounded，但作用于嵌套的结果（application.detail、report 里的列表）：每次把最长的列表减半。"""
+    while len(p.canonical_json(value)) > limit:
+        found, stack = None, [value]
+        while stack:
+            node = stack.pop()
+            for key, item in node.items():
+                if isinstance(item, list) and item and (found is None or len(p.canonical_json(item)) > found[2]):
+                    found = (node, key, len(p.canonical_json(item)))
+                elif isinstance(item, dict):
+                    stack.append(item)
+        if found is None:
+            break
+        node, key, _ = found
+        node.setdefault('counts', {}).setdefault(key, len(node[key]))
+        node[key] = node[key][:len(node[key]) // 2]
+        node['truncated'] = True
     return value
 
 
@@ -169,6 +196,13 @@ class ProjectOps:
                 try:
                     self.agent.client.json('POST', path + record['op_id'], {'status': status, 'result': result, 'error': error})
                 except APIError as exc:
+                    if exc.status == 413 and isinstance(result, dict):
+                        # controller 的请求上限可以比这里的结果上限小：缩减明细后下一轮再报，不把没被接受的结果当作已上报。
+                        size = len(p.canonical_json(result))
+                        smaller = shrink(json.loads(p.canonical_json(result)), size // 2)
+                        if len(p.canonical_json(smaller)) < size:
+                            self.save(dict(record, outcome=[status, smaller, error]))
+                            continue
                     if exc.status not in (400, 404, 409, 413):
                         raise
                 self.save(dict(record, state='reported', outcome=None))

@@ -25,14 +25,14 @@ export function ResultFacts({ job, d, finals }: { job: any; d: any; finals: any[
   </div>
 }
 
-export function JobResult({ job, finals }: { job: any; finals: any[] }) {
+export function JobResult({ job, finals, tick }: { job: any; finals: any[]; tick?: number }) {
   const cp = job.delivery_checkpoint_id ?? finals[finals.length - 1]?.checkpoint_id
   return <Section title="成果下载与应用" extra={<span className="muted">逐文件核对哈希，路径不会落到所选目录之外</span>}>
     {!isDesktop ? <p className="muted">整包下载与应用到项目在桌面端进行；也可以用命令行 <code>agent-collab job artifacts {job.job_id} --download &lt;目录&gt;</code>。下面“成果文件”里可以逐个查看与另存。</p>
       : !cp ? <p className="muted">还没有可下载的成果（需要最终检查点）。</p>
       : <><Download job={job} cp={cp} />{job.project_id && (job.delivery_checkpoint_id ? <Apply job={job} />
         : <p className="muted">成果发布之后才能应用到项目目录。</p>)}</>}
-    {job.project_id && job.delivery_checkpoint_id && <RemoteApply job={job} />}
+    {job.project_id && job.delivery_checkpoint_id && <RemoteApply job={job} tick={tick} />}
   </Section>
 }
 
@@ -77,7 +77,8 @@ function Apply({ job }: { job: any }) {
   const conflicts = changes.filter(c => c.state === 'conflict')
   const n = (k: string, v: string) => changes.filter(c => c[k] === v).length
   const apply = (skip: boolean) => run('应用中…', async () => {
-    setRes(await bridge('result_apply', { job_id: job.job_id, checkpoint_id: plan.checkpoint_id, skip_conflicts: skip }))
+    try { setRes(await bridge('result_apply', { job_id: job.job_id, checkpoint_id: plan.checkpoint_id, skip_conflicts: skip })) }
+    finally { window.dispatchEvent(new Event(UNFINISHED_CHANGED)) }  // 写入中途出错会留下未完成的应用：页面顶部重新查询
     setPlan(null)
   })
   return <div>
@@ -125,14 +126,25 @@ const RECOVER: Record<string, [string, string]> = {
   rollback: ['回滚', '把已写入且之后未再改动的文件恢复成备份里的原样；之后又被改过的文件保留现状。结束后上报最终状态。'],
   abandon: ['按现状结束', '不再写入也不回滚，按目录现状结束，在 controller 上记为“结果未知”。'],
 }
+const UNFINISHED_CHANGED = 'agent-collab:unfinished-changed'
 export function Unfinished() {
   const [list, setList] = useState<any[]>([])
   const [reports, setReports] = useState<any[]>([])
-  const load = () => bridge('result_unfinished').then(r => { setList(r.unfinished ?? []); setReports(r.unreported ?? []) }, () => {})
-  useEffect(() => { if (isDesktop) void load() }, [])
+  const [failed, setFailed] = useState<string | null>(null)
+  const load = () => bridge('result_unfinished').then(r => { setFailed(null); setList(r.unfinished ?? []); setReports(r.unreported ?? []) },
+    e => setFailed(errText(e)))
+  useEffect(() => {
+    if (!isDesktop) return
+    void load()
+    const again = () => void load()
+    window.addEventListener(UNFINISHED_CHANGED, again)
+    return () => window.removeEventListener(UNFINISHED_CHANGED, again)
+  }, [])
   // 本机已有结果、等 controller 确认的应用：属于这条连接的在查询时已按原 request_id 补报（reported 为补报后的状态）。
   const waiting = reports.filter(r => !r.reported)
   return <>
+    {failed && <section className="card notice" role="alert"><b>没能查询这台机器上未完成的应用：</b>{failed}
+      <p className="muted">查询不到时，可能有写入中途中断的应用没有显示出来。</p><p className="actions"><button onClick={() => void load()}>重新查询</button></p></section>}
     {reports.some(r => r.reported) && <section className="card"><p className="ok">已向 controller 补报 {reports.filter(r => r.reported).length} 次应用的结果（文件没有重写）：
       {reports.filter(r => r.reported).map(r => <span key={r.application_id}> <code>{short(r.application_id)}</code> <ApplyBadge s={r.reported.startsWith('not_recorded') ? 'unknown' : r.reported} /></span>)}</p></section>}
     {waiting.length > 0 && <section className="card notice" role="status">

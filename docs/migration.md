@@ -76,7 +76,7 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 4. **一致备份。** 在暂停状态下做一次备份并复制到 controller 主机之外；记下备份清单里的 `event_seq`（旧版本写出的清单没有这一项时，记下此刻 `GET /events` 的最大序号）。回退边界从这一点算起。
 5. **升级并静态核对。** 停止旧版本的 worker 服务，升级各节点（节点兼容旧 controller：不上报模型目录、接受旧的协调决策 schema），在旧 controller 上确认心跳与认证探测正常。停止 controller，升级，启动。首次启动写入模型设置迁移值；不迁移活进程、内存中的会话或未确认的状态。核对 controller 身份与恢复代次未变、派单仍然暂停、节点全部在线并上报模型目录、设置为迁移值。
 6. **只开放验收提交，受控恢复派单。** 把提交闸门设为 `acceptance`（`POST /intake`，带原因），再恢复派单。此时 controller 只接受验收运行：由具备 `maintain` 权限的主体提交、带 `acceptance_run` 标记、不属于任何项目、没有回写目标、不声明外部副作用；其余提交一律以 `intake_closed` 被拒绝，包括用管理令牌的。验收运行的输入用专门准备的小型测试内容，工作区是节点上隔离的 attempt 目录。
-7. **验收。** 各节点在服务进程上下文里完成一次真实的执行与协调；桌面端完成“提交 → 执行 → 检查 → 成果”的闭环；自动化经 `agent-collab` 入口提交并取回结果。这些任务都带 `acceptance_run` 标记（`GET /jobs?acceptance_run=1`）。
+7. **验收。** 验收运行经 `agent-collab submit <任务文件>` 提交，任务文件里带 `"acceptance_run": true`（桌面端与浏览器页面的提交入口不发送这个标记，这一阶段会被 `intake_closed` 拒绝）。各节点在服务进程上下文里完成一次真实的执行与协调；自动化经 `agent-collab` 入口提交并取回结果；桌面端连接后查看这些任务的执行、检查与成果并另存。这些任务都带 `acceptance_run` 标记（`GET /jobs?acceptance_run=1`）。桌面端自己的“提交 → 执行 → 检查 → 成果”闭环在第 8 步开放普通提交之后做。
 8. **开放普通提交。** 确认 `GET /activity?after=<第 4 步的 event_seq>` 的 `ordinary_jobs` 为 0、`disposable` 为 true（切换以来只有验收状态），把提交闸门设回 `open`，通知使用者改用桌面端与 `agent-collab` 入口。
 9. **退役旧的日常入口。** 关闭浏览器控制台（`web_console: false`），更新引用旧 launcher、旧提交包装的说明。保留的旧安装包与备份只作被动恢复材料。
 
@@ -92,7 +92,7 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 
 - 普通的原位升级不会让升级前签发的请求失效。本文的切换顺序靠第 3 步的前置条件（升级时没有活动 attempt、没有未结束的任务）保证升级后不存在在途的执行权，而不是靠升级本身。升级前已经被取代、撤销或失联的 attempt，其迟到请求继续被 epoch 与撤销标记拒绝（`stale_epoch`、`revoked`），与升级无关。
 - 升级前已经结束的任务，它的检查点、验收、发布回执和幂等回执仍然有效：例如对一个已完成、尚未发布的任务，升级后仍可以发布它切换前的成果。这些是合法的历史，不属于“必须失效的旧请求”。
-- 需要让切换前签发的执行权**全部**失效时（例如第 3 步的前置条件无法完全满足，或要确保任何残留的旧进程都无法再提交结果），在 controller 停止后运行切换屏障：
+- 需要让切换前签发的执行权**全部**失效时（例如第 3 步的前置条件无法完全满足，或要确保任何残留的旧进程都无法再提交结果），在 controller 停止后运行切换屏障。屏障要求派单已暂停、提交闸门不是 `open`，而旧版本没有提交闸门，所以顺序是：按第 5 步升级并启动新 controller（派单保持暂停），把提交闸门设为 `closed` 或 `acceptance`，停止 controller，运行屏障，再启动并从第 6 步继续：
 
   ```bash
   agent-collab controller barrier --data-dir <controller 数据目录> --request-id <新 UUID> --reason "<原因>"

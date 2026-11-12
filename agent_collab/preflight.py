@@ -359,7 +359,9 @@ def _controller(root, reader, now, snapshot=None):
                 config=dict(present=(root / 'config.json').exists(), keys=sorted(config or {}),
                             public_origin=_object(config).get('public_origin'),
                             deployment_profile=_object(config).get('deployment_profile'),
-                            managed_coordinator=managed_profile(config or {})),
+                            # 与 controller 相同的优先级：保存过的协调设置与设置里的协调模型优先于 config.json。
+                            managed_coordinator=managed_profile(config or {}, _object(_object(settings).get('claude')).get('default'),
+                                                                _object(records.get('settings', {}).get('coordination')) or None)),
                 jobs=dict(total=len(jobs), by_status=dict(Counter(str(j.get('status', 'unknown')) for j in jobs)),
                           non_terminal=[dict(_pick(j, 'job_id status work_package_id title'),
                                              harness=_object(j.get('contract')).get('harness'))

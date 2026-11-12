@@ -30,6 +30,8 @@ PROJECT_EXCLUDES = DEFAULT_EXCLUDES + [
     'node_modules/**', '.venv/**', 'venv/**', '.tox/**', '.mypy_cache/**', '.ruff_cache/**', '.gradle/**', '.next/**', '.turbo/**',
     '.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx', 'id_rsa', 'id_ed25519', '.netrc', '.npmrc', '.pypirc', '*.token',
     'Thumbs.db']
+# 应用成果时始终不写的路径，不论任务契约的排除规则：版本库元数据里有会被执行的钩子与配置。
+PROTECTED = ['.git/**', '.hg/**', '.svn/**']
 CHUNK = 1024 * 1024
 REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT：Windows 的目录联接、符号链接与其他重解析点
 
@@ -362,7 +364,7 @@ def plan(root, base_manifest, result_manifest, exclude=None, locations=None):
     root = resolve_root(root)
     base = p.validate_manifest(base_manifest or {'version': 1, 'base': None, 'files': [], 'deleted': []})
     result = p.validate_manifest(result_manifest)
-    patterns = validate_excludes(list(DEFAULT_EXCLUDES if exclude is None else exclude))
+    patterns = validate_excludes(list(DEFAULT_EXCLUDES if exclude is None else exclude) + PROTECTED)
     before, after = {f['path']: f for f in base['files']}, {f['path']: f for f in result['files']}
     diff = p.manifest_diff(base, result)
     changes = []
@@ -414,6 +416,17 @@ def unfinished(state_dir, root=None):
         try:
             entry = json.loads(marker.read_text(encoding='utf-8'))
         except (OSError, ValueError):
+            continue
+        try:
+            status = json.loads((_journal_dir(state_dir, entry['application_id']) / 'journal.json').read_text(encoding='utf-8'))['status']
+        except (OSError, ValueError, KeyError):
+            status = 'writing'
+        if status != 'writing':
+            # 日志已有最终结果、只是标记当时没删掉：不算未完成，不挡住这个目录的下一次应用。
+            try:
+                marker.unlink()
+            except OSError:
+                pass
             continue
         if root is None or entry['root'] == str(resolve_root(root)):
             found.append(entry)
@@ -544,7 +557,10 @@ def _run(root, record, todo, after, fetch, journal, state_dir, result, progress,
     record.update(status=result['status'], finished_at=now(),
                   result={k: result[k] for k in ('changed', 'pending', 'conflicts', 'errors', 'cancelled')})
     _save(journal / 'journal.json', record)
-    _root_marker(state_dir, root).unlink()  # 有了最终结果：这个目录可以开始下一次应用
+    try:
+        _root_marker(state_dir, root).unlink()  # 有了最终结果：这个目录可以开始下一次应用
+    except OSError:
+        pass  # 删不掉也不影响：日志已是最终结果，unfinished() 不再把它算作未完成
     return result
 
 

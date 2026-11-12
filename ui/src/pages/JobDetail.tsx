@@ -98,7 +98,7 @@ export function JobDetail({ id, tick }: { id: string; tick: number }) {
         : <p className="muted">还没有最终检查点。</p>}
     </Section>
 
-    <JobResult job={job} finals={finals} />
+    <JobResult job={job} finals={finals} tick={tick} />
 
     <Section title="契约（受理后不可变）">
       <dl className="kv">

@@ -462,7 +462,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
  "archived_at", "created_at", "created_by", "updated_at", "updated_by", "jobs", "active_jobs"}
 ```
 
-- `defaults` 的每一项为 null 表示沿用工作区的值。`codex.model` 与 `effort` 成对给出或都不给，且必须在部署许可范围内；`exclude` 是项目的排除规则（POSIX 相对 glob），用于执行节点的检查点与成果应用，草拟时写进 `contract.workspace.exclude`。
+- `defaults` 的每一项为 null 表示沿用工作区的值。`codex.model` 与 `effort` 成对给出或都不给，且必须在部署许可范围内；`exclude` 是项目的排除规则（POSIX 相对 glob），用于执行节点的检查点与成果应用，草拟时写进 `contract.workspace.exclude`。不论排除规则如何，应用成果时都不写 `.git/`、`.hg/`、`.svn/` 下的路径（版本库元数据里有会被执行的钩子）。
 - `revision` 是配置版本：名称、默认策略或归档状态每改一次加一，并留下历史（`GET /projects/{id}` 的 `history`，最近 20 次）。登记输入基线与应用成果不改变 `revision`。
 - 本机目录不在 controller 上。项目对应哪台设备上的哪个目录，是那台设备上的绑定（桌面端的 `projects.json`、CLI 的 `<配置目录>/projects.json`），每台设备各有各的；controller 只在基线的 `source` 里保存目录名等说明。
 - 优先级：任务显式给出的值 > 项目默认值 > 工作区默认值，model 与 effort 逐项判断来源（`model_policy.source`）。受理时冻结：job 带 `project_id`、`project_revision`，`model_policy` 带 `settings_revision`、`project_revision`、解析结果与来源；根工作包的冻结策略带 `project_id`、`project_revision`。之后修改项目默认值或工作区设置不影响已受理的任务（包括排队中的）和它们的修复。同一根工作包的修订属于根所在的项目，换项目返回 400。
@@ -527,7 +527,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - `POST /nodes/codes`（devices）`{"request_id", "node_id", "ttl_s"?, "replace"?}` → 201 `{"code", "node_id", "expires_at"}`。配对码只在这次响应里出现，重复的 `request_id` 返回 409。`node_id` 已登记时必须带 `replace: true`（配对会替换它原有的凭据），否则返回 409 `node_exists`；已退役的节点返回 409 `node_retired`。写 `audit.action` 事件。
 - `POST /nodes/{id}/maintenance`（devices）`{"request_id", "expected_version", "active", "reason"?}` → node。`active` 为 true 时 `reason` 必填（非空，至多 300 字符），为 false 时不需要。进入维护时停止向该节点派单（调度原因 `maintenance`），已在运行的任务不受影响；结束维护时恢复进入维护之前的接单状态（此前已暂停接单的保持暂停）。`GET /nodes` 的每个节点带 `maintenance`（`{"reason", "by", "at", "drain_before"}` 或 null）与 `maintenance_state`：`none`、`draining`（还有任务在运行）、`active`。
-- `POST /nodes/{id}/retire`（devices）`{"request_id", "expected_version", "retired", "reason"?}` → node。`retired` 为 true 时 `reason` 必填（非空，至多 300 字符），为 false 时不需要。退役前必须先处理：该节点上有效的 attempt、当前 attempt 在该节点且处于待对账、恢复中或已请求取消的任务、以该节点为目标且尚未完成的回写、把它列为候选的协调设置；否则返回 409 `retire_blocked`，`details.blockers` 是一个对象，只含存在的项：`active_attempts`（attempt_id 列表）、`unsettled_jobs`（job_id 列表）、`pending_integrations`（job_id 列表）、`coordination_profile`（协调 profile 的 id）。
+- `POST /nodes/{id}/retire`（devices）`{"request_id", "expected_version", "retired", "reason"?}` → node。`retired` 为 true 时 `reason` 必填（非空，至多 300 字符），为 false 时不需要。退役前必须先处理：该节点上有效的 attempt、当前 attempt 在该节点且处于待对账、恢复中或已请求取消的任务、以该节点为目标且尚未完成的回写、该节点上尚未完成的管理操作、结果待确认的远端写回、把它列为候选的协调设置；否则返回 409 `retire_blocked`，`details.blockers` 是一个对象，只含存在的项：`active_attempts`（attempt_id 列表）、`unsettled_jobs`（job_id 列表）、`pending_integrations`（job_id 列表）、`pending_operations`（状态为 `requested` 或 `received` 的 op_id 列表）、`unsettled_applications`（以该节点为目标、仍为 `started` 的 application_id 列表）、`coordination_profile`（协调 profile 的 id）。
   - 退役后：节点记录保留（带 `retired_at`、`retired_by`、`retire_reason`），历史 attempt 仍引用它；它的节点凭据与未用的配对码作废；不再出现在 `GET /nodes`、总览的节点列表、调度与调度解释、模型目录与可选组合里，也不再产生在线状态事件。`GET /nodes?retired=1` 列出已退役的节点，总览带 `retired_nodes` 计数。
   - `retired: false` 恢复身份：记录不变，保持不接单，需要重新配对才有凭据。没有删除节点的端点。
 
@@ -569,8 +569,8 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - `acceptance`：只接受验收运行，即请求带 `acceptance_run: true`、提交者具备 `maintain` 权限、不带 `project_id` 也不是项目任务的修订（`work_package_id` 指向属于项目的根）、契约没有回写目标节点、`recovery.side_effects` 为 `none`；不满足形状的返回 400，没带标记的返回 409 `intake_closed`。
   - 任意模式下都可以提交验收运行；job 带 `acceptance_run`，`GET /jobs?acceptance_run=1` 列出它们。
 - 备份清单（`backup-manifest.json`）带 `event_seq`：快照里最后一条事件的序号。
-- `GET /activity?after=<seq>`（read）→ `{"after", "last_seq", "jobs": [{"job_id", "title", "acceptance_run", "coordinates", "project_id"}], "ordinary_jobs", "acceptance_jobs", "counts", "disposable"}`：序号大于 `after` 的事件里受理的任务与各类事实的数量（确认的检查点、发布、验收、下载、基线、项目、节点写回 `integrated`、已写入的应用 `applications_written` 等）。协调回合随它协调的任务归类。`disposable` 为 true 表示其间没有普通任务，也没有任何写回或应用。
-- 切换屏障：`agent-collab controller barrier --data-dir D --request-id <UUID> --reason R`，在已停止的 controller 上运行。要求派单已暂停、提交闸门不是 `open`。它把恢复代次加一并撤销此前签发的全部执行权（与 `restore` 相同的处理，但数据不回退）：attempt 的租约令牌作废、进行中的 attempt 记为失联、未结束的任务停在 `waiting_reconcile`（`stale_generation`）、协调租约失效、节点下次心跳被要求对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果。普通的停止再启动保留恢复代次、租约与协调租约。
+- `GET /activity?after=<seq>`（read）→ `{"after", "last_seq", "jobs": [{"job_id", "title", "acceptance_run", "coordinates", "project_id"}], "ordinary_jobs", "acceptance_jobs", "counts", "disposable"}`：序号大于 `after` 的事件里受理的任务与各类事实的数量（确认的检查点、发布、验收、下载、基线、项目、节点写回 `integrated`、已写入的应用 `applications_written`、其间开始且仍没有最终结果的应用 `applications_unsettled` 等）。协调回合随它协调的任务归类。`disposable` 为 true 表示其间没有普通任务，也没有任何写回、已写入或结果未定的应用。
+- 切换屏障：`agent-collab controller barrier --data-dir D --request-id <UUID> --reason R`，在已停止的 controller 上运行。要求派单已暂停、提交闸门不是 `open`。它把恢复代次加一并撤销此前签发的全部执行权（与 `restore` 相同的处理，但数据不回退）：attempt 的租约令牌作废、进行中的 attempt 记为失联、未结束的任务停在 `waiting_reconcile`（`stale_generation`）、协调租约失效、节点下次心跳被要求对账；尚未被节点领取（`requested`）的管理操作记 `failed`（`error: stale_generation`），对应的远端写回记 `failed`（`reason: stale_generation`，`written` 为空）；已领取的照常对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果。普通的停止再启动保留恢复代次、租约与协调租约。
 
 **13.10 远端项目写回**（`remote_apply` 能力）
 

@@ -28,6 +28,7 @@ export function Activity({ tick }: { tick: number }) {
   const [done, setDone] = useState(false)
   const [busy, setBusy] = useState(false)
   const [cat, setCat] = useState('')
+  const [page, setPage] = useState(0)  // 显示窗口：每页 MAX_RENDER 条，0 是最新的一页
   const max = useRef(0)
   const merge = (list: any[]) => setEvents(m => { const n = new Map(m); for (const e of list) { n.set(e.seq, e); max.current = Math.max(max.current, e.seq) } return n })
   // 首次加载取最新一页；之后每次 tick 从已知最大序号向后补读（after 模式，升序）。
@@ -47,13 +48,13 @@ export function Activity({ tick }: { tick: number }) {
     setBusy(true)
     try { const d = await api.eventsBefore(all[all.length - 1].seq, 200); merge(d.events ?? []); if ((d.events ?? []).length < 200) setDone(true) } catch (e) { setErr(errText(e)) } finally { setBusy(false) }
   }
-  return <Section title="活动" extra={<span className="actions"><select aria-label="按类别筛选" value={cat} onChange={e => setCat(e.target.value)}>
+  return <Section title="活动" extra={<span className="actions"><select aria-label="按类别筛选" value={cat} onChange={e => { setCat(e.target.value); setPage(0) }}>
     <option value="">全部类别</option>{CATS.map(([k, t]) => <option key={k} value={k}>{t}</option>)}</select>
     <small className="muted">已载入 {all.length} 条</small></span>}>
     <p className="muted">controller 记录的产品事件（状态变化、进度与操作记录），不是 CLI 的原始日志；原始输出在任务详情里按需从执行节点取回。</p>
     {err && <p className="err">{err}</p>}
     <table><thead><tr><th>时间</th><th>事件</th><th>相关对象</th><th>执行者</th><th></th></tr></thead>
-      <tbody>{shown.slice(0, MAX_RENDER).map(e => { const p = e.payload ?? {}
+      <tbody>{shown.slice(page * MAX_RENDER, (page + 1) * MAX_RENDER).map(e => { const p = e.payload ?? {}
         return <tr key={e.seq} className={e.stale ? 'stale' : ''}>
           <td><small>#{e.seq}<br />{when(e.created_at)}</small></td>
           <td>{TYPE[e.type] ?? e.type}{e.type === 'audit.action' && p.action ? <> <code>{p.action}</code></> : null}
@@ -65,7 +66,9 @@ export function Activity({ tick }: { tick: number }) {
           <td><small>{actorName(p.actor) ?? '—'}</small></td>
           <td>{Object.keys(p).length ? <details><summary>详情</summary><Json v={p} /></details> : null}</td>
         </tr> })}</tbody></table>
-    {shown.length > MAX_RENDER && <p className="muted">筛选后共 {shown.length} 条，只显示最新 {MAX_RENDER} 条。</p>}
+    {shown.length > MAX_RENDER && <p className="actions"><small className="muted">共 {shown.length} 条，显示第 {page * MAX_RENDER + 1}–{Math.min(shown.length, (page + 1) * MAX_RENDER)} 条</small>
+      <button disabled={page === 0} onClick={() => setPage(page - 1)}>较新</button>
+      <button disabled={(page + 1) * MAX_RENDER >= shown.length} onClick={() => setPage(page + 1)}>较早</button></p>}
     {!all.length && !err && <p className="muted">{done ? '还没有事件。' : '加载中…'}</p>}
     <p className="actions">{done ? <small className="muted">没有更早的事件了（更早的可能已被裁剪）</small>
       : all.length > 0 && <button disabled={busy} onClick={() => void older()}>{busy ? '加载中…' : '更早'}</button>}</p>

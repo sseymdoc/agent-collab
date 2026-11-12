@@ -389,6 +389,15 @@ class ApplyTests(ApplyCase):
         self.assertEqual(project.unfinished(self.state), [])  # 有了明确结果，不算中断
 
 
+class ProtectedPathTests(ApplyCase):
+    def test_results_never_write_version_control_metadata_whatever_the_contract_excludes(self):
+        result = self.result({'.git/hooks/pre-commit': 'echo owned', 'a.txt': 'a1'})
+        outline = project.plan(self.root, self.base, result, exclude=[])
+        self.assertEqual([c['path'] for c in outline['changes']], ['a.txt'])
+        self.assertEqual(self.apply(result)['status'], 'applied')
+        self.assertFalse((self.root / '.git').exists())
+
+
 class CancelTests(ApplyCase):
     """取消只在两个文件之间生效：正在写的文件写完（备份、替换、记日志），不开始下一个；取消不等于回滚。"""
 
@@ -550,6 +559,16 @@ class InterruptionTests(ApplyCase):
         rolled = project.recover(self.state, application, 'rollback')
         self.assertEqual((rolled['status'], rolled['restored'], rolled['kept'], (self.root / 'a.txt').read_text()),
                          ('partial', [], ['a.txt'], 'a1'))
+
+    def test_marker_left_behind_after_a_final_result_does_not_block_the_next_application(self):
+        done = self.apply(self.result({'a.txt': 'a1'}))
+        marker = project._root_marker(self.state, project.resolve_root(self.root))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({'application_id': done['application_id'], 'root': str(project.resolve_root(self.root))}), encoding='utf-8')
+        self.assertEqual(project.unfinished(self.state, self.root), [])
+        self.assertFalse(marker.exists())
+        current = project.scan(self.root, exclude=[])['manifest']
+        self.assertEqual(self.apply(self.result({'a.txt': 'a2'}, base=current), base=current)['status'], 'applied')
 
     def test_abandoning_records_the_outcome_as_unknown_not_as_applied(self):
         result, application = self.interrupted()

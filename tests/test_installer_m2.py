@@ -348,7 +348,7 @@ class InstallerM2Tests(unittest.TestCase):
             self.assertEqual(json.loads(out)['desired'], {'controller': 'stopped', 'worker': 'stopped'})
 
     def test_stopped_worker_automatic_rollback_and_interrupted_stop_never_start(self):
-        for system in ('Linux', 'Darwin', 'Windows'):
+        for system in ('Linux', 'Darwin', 'Windows') if os.name != 'nt' else ('Windows',):
             with self.subTest(system=system):
                 self.prefix, self.state = self.temp / system, self.temp / (system + '-state')
                 self.installation(system, desired={'worker': 'stopped'})

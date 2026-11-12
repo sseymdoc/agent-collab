@@ -14,6 +14,7 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 from agent_collab import cli, node_agent, node_projects, project, project_cli, protocol as p
+from agent_collab.controller import App, barrier
 from agent_collab.node_agent import Agent, pair
 from fake_controller import no_auth
 from helpers import ControllerCase, contract, uid
@@ -345,6 +346,34 @@ class RemoteTimeoutTests(RemoteCase):
         self.assertEqual((done['status'], done['detail'].get('rolled_back'), done['detail']['operation_id'], tree(self.folder)),
                          ('failed', True, rollback['op_id'], INPUTS))
 
+    def test_unsettled_application_blocks_retirement_counts_as_activity_and_unreceived_ones_end_at_the_barrier(self):
+        self.bind()
+        job = self.published()
+        after = max(e['seq'] for e in self.call('GET', '/events?limit=1000')['events'])
+        started = self.apply(job)  # 节点不再循环：操作停在 requested
+        activity = self.call('GET', '/activity?after=%d' % after)
+        self.assertEqual((activity['counts']['applications_unsettled'], activity['disposable']), (1, False))
+        node = next(n for n in self.call('GET', '/nodes')['nodes'] if n['node_id'] == 'target')
+        blocked = self.call('POST', '/nodes/target/retire', {'request_id': uid(), 'retired': True, 'reason': 'gone',
+                                                             'expected_version': node['version']}, status=409)['error']
+        self.assertEqual(blocked['details']['blockers'], {'pending_operations': [started['operation_id']],
+                                                          'unsettled_applications': [started['application_id']]})
+        meta = lambda: self.call('GET', '/overview')['controller']['metadata_version']
+        self.call('POST', '/dispatch', {'request_id': uid(), 'paused': True, 'expected_version': meta()})
+        self.call('POST', '/intake', {'request_id': uid(), 'mode': 'closed', 'reason': 'cutover', 'expected_version': meta()})
+        self.app.close()
+        barrier(self.temp / 'data', uid(), 'cutover', clock=self.clock)
+        self.app = App(self.temp / 'data', clock=self.clock)
+        # 屏障之前没被领取的写回作废：不会再下发给节点，记录为失败、一个文件都没写。
+        done = self.application(started)
+        self.assertEqual((done['status'], done['detail']['reason'], done['detail']['written']), ('failed', 'stale_generation', []))
+        self.assertEqual(self.op(started['operation_id'])['status'], 'failed')
+        self.drive(lambda: self.agent.connected and self.agent.reconciled)
+        for _ in range(5):
+            self.agent.cycle()
+            self.clock.advance(1.5)
+        self.assertEqual(tree(self.folder), INPUTS)
+
 
 class RemoteRestartTests(RemoteCase):
     def counting(self):
@@ -467,6 +496,59 @@ class RemoteRootsTests(RemoteCase):
         done = self.settled(self.apply(job))
         self.assertEqual((done['status'], done['detail']['reason'], tree(inside)), ('failed', 'outside_integration_roots', INPUTS))
         self.assertNoPaths([plan, done])
+
+
+class RemoteLimitsTests(RemoteCase):
+    def test_binding_limit_and_root_names_match_what_registration_accepts(self):
+        stored = {uid(): {'path': str(self.folder), 'bound_at': 0} for _ in range(node_projects.MAX_BINDINGS)}
+        (self.directory / node_projects.BINDINGS).write_text(json.dumps(stored), encoding='utf-8')
+        with self.assertRaises(project.ProjectError) as caught:
+            node_projects.bind(self.directory, self.pid, self.folder)
+        self.assertEqual(caught.exception.code, 'too_many_bindings')
+        node_projects.bind(self.directory, next(iter(stored)), self.folder)  # 已有的绑定可以改，不受上限影响
+        self.assertNotIn(chr(92), node_projects.root_name('/srv/a' + chr(92) + 'b'))
+
+    def test_result_rejected_as_too_large_is_shrunk_and_reported_again(self):
+        self.bind()
+        outputs = dict(OUTPUTS, **{'out/many-%02d.txt' % i: b'x' for i in range(40)})
+        job = self.published(outputs=outputs)
+        real, rejected = self.agent.client.json, []
+
+        def limited(method, path, body=None, *rest, **kwargs):
+            if isinstance(body, dict) and body.get('result') and len(p.canonical_json(body)) > 800:
+                rejected.append(len(p.canonical_json(body)))
+                raise client_api_error(413)
+            return real(method, path, body, *rest, **kwargs)
+        with mock.patch.object(self.agent.client, 'json', limited):
+            done = self.settled(self.apply(job))
+        self.assertTrue(rejected)
+        self.assertEqual((done['status'], done['detail'].get('truncated'), tree(self.folder)), ('applied', True, outputs))
+        self.assertEqual(done['detail']['counts']['changed'], 43)
+
+
+class LocalReportTests(unittest.TestCase):
+    def test_server_errors_keep_the_receipt_and_explicit_refusals_end_it(self):
+        with mock.patch.dict('os.environ', {}), mock.patch.object(cli, 'client_home', return_value=Path(self.id_dir())):
+            record = project_cli.queue_report(type('C', (), {'controller_id': 'c', 'url': 'u'})(), uid(), uid(), {'status': 'applied'})
+            answers = iter([(503, {}), (409, {})])
+            conn = type('C', (), {'controller_id': 'c', 'url': 'u', 'send': lambda self, *a: next(answers)})()
+            self.assertIsNone(project_cli.send_report(conn, record))
+            self.assertTrue(project_cli.report_path(record['application_id']).is_file())
+            self.assertEqual(project_cli.send_report(conn, record), 'not_recorded (HTTP 409)')
+            self.assertFalse(project_cli.report_path(record['application_id']).exists())
+
+    def id_dir(self):
+        import tempfile
+        root = Path(__file__).resolve().parents[1] / '.dev' / 'tmp'
+        root.mkdir(parents=True, exist_ok=True)
+        path = tempfile.mkdtemp(dir=str(root))
+        self.addCleanup(__import__('shutil').rmtree, path, True)
+        return path
+
+
+def client_api_error(status):
+    from agent_collab.client import APIError
+    return APIError(status, {})
 
 
 class InProcessConn:

@@ -158,6 +158,9 @@ class PreflightTests(unittest.TestCase):
         self.assertIn('records', c['database']['tables'])
         self.assertEqual(c['meta']['metadata_version'], 5)
         self.assertEqual(c['config']['managed_coordinator']['status'], 'ready')
+        # 保存过的协调设置优先于 config.json，与 controller 一致。
+        self.put('settings', 'coordination', dict(revision=1, enabled=False, node_ids=[]))
+        self.assertEqual(self.report()['controller']['config']['managed_coordinator']['status'], 'disabled')
         self.assertEqual(c['jobs']['by_status'], {'running': 1})
         self.assertEqual(c['jobs']['non_terminal'][0]['harness'], 'codex')
         self.assertEqual(c['attempts']['active'][0]['epoch'], 2)

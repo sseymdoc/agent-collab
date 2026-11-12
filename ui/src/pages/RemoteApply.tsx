@@ -45,8 +45,9 @@ function Detail({ app }: { app: any }) {
 // 页面离开后不再更新状态、停止轮询。
 function useAlive() { const r = useRef(true); useEffect(() => { r.current = true; return () => { r.current = false } }, []); return r }
 
-export function RemoteApply({ job }: { job: any }) {
-  const { data: p } = useData(() => api.project(job.project_id), [job.project_id])
+export function RemoteApply({ job, tick }: { job: any; tick?: number }) {
+  // 随页面的刷新信号重读：节点上新增的绑定与节点在线状态不需要离开任务页就能看到。
+  const { data: p, reload } = useData(() => api.project(job.project_id), [job.project_id, tick])
   const targets: any[] = p?.remote_targets ?? []
   const pending: any[] = (job.applications ?? []).filter((a: any) => a.target_node_id && a.status === 'started')
   const [node, setNode] = useState('')
@@ -55,7 +56,8 @@ export function RemoteApply({ job }: { job: any }) {
   return <div>
     <h3>写回到节点上的目录</h3>
     {!targets.length ? <p className="muted">没有节点为这个项目绑定目录。要把成果写回某台节点上的目录，在那台节点本机运行
-      <code> agent-collab agent project-bind --data-dir &lt;节点数据目录&gt; {job.project_id} &lt;目录&gt;</code>，绑定会在一个心跳周期内出现在这里。</p>
+      <code> agent-collab agent project-bind --data-dir &lt;节点数据目录&gt; {job.project_id} &lt;目录&gt;</code>，绑定会在一个心跳周期内出现在这里。
+      <button className="link" onClick={() => void reload()}>重新读取</button></p>
       : <>
         <p className="muted">由那台节点在自己绑定的目录上比对与写入，规则与本机应用相同：只写成果改过的路径，节点上改过的文件算冲突、缺省不写；写入前备份到节点的数据目录。controller 只知道目录名。</p>
         <p className="actions"><label>目标 <select aria-label="选择目标节点" value={chosen?.node_id ?? ''} onChange={e => setNode(e.target.value)}>
@@ -104,7 +106,9 @@ function Target({ job, target }: { job: any; target: any }) {
   const plan = planOp?.status === 'succeeded' ? planOp.result : null
   const changes: any[] = plan?.changes ?? []
   const conflicts = changes.filter(c => c.state === 'conflict')
-  const n = (k: string, v: string) => changes.filter(c => c[k] === v).length
+  // 数量取节点在截断明细之前算好的 summary：明细过长时 changes 只是一部分。
+  const n = (_k: string, v: string) => plan?.summary?.[v] ?? changes.filter(c => c.state === v || c.action === v).length
+  const conflictCount = n('state', 'conflict')
   return <div>
     <p className="actions"><button disabled={!!busy || !tasks} title={tasks ? undefined : '需要任务权限（tasks）'} onClick={() => void review()}>{plan ? '重新审阅' : '审阅节点上的变更'}</button>
       {busy === 'review' && planOp && <small className="muted">{planOp.status === 'requested' ? '等待节点领取…' : '节点已收到，正在比对…'}</small>}
@@ -112,7 +116,7 @@ function Target({ job, target }: { job: any; target: any }) {
     {err && <p className="err" role="alert">{err}</p>}
     {plan && <>
       <p>节点 <b>{target.node_id}</b> 上的目录 <b>{plan.root_name}</b> · 检查点 <code>{short(planOp.params.checkpoint_id)}</code>：新增 {n('action', 'add')}、修改 {n('action', 'modify')}、删除 {n('action', 'delete')}；
-        可以应用 {n('state', 'clean')}，目录里已是该内容 {n('state', 'already')}，冲突 <b className={conflicts.length ? 'err' : ''}>{conflicts.length}</b>
+        可以应用 {n('state', 'clean')}，目录里已是该内容 {n('state', 'already')}，冲突 <b className={conflictCount ? 'err' : ''}>{conflictCount}</b>
         {typeof plan.summary?.bytes === 'number' ? `；将写入 ${bytes(plan.summary.bytes)}` : ''}{plan.truncated ? '（清单过长，只显示了一部分）' : ''}。</p>
       <table><thead><tr><th>路径</th><th>变更</th><th>状态</th><th>大小</th></tr></thead>
         <tbody><Capped items={[...conflicts, ...changes.filter(c => c.state !== 'conflict')]} n={300} render={c => <tr key={c.path}>
@@ -121,12 +125,12 @@ function Target({ job, target }: { job: any; target: any }) {
             : <><span className="badge bad">冲突</span> <small>{why(c.reason)}</small></>}</td>
           <td>{c.action === 'delete' ? '—' : bytes(c.size)}</td></tr>} /></tbody></table>
       {!changes.length && <p className="muted">成果相对输入没有改动。</p>}
-      {conflicts.length ? <>
-        <p className="notice">有 {conflicts.length} 个冲突：缺省不会写入任何文件，冲突文件保留节点上的内容。也可以只写入没有冲突的文件，结果会记为部分应用。</p>
+      {conflictCount ? <>
+        <p className="notice">有 {conflictCount} 个冲突：缺省不会写入任何文件，冲突文件保留节点上的内容。也可以只写入没有冲突的文件，结果会记为部分应用。</p>
         <p className="actions"><button className="danger" disabled={!!busy || !tasks} onClick={() => {
-          if (window.confirm(`在节点 ${target.node_id} 上只写入 ${n('state', 'clean')} 个没有冲突的文件，${conflicts.length} 个冲突文件保留原样；结果记为部分应用。确定？`)) void apply(true)
+          if (window.confirm(`在节点 ${target.node_id} 上只写入 ${n('state', 'clean')} 个没有冲突的文件，${conflictCount} 个冲突文件保留原样；结果记为部分应用。确定？`)) void apply(true)
         }}>只应用没有冲突的文件</button></p>
-      </> : changes.some(c => c.state === 'clean') && <p className="actions"><button className="primary" disabled={!!busy || !tasks} onClick={() => void apply(false)}>写回到节点上的目录</button></p>}
+      </> : n('state', 'clean') > 0 && <p className="actions"><button className="primary" disabled={!!busy || !tasks} onClick={() => void apply(false)}>写回到节点上的目录</button></p>}
     </>}
     {run && <div className="draft">
       <p>写回 <code>{short(run.app.application_id)}</code>：<State app={run.app} op={run.op} />

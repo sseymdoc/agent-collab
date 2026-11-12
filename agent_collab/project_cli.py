@@ -202,8 +202,8 @@ def send_report(conn, record):
                                  {'request_id': record['request_id'], 'status': record['status'], 'detail': record['detail']})
     except cli.Unreachable:
         return None
-    if status in (401, 403):
-        return None  # 授权问题：处理之后用同一份回执补报，不改用别的身份
+    if status in (401, 403) or status >= 500:
+        return None  # 授权问题或服务端暂时故障：之后用同一份回执补报，不改用别的身份
     report_path(record['application_id']).unlink()
     if 200 <= status < 300:
         return body['status']

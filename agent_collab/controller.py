@@ -635,10 +635,14 @@ class App:
             # 草拟时看到的解析结果已过期：让客户端重新草拟，而不是按新默认值悄悄受理。
             raise APIError('version_mismatch', 'model settings changed since the contract was drafted', current=self.model_settings())
         project = self._project(data['project_id'], usable=True) if data.get('project_id') is not None else None
+        root = self.store.get('root', data['work_package_id']) if isinstance(data.get('work_package_id'), str) else None
+        if project is None and root and root.get('project_id'):
+            # 修订属于根所在的项目：没带 project_id 也按那个项目受理（归档、版本与验收运行检查都用它）。
+            project = self._project(root['project_id'], usable=True)
         expected = data.get('expected_project_revision')
         if expected is not None and (project is None or expected != project['revision']):
             raise APIError('version_mismatch', 'project settings changed since the contract was drafted', current=project)
-        acceptance_run = self._intake_check(data, identity)
+        acceptance_run = self._intake_check(data, identity, project)
         return self._create_job(data, created_by=self.actor(identity), project=project, acceptance_run=acceptance_run)
 
     # ------------------------------------------------------------ 提交闸门与切换（§13.9）
@@ -646,7 +650,7 @@ class App:
     def intake(self):
         return self.meta().get('intake') or {'mode': 'open', 'reason': None, 'by': None, 'at': None}
 
-    def _intake_check(self, data, identity):
+    def _intake_check(self, data, identity, project=None):
         """普通提交是否开放由 controller 决定，不靠约定。返回这次提交是否是验收运行。
 
         acceptance 模式只接受带 acceptance_run 标记、由有 maintain 权限的主体提交、且不产生外部写入的任务：
@@ -664,7 +668,7 @@ class App:
             contract = data.get('contract') if isinstance(data.get('contract'), dict) else {}
             integration = contract.get('integration') if isinstance(contract.get('integration'), dict) else {}
             recovery = contract.get('recovery') if isinstance(contract.get('recovery'), dict) else {}
-            if data.get('project_id') is not None or integration.get('target_node_id') or recovery.get('side_effects', 'none') != 'none':
+            if project is not None or data.get('project_id') is not None or integration.get('target_node_id') or recovery.get('side_effects', 'none') != 'none':
                 raise ValueError('an acceptance run must not belong to a project, write back to a node, or declare side effects')
         return marked
 
@@ -683,7 +687,7 @@ class App:
         """序号大于 after 的事件里产生了什么：用来判断一份备份之后是否已有不能丢弃的状态。"""
         jobs, counts = {}, {}
         rows = self.store.db.execute('SELECT data FROM events WHERE seq>? ORDER BY seq', (after,))
-        last = after
+        last, started = after, {}
         for row in rows:
             event = json.loads(row[0])
             last = event['seq']
@@ -696,8 +700,10 @@ class App:
                 counts[kind] = counts.get(kind, 0) + 1
             elif kind == 'job.integration' and payload.get('status') == 'integrated':
                 counts['integrated'] = counts.get('integrated', 0) + 1
-            elif kind == 'project.application' and payload.get('status') in ('applied', 'partial'):
-                counts['applications_written'] = counts.get('applications_written', 0) + 1
+            elif kind == 'project.application':
+                if payload.get('status') in ('applied', 'partial'):
+                    counts['applications_written'] = counts.get('applications_written', 0) + 1
+                started[payload.get('application_id')] = payload.get('status') == 'started'
         # 协调回合跟随它协调的目标：目标是验收运行，它也算验收运行。
         targets = {j['job_id']: j for j in self.store.all('job')}
         for entry in jobs.values():
@@ -706,7 +712,9 @@ class App:
             if target and (targets.get(target['job_id']) or {}).get('acceptance_run'):
                 entry['acceptance_run'] = True
         ordinary = [j for j in jobs.values() if not j['acceptance_run']]
-        written = counts.get('integrated', 0) + counts.get('applications_written', 0)
+        # 还没有最终结果的应用可能已经写了一部分文件：同样不可丢弃。
+        counts['applications_unsettled'] = sum(started.values())
+        written = counts.get('integrated', 0) + counts.get('applications_written', 0) + counts['applications_unsettled']
         return response({'after': after, 'last_seq': last, 'jobs': list(jobs.values()), 'ordinary_jobs': len(ordinary),
                          'acceptance_jobs': len(jobs) - len(ordinary), 'counts': counts,
                          # 只有验收运行、且没有任何写回：恢复这份备份只丢掉可丢弃的验收状态。
@@ -776,6 +784,14 @@ class App:
         pending = [r['pending']['job_id'] for r in self.store.all('integration_target') if r['target_node_id'] == node_id and r.get('pending')]
         if pending:
             blockers['pending_integrations'] = pending
+        operations = [op['op_id'] for op in self.store.all('node_op') if op['node_id'] == node_id and op['status'] in ('requested', 'received')]
+        if operations:
+            blockers['pending_operations'] = operations
+        # 远端写回结果待确认：退役后节点不能再补报，先在节点上用 recover 处理。
+        applications = [a['application_id'] for a in self.store.all('application')
+                        if a.get('target_node_id') == node_id and a['status'] == 'started']
+        if applications:
+            blockers['unsettled_applications'] = applications
         profile = self.coordination_profile()
         if profile['profile'] and node_id in profile['profile']['node_ids']:
             blockers['coordination_profile'] = profile['profile_id']
@@ -2308,9 +2324,6 @@ class App:
                 raise ValueError('revisions of a work package stay in its project')
             if any(j['work_package_id'] == root_id and j['status'] not in ('completed', 'failed', 'cancelled') for j in self.store.all('job')):
                 raise APIError('conflict', 'work_package revisions must be serial')
-            if acceptance_run and root.get('project_id'):
-                # 修订沿用根的项目：没带 project_id 的验收运行也会落进项目，按项目任务处理（§13.9）。
-                raise ValueError('an acceptance run must not belong to a project, write back to a node, or declare side effects')
         else:
             # 根受理时冻结模型策略：后续修订与受管修复只读这里，不读之后修改的设置或项目默认值（§12.4、§13.1）。
             root = {'counters': dict(attempts=0, infra_retries=0, migrations=0, repairs=0), 'created_at': d.timestamp(now),
@@ -2944,6 +2957,19 @@ def revoke_execution(store, generation, clock):
             job = d.transition(job, clock(), status='cancel_requested' if job['cancel']['requested_at'] else 'waiting_reconcile', status_reason='stale_generation')
             store.put('job', job['job_id'], job)
             store.event('job.updated', job, d.timestamp(clock()), job_id=job['job_id'])
+    for op in store.all('node_op'):
+        if op['status'] != 'requested':
+            continue  # 已领取的操作节点可能正在执行：结果照常对账（远端写回保持待确认，用 recover 处理）
+        # 还没被领取的操作作废：屏障之后它们不会再下发，节点晚到的领取得到终态拒绝。
+        at = d.timestamp(clock())
+        op.update(status='failed', error='stale_generation', finished_at=at)
+        store.put('node_op', op['op_id'], op)
+        store.event('node.operation', {k: op[k] for k in ('op_id', 'node_id', 'kind', 'status')}, at, node_id=op['node_id'])
+        record = store.get('application', op['params'].get('application_id')) if op['kind'] == 'project_apply' else None
+        if record and record['status'] == 'started':
+            record.update(status='failed', detail={'reason': 'stale_generation', 'written': [], 'operation_id': op['op_id']}, finished_at=at)
+            store.put('application', record['application_id'], record)
+            store.event('project.application', record, at, job_id=record['job_id'])
     for node in store.all('node'):
         store.put('node_private', node['node_id'], {'reconcile_required': True})
     return meta

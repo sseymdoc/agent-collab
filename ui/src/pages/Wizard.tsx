@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { invoke } from '../transport'
 import { Badge, Json, Section, errText, show } from '../ui'
 
@@ -65,6 +65,9 @@ export function Wizard({ info, onOpen, onConnect }: { info: any; onOpen: (opened
   const [url, setUrl] = useState('')
   const [code, setCode] = useState('')
   const [node, setNode] = useState('')
+  // 向导被离开（改为连接已有 controller、或从连接页打开了别的连接）后，安装照常完成，但不再自动打开本机连接。
+  const owned = useRef(true)
+  useEffect(() => { owned.current = true; return () => { owned.current = false } }, [])
   const discover = () => invoke('local_discover').then(setD, e => setErr(errText(e)))
   useEffect(() => { if (mode && !d) void discover() }, [mode]) // eslint-disable-line
   const run = async (label: string, f: () => Promise<void>) => {
@@ -76,7 +79,7 @@ export function Wizard({ info, onOpen, onConnect }: { info: any; onOpen: (opened
     setOut(r.output ?? null)
     if (!r.ok) throw new Error('安装没有完成，安装器输出见下方')
     if (args.role === 'worker') setOk('这台机器已作为节点安装并加入 controller。它出现在该 controller 的“设备”页后，可在那里重新探测登录与模型目录。')
-    if (args.role === 'all-in-one') {
+    if (args.role === 'all-in-one' && owned.current) {
       const c = await invoke('local_pair')
       await onOpen(await invoke('connection_open', { id: c.id }), c)
     }
