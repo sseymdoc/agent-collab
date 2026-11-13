@@ -20,7 +20,7 @@ FILES="updater.key updater.key.pub release.key release.key.pub allowed_signers F
 
 ask() {
   local value
-  if [ -t 0 ]; then read -rsp "$1：" value; echo >&2; else IFS= read -r value; fi
+  if [ -t 0 ]; then IFS= read -rsp "$1：" value; echo >&2; else IFS= read -r value; fi
   printf %s "$value"
 }
 

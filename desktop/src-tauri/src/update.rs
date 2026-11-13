@@ -274,9 +274,30 @@ fn compat(manifest: &Value, features: Option<&[String]>) -> Value {
     }
 }
 
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+fn this_platform() -> String {
+    format!("{}-{}", if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "darwin" } else { "linux" }, std::env::consts::ARCH)
+}
+
+/// 下载的字节必须是产品发行清单里本平台的更新包（大小与 SHA-256 一致）。
+fn matches_manifest(manifest: &Value, bytes: &[u8]) -> std::result::Result<(), String> {
+    use sha2::Digest;
+    let artifacts = manifest["platforms"][this_platform()]["artifacts"].as_array().cloned().unwrap_or_default();
+    let item = artifacts
+        .iter()
+        .find(|a| matches!(a["role"].as_str(), Some("updater" | "installer+updater")))
+        .ok_or_else(|| "产品发行清单里没有本平台的更新包".to_string())?;
+    let digest = super::hex(&sha2::Sha256::digest(bytes));
+    if item["sha256"].as_str() != Some(digest.as_str()) || item["bytes"].as_u64() != Some(bytes.len() as u64) {
+        return Err("下载的更新包与产品发行清单记录的大小或 SHA-256 不符".into());
+    }
+    Ok(())
+}
+
 /// 页面需要的发行清单摘要：组件版本、本平台的最低系统与产物、签名与公证状态。
 fn summary(manifest: &Value) -> Value {
-    let platform = format!("{}-{}", if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "darwin" } else { "linux" }, std::env::consts::ARCH);
+    let platform = this_platform();
     json!({
         "release_id": manifest["release_id"],
         "kind": manifest["identity"]["kind"],
@@ -501,14 +522,17 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
         }
         same_channel(&app, offer)?;
         same_controller(offer, &features)?;
-        (offer.update.clone(), offer.channel.clone())
+        (offer.update.clone(), offer.channel.clone(), offer.manifest.clone())
     };
-    let (update, channel) = update;
+    let (update, channel, offer_manifest) = update;
     let mut journal = Journal::new(&current_version(&app), &update.version, &load_settings(&app).channel);
     journal.mark("compat", "done", None);
     journal.mark("download", "running", None);
     save_journal(&app, &journal)?;
     let (mut done, events) = (0u64, app.clone());
+    // 插件建 Update 时不带超时：服务器停住不发数据时下载会一直挂着并占着 running。
+    let mut update = update;
+    update.timeout = Some(DOWNLOAD_TIMEOUT);
     let downloaded = update
         .download(
             |chunk, total| {
@@ -520,7 +544,13 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
         .await;
     match downloaded {
         Ok(bytes) => {
-            // download() 已用公钥核对过签名与签名里的版本。
+            // download() 已用公钥核对过签名与签名里的版本；再核对字节就是已验签的产品清单里本平台的那个更新包。
+            if let Err(e) = matches_manifest(&offer_manifest, &bytes) {
+                journal.mark("verify", "failed", Some(e.clone()));
+                journal.finish("failed", Some("下载的更新包与产品发行清单不符".into()));
+                save_journal(&app, &journal)?;
+                return Err(err("invalid", e));
+            }
             journal.mark("download", "done", Some(format!("{} 字节", bytes.len())));
             journal.mark("verify", "done", Some("签名有效".into()));
             journal.finish("running", None);
@@ -678,6 +708,17 @@ pub fn pep440_key(version: &str) -> Option<(Vec<u64>, u8, u64, u8, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloaded_bytes_must_match_the_manifest_entry_for_this_platform() {
+        use sha2::Digest;
+        let bytes = b"update-bytes";
+        let manifest = json!({ "platforms": { this_platform(): { "artifacts": [
+            { "role": "updater", "bytes": bytes.len(), "sha256": crate::hex(&sha2::Sha256::digest(bytes)) } ] } } });
+        assert!(matches_manifest(&manifest, bytes).is_ok());
+        assert!(matches_manifest(&manifest, b"other-bytes!").is_err());
+        assert!(matches_manifest(&json!({ "platforms": {} }), bytes).is_err());
+    }
 
     #[test]
     fn pep440_order_is_semantic_not_lexical() {

@@ -160,7 +160,7 @@ export function LocalService() {
 // 节点本机的项目目录授权（docs/protocol.md §13.10）：只在这台机器上、经系统对话框选目录。controller 只看到项目 ID 与目录名，
 // 之后可以请这台节点把该项目已发布的成果写回这个目录（三方比较，冲突缺省不写）。没有图形界面的节点用
 // `agent-collab agent project-bind`。
-function NodeBindings() {
+export function NodeBindings() {
   const [b, setB] = useState<any[] | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)

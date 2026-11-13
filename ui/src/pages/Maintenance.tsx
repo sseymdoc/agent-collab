@@ -3,7 +3,7 @@ import { api } from '../api'
 import { can, session } from '../session'
 import { bridge, currentEpoch, invoke, isDesktop } from '../transport'
 import { Action, Badge, Json, Section, bytes, errText, show, useData, when } from '../ui'
-import { installed } from './Wizard'
+import { NodeBindings, installed } from './Wizard'
 
 // 维护（ADR 0004、docs/protocol.md §14）：桌面更新与本机后台升级（仅桌面端），备份与恢复预览、切换屏障预检（maintain 权限），
 // 诊断导出（仅桌面端，只落本机）。每个角色更新什么见 ADR 0004 第 5 条：桌面更新不升级远端 controller 或节点。
@@ -146,6 +146,8 @@ function LocalBackend() {
       }}>升级本机后台</button>{busy && <small className="muted">升级中，可能需要几分钟…</small>}</p></>}
     {msg && <p className={msg[1]}>{msg[0]}</p>}
     {out && <><p className="muted">安装器输出（末尾）</p><pre className="json">{out}</pre></>}
+    {/* 连接页上的同一个面板在连上 controller 之后就看不到了：这里也提供，项目可以从当前连接里选。 */}
+    {/worker|all-in-one/.test(String(i.role)) && i.identity?.paired && <NodeBindings />}
   </Section>
 }
 

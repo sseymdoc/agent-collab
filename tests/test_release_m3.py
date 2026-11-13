@@ -122,6 +122,19 @@ class UpdaterKeyPairTests(unittest.TestCase):
             build.check_key_pair(pubkey, wrap(['untrusted comment: signature', blob(b'BBBBBBBB', 64), 'trusted comment: x', 'sig']), 'other')
 
 
+class DesktopCopyTests(unittest.TestCase):
+    def test_copy_skips_generated_payload_and_local_secrets(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        skip = build.desktop_ignore('x/src-tauri/resources', ['app', 'runtime', 'release', 'licenses', 'payload.json', 'icons'])
+        self.assertEqual(skip, {'runtime', 'release', 'licenses', 'payload.json'})
+        self.assertEqual(build.desktop_ignore('x/resources/app', ['helper.py', 'agent_collab']), {'agent_collab'})
+        self.assertEqual(build.desktop_ignore('x/src', ['lib.rs', 'admin.token', 'controller.db', 'target']),
+                         {'admin.token', 'controller.db', 'target'})
+
+
 class ReleaseArchiveTests(unittest.TestCase):
     setUpClass = classmethod(legacy.InstallerTests.setUpClass.__func__)
     tearDownClass = classmethod(legacy.InstallerTests.tearDownClass.__func__)

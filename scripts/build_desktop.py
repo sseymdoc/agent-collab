@@ -162,6 +162,21 @@ def sign_nested(resources, identity):
     return count
 
 
+# 被 .gitignore 忽略、干净检查看不到的本机文件（令牌、数据库）一律不复制进包。
+SECRET_PATTERNS = ('*.token', '*.db', '*.db-wal', '*.db-shm')
+
+
+def desktop_ignore(directory, names):
+    """复制 desktop/ 时跳过构建产物与上次组装留下的随包载荷（这次按参数重新组装，不合并旧文件）。"""
+    skip = set(shutil.ignore_patterns('target', 'gen', 'node_modules', *SECRET_PATTERNS)(directory, names))
+    path = Path(directory)
+    if path.name == 'resources' and path.parent.name == 'src-tauri':
+        skip |= {'runtime', 'release', 'licenses', 'payload.json'} & set(names)
+    if path.name == 'app' and path.parent.name == 'resources':
+        skip |= {'agent_collab'} & set(names)
+    return skip
+
+
 def tar_app(app, destination):
     """macOS 更新归档：tar.gz 里是 <名称>.app 目录本身，保留链接与权限（Tauri updater 的格式）。"""
     with tarfile.open(str(destination), 'w:gz', format=tarfile.PAX_FORMAT) as archive:
@@ -190,14 +205,14 @@ def build(args):
     if work.exists():
         shutil.rmtree(str(work))
     dist.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(str(src / 'desktop'), str(work / 'desktop'), ignore=shutil.ignore_patterns('target', 'gen', 'node_modules'))
+    shutil.copytree(str(src / 'desktop'), str(work / 'desktop'), ignore=desktop_ignore)
     static = src / 'agent_collab' / 'static'
     if not (static / 'index.html').is_file():
         raise SystemExit('页面产物 agent_collab/static 不存在：先构建页面')
     shutil.copytree(str(static), str(work / 'agent_collab' / 'static'))
     resources = work / 'desktop' / 'src-tauri' / 'resources'
     shutil.copytree(str(src / 'agent_collab'), str(resources / 'app' / 'agent_collab'),
-                    ignore=shutil.ignore_patterns('static', '__pycache__', '*.pyc'))
+                    ignore=shutil.ignore_patterns('static', '__pycache__', '*.pyc', *SECRET_PATTERNS))
     if args.fixture_module:
         # 覆盖安装的残留验证：旧版带模块 A、新版删掉 A 加上 B（只用于测试身份）。
         name = '_m3_fixture_' + args.fixture_module
@@ -269,7 +284,10 @@ def build(args):
         updater = final
         artifacts.append(dict(name=final.name, role='installer+updater'))
     else:
-        app = next((bundle_dir / 'macos').glob('*.app'))
+        # 同一个 target 目录里可能还留着别的身份的应用包：按本次的产品名取。
+        app = bundle_dir / 'macos' / (identity['product'] + '.app')
+        if not app.is_dir():
+            raise SystemExit('没有找到本次构建的应用包：%s' % app)
         # 应用本身由 Tauri 按 signingIdentity 签名（嵌套代码已在组装阶段签过，见 sign_nested）。
         identity_name = os.environ.get('AGENT_COLLAB_CODESIGN_IDENTITY')
         code_deep, deep = capture(['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)])

@@ -477,8 +477,13 @@ async fn controller_info(shell: &Shell, epoch: u64) -> Result<Value> {
             event.remove("payload");
         }
     }
-    if serde_json::to_vec(&info).map_or(0, |v| v.len()) > 900 * 1024 {
+    // 助手读这个文件的上限是 1 MiB（按写入的缩进格式算）：超过时先省略事件，仍超过就整节只留一条说明。
+    let size = |info: &serde_json::Map<String, Value>| serde_json::to_vec_pretty(info).map_or(usize::MAX, |v| v.len());
+    if size(&info) > 900 * 1024 {
         info.insert("events".into(), json!({ "error": "省略：controller 信息超过诊断上限" }));
+    }
+    if size(&info) > 900 * 1024 {
+        return Ok(json!({ "error": "controller 信息超过诊断上限，没有收集" }));
     }
     Ok(Value::Object(info))
 }

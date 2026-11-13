@@ -326,6 +326,12 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(status, 0, error)
         self.assertIn('runtime', self.report()['sections'])
 
+    def test_url_userinfo_is_redacted_in_text_and_json(self):
+        redactor = d.Redactor(home='/home/u', username='u', hostname='h')
+        self.assertNotIn('pw1', redactor.text('proxy https://svc:pw1@proxy.example/x failed'))
+        self.assertNotIn('pw2', json.dumps(redactor.value({'proxy': 'http://svc:pw2@proxy.example'})))
+        self.assertIn('proxy.example', redactor.text('https://svc:pw1@proxy.example'))
+
     def test_bare_basic_and_bearer_credentials_are_redacted(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')
         clean = redactor.text('ERROR Basic dXNlcjpwYXNz then Bearer abc')
