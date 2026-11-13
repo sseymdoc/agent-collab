@@ -2066,8 +2066,8 @@ def configuration(args, old, system):
             defaults[key] = value
     service = not args.no_service
     if old and getattr(args, 'uninstall', False):
-        # 卸载沿用安装时的服务模式：用 --no-service 安装的前缀不必再带这个参数（桌面端卸载也不知道它）。
-        service = service and saved.get('service', True)
+        # 找到的已有前缀（--prefix 或缺省位置）卸载时沿用安装时的服务模式，带不带 --no-service 都一样（桌面端卸载也不知道它）。
+        service = saved.get('service', True)
     defaults.update(system=system, service=service)
     for key in ('prefix', 'state_dir', 'python', 'admin_token_file', 'ca_file', 'workspace_root'):
         if defaults.get(key):

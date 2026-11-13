@@ -492,7 +492,7 @@ pub fn project(command: Command, stop: &dyn Fn() -> Option<BridgeError>, progres
 /// `install`、`service`、`controller client-code` 的输出。
 pub struct Captured {
     pub code: Option<i32>,
-    /// 标准输出（上限 1 MiB）。
+    /// 标准输出（上限 调用方给的上限（`capture_up_to` 的 `limit`））。
     pub stdout: String,
     /// 标准输出与标准错误合并后的末尾 4000 个字符。
     pub tail: String,

@@ -346,7 +346,10 @@ export function useAutoUpdate(notify: (title: string, body: string) => void) {
           for (;;) {
             const now = await invoke('update_status')
             if (stopped || !now.settings?.auto_install || now.downloaded?.version !== r.version) return
-            if (!now.blockers?.length) { await invoke('update_install'); return }
+            if (!now.blockers?.length) {
+              // 读状态之后又有操作开始时，安装会以 busy 拒绝：当作阻塞，继续等。
+              try { await invoke('update_install'); return } catch (err: any) { if (err?.code !== 'busy') throw err }
+            }
             await new Promise(done => { retry = window.setTimeout(done, 60000) })
           }
         } catch (err) { notify('桌面端更新 ' + r.version + ' 没有完成', errText(err) + '；在“维护”页查看') }

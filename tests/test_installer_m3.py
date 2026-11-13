@@ -241,6 +241,15 @@ class InstallerM3Tests(unittest.TestCase):
             code = ins.main([a for a in self.args('worker') if a != '--no-service'] + ['--uninstall'])
         self.assertEqual(code, 0, output.getvalue())
         self.assertIsNone(ins.current_version(self.prefix))
+        # 反过来：服务模式安装的前缀带着 --no-service 卸载，也沿用记录的模式（服务照常移除）。
+        self.invoke('--release', str(self.v1), role='worker')
+        record = ins.read_json(self.prefix / 'installation.json')
+        record['config']['service'] = True
+        ins.write_json(self.prefix / 'installation.json', record)
+        with patch.object(ins.Services, 'remove') as remove, patch.object(ins.Services, 'check_ownership'), \
+                patch.object(ins.os, 'getuid', return_value=501, create=True), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(ins.main(self.args('worker') + ['--uninstall']), 0)
+        remove.assert_called()
 
     def test_oversized_archive_is_refused_before_it_is_read(self):
         with patch.object(ins, 'MAX_ARCHIVE_BYTES', self.v1.stat().st_size - 1),                 patch.object(Path, 'read_bytes', side_effect=AssertionError('archive read')):

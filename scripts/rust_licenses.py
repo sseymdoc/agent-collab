@@ -43,7 +43,7 @@ def graph(src, cargo_home=None):
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--locked', '--offline', '--filter-platform', triple],
                                          cwd=str(src), capture_output=True, check=True,
                                          # 与读取许可证文本用同一份缓存：--offline 时 cargo 只在这里找依赖。
-                                         env=dict(os.environ, CARGO_HOME=str(cargo_home)) if cargo_home else None).stdout)
+                                         env=dict(os.environ, CARGO_HOME=str(Path(cargo_home).resolve())) if cargo_home else None).stdout)
         packages = {p['id']: p for p in meta['packages']}
         nodes = {n['id']: n for n in meta['resolve']['nodes']}
         root = meta['resolve']['root']

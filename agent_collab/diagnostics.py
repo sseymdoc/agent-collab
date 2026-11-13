@@ -179,9 +179,11 @@ def configuration(args):
         old, _ = read_json(prefix / 'installation.json')
         if old:
             local_path(old['config']['state_dir'])
+            if not isinstance(old['config']['service'], bool) or not isinstance(old.get('version'), (str, type(None))):
+                raise ValueError('invalid installation record')
     except FileNotFoundError:
         old = None
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
         old, broken = None, exc
     options = ['--prefix', str(prefix)]
     if args.state_dir:

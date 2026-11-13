@@ -288,10 +288,12 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(redactor.text('ann@box: channel annotate inbox box-2'), '<user>@<host>: channel annotate inbox box-2')
 
     def test_malformed_agent_state_or_installation_record_leaves_the_rest_of_the_export(self):
-        for path in (self.state / 'worker/agent.json', self.prefix / 'installation.json'):
-            with self.subTest(path=path.name):
+        missing_service = {'version': '1.2.3', 'config': {'state_dir': str(self.state)}}
+        for path, broken in ((self.state / 'worker/agent.json', '{not json'), (self.prefix / 'installation.json', '{not json'),
+                             (self.prefix / 'installation.json', missing_service)):
+            with self.subTest(path=path.name, broken=str(broken)[:20]):
                 original = path.read_text(encoding='utf-8')
-                self.write(path, '{not json')
+                self.write(path, broken)
                 try:
                     status, _, error = self.run_cli()
                     self.assertEqual(status, 0, error)
