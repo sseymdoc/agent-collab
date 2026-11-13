@@ -91,7 +91,7 @@ function DesktopUpdate() {
       <dl className="kv">
         <dt>影响范围</dt><dd>只替换桌面端与随包组件（运行时、本机助手、后台发行包）；需要重启桌面端{navigator.userAgent.includes('Windows') ? '（安装时窗口会自动关闭，安装完成后重新打开）' : ''}。
           本机后台服务继续运行、不被打断；随包的后台版本变新时，安装后在“本机后台”里另行升级。</dd>
-        <dt>组件</dt><dd>后台 {show(offer.summary?.components?.backend?.version)} · 运行时 Python {show(offer.summary?.components?.runtime?.python)} · 源提交 {String(offer.summary?.source?.commit ?? '').slice(0, 7) || show(null)}</dd>
+        <dt>组件</dt><dd>后台 {show(offer.summary?.components?.backend?.version)} · 运行时 Python {show(offer.summary?.platform?.runtime?.python ?? offer.summary?.components?.runtime?.python)} · 源提交 {String(offer.summary?.source?.commit ?? '').slice(0, 7) || show(null)}</dd>
         <dt>本平台</dt><dd>最低系统 {show(offer.summary?.platform?.min_os)} · 平台签名 {SIGNED[offer.summary?.platform?.signed?.platform] ?? '未签名'}
           {offer.summary?.platform?.signed?.notarized !== null && offer.summary?.platform?.signed?.notarized !== undefined ? ' · 公证 ' + (offer.summary.platform.signed.notarized ? '已公证' : '未公证') : ''}</dd>
         <dt>与当前 controller</dt><dd className={VERDICT[verdict]?.[1]}>{VERDICT[verdict]?.[0] ?? show(verdict)}{offer.compat?.reason ? '：' + offer.compat.reason : ''}

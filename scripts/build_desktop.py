@@ -411,7 +411,8 @@ def manifest(args):
         source=dict(commit=first['commit'], dirty=any(f['dirty'] for f in found)), built_at=max(f['built_at'] for f in found),
         components=dict(desktop=dict(version=first['desktop_version']),
                         backend=dict(version=backend['manifest']['version'], file=backend['file'], sha256=backend['sha256'], signed=backend['signed']),
-                        runtime=dict(python=(first.get('runtime') or {}).get('python'), openssl=(first.get('runtime') or {}).get('openssl'))),
+                        runtime={f['target']: dict(python=(f.get('runtime') or {}).get('python'), openssl=(f.get('runtime') or {}).get('openssl'))
+                                 for f in found}),
         protocol=dict(api_version=1, backend_protocol_version=backend['manifest'].get('protocol_version'), controller_features=backend['manifest'].get('features')),
         database_schema=dict(min=backend['manifest'].get('controller_schema_min'), max=backend['manifest'].get('controller_schema_max'),
                     fingerprint=backend['manifest'].get('controller_schema_fingerprint')),
@@ -420,6 +421,7 @@ def manifest(args):
         rollback='程序回退只在 schema 范围内进行（本机后台 install --rollback；桌面端重新安装旧安装包）；恢复旧数据库是另一个操作（agent-collab maintenance restore）',
         features=sorted({x for f in found for x in f['features']}),
         platforms={f['target']: dict(min_os=f['min_os'], artifacts=f['artifacts'], payload_sha256=f['payload']['sha256'],
+                                     runtime=dict(python=(f.get('runtime') or {}).get('python'), openssl=(f.get('runtime') or {}).get('openssl')),
                                      signed=dict(platform=f['signing'].get('platform'), verified=f['signing'].get('verified'),
                                                  notarized=f['signing'].get('notarized'), stapled=f['signing'].get('stapled')))
                    for f in found},

@@ -333,6 +333,13 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertNotIn('p@55!', redactor.text(line))
             self.assertNotIn('two words', redactor.text(line))
 
+    def test_password_in_json_argv_arrays_is_redacted(self):
+        redactor = d.Redactor(home='/home/u', username='u', hostname='h')
+        line = json.dumps({'level': 'ERROR', 'argv': ['tool', '--password', 'p@55!', '--verbose']})
+        clean = redactor.text(line)
+        self.assertNotIn('p@55!', clean)
+        self.assertIn('--verbose', clean)
+
     def test_url_userinfo_is_redacted_in_text_and_json(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')
         self.assertNotIn('pw1', redactor.text('proxy https://svc:pw1@proxy.example/x failed'))

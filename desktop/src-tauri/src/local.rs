@@ -522,9 +522,12 @@ pub async fn diagnostics_export(app: AppHandle, shell: State<'_, Shell>, epoch: 
     let captured = captured?;
     let preview = json_output(&captured.stdout).filter(|_| captured.code == Some(0) && out.is_file());
     let preview = preview.ok_or_else(|| io(format!("诊断导出失败：{}", helper::tail_chars(&captured.tail, 600))))?;
-    // 助手运行期间换了连接：这份包里是旧连接的 controller 信息，不作为当前连接的结果返回（暂存包留着，可以重新导出）。
+    // 助手运行期间换了连接：这份包里是旧连接的 controller 信息，不作为当前连接的结果返回，暂存包一并删除。
     if let Some(epoch) = epoch {
-        shell.lock().current(epoch)?;
+        if let Err(e) = shell.lock().current(epoch) {
+            let _ = std::fs::remove_file(&out); // 返回不了包 ID，留着也无法保存
+            return Err(e);
+        }
     }
     Ok(json!({ "id": id, "preview": preview }))
 }

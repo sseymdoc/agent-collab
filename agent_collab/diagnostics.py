@@ -124,7 +124,15 @@ class Redactor:
                 result[self.text(name)] = item
             return result
         if isinstance(value, list):
-            return [self.value(item) for item in value]
+            # argv 数组（例如 JSON 日志里的 ["tool", "--password", "x"]）：口令类选项后面的那一项按凭据替换。
+            result, secret_next = [], False
+            for item in value:
+                if secret_next and isinstance(item, str):
+                    result.append(self.mark('argument'))
+                else:
+                    result.append(self.value(item))
+                secret_next = isinstance(item, str) and bool(re.fullmatch(r'(?i)--?[\w-]*(?:password|passwd|secret|token)', item))
+            return result
         return self.text(value) if isinstance(value, str) else value
 
 

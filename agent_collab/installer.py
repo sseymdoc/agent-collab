@@ -1481,7 +1481,8 @@ def remember_trust(prefix, journal, source):
     pinned = prefix / 'trust/allowed_signers'
     if (pinned.read_bytes() if pinned.is_file() else None) != source['previous_trust']:
         raise ValueError('pinned trust changed concurrently; rerun verification')
-    if source['trust'] is not None and source['trust'] != source['previous_trust']:
+    # 同一事务里已经登记过（例如升级换了一次、恢复时又换一次）：保留事务开始前的那份，回退要回到它。
+    if source['trust'] is not None and source['trust'] != source['previous_trust'] and not journal.value.get('trust_changed'):
         previous = source['previous_trust']
         journal.value.update(trust_changed=True, trust_before=None if previous is None else previous.decode('latin-1'))
         journal.save()

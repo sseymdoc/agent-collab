@@ -350,6 +350,8 @@ pub struct Updates {
     /// 已下载并验签的更新包：版本、所属通道与字节。
     bytes: Mutex<Option<(String, String, Vec<u8>)>>,
     last_check: Mutex<Option<Value>>,
+    /// 每次换通道加一：下载开始时记下，完成时不同就作废（A→B→A 来回切换也算换过）。
+    generation: std::sync::atomic::AtomicU64,
     /// 下载或安装进行中。
     running: tokio::sync::Mutex<()>,
 }
@@ -429,6 +431,7 @@ pub fn update_settings(
     write_json(&settings_path(&app)?, &settings)?;
     if changed {
         // 换了通道：上一个通道检查到的版本与下载好的包都作废。
+        updates.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *bytes = None;
         *lock(&updates.offer) = None;
         *lock(&updates.last_check) = None;
@@ -534,6 +537,7 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
         (offer.update.clone(), offer.channel.clone(), offer.manifest.clone())
     };
     let (update, channel, offer_manifest) = update;
+    let generation = updates.generation.load(std::sync::atomic::Ordering::SeqCst);
     let mut journal = Journal::new(&current_version(&app), &update.version, &load_settings(&app).channel);
     journal.mark("compat", "done", None);
     journal.mark("download", "running", None);
@@ -566,7 +570,7 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
             save_journal(&app, &journal)?;
             let size = bytes.len();
             let mut slot = lock(&updates.bytes);
-            if load_settings(&app).channel != channel {
+            if load_settings(&app).channel != channel || updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                 drop(slot);
                 journal.finish("failed", Some("下载期间更新通道已经改变，本次下载作废".into()));
                 save_journal(&app, &journal)?;
