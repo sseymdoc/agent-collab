@@ -501,8 +501,9 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
         }
         same_channel(&app, offer)?;
         same_controller(offer, &features)?;
-        offer.update.clone()
+        (offer.update.clone(), offer.channel.clone())
     };
+    let (update, channel) = update;
     let mut journal = Journal::new(&current_version(&app), &update.version, &load_settings(&app).channel);
     journal.mark("compat", "done", None);
     journal.mark("download", "running", None);
@@ -525,6 +526,9 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
             journal.finish("running", None);
             save_journal(&app, &journal)?;
             let size = bytes.len();
+            if load_settings(&app).channel != channel {
+                return Err(invalid("下载期间更新通道已经改变，这次下载不再使用；先重新检查更新"));
+            }
             *lock(&updates.bytes) = Some((update.version.clone(), bytes));
             Ok(json!({ "version": update.version, "bytes": size, "op_id": journal.op_id }))
         }

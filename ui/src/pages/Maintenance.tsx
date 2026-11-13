@@ -53,7 +53,8 @@ function DesktopUpdate() {
   if (!st) return <Section title="桌面端更新">{err ? <p className="err">{err}</p> : <p className="muted">读取中…</p>}</Section>
   const id = st.identity
   const settings = st.settings
-  const save = (patch: any) => run('保存中…', async () => { await invoke('update_settings', { ...settings, ...patch }) })
+  // 换通道时上一个通道的检查结果作废（外壳同时清掉已检查的版本与下载）。
+  const save = (patch: any) => run('保存中…', async () => { await invoke('update_settings', { ...settings, ...patch }); if (patch.channel !== undefined) setCheck(null) })
   const features: string[] = session()?.controller?.features ?? []
   const offer = check?.available ? check : st.offer ? { available: true, ...st.offer } : null
   const verdict = offer?.compat?.verdict

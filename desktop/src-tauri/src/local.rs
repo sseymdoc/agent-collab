@@ -440,6 +440,8 @@ pub async fn node_unbind(app: AppHandle, shell: State<'_, Shell>, project_id: St
 fn diagnostics_dir(app: &AppHandle) -> Result<PathBuf> {
     let dir = data_dir(app)?.join("diagnostics");
     std::fs::create_dir_all(&dir).map_err(io)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).map_err(io)?;
     Ok(dir)
 }
 

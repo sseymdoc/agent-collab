@@ -489,6 +489,12 @@ def gate(args):
             value = json.loads(latest.read_text(encoding='utf-8'))
             check(channel + '/latest.json 版本一致且各平台完整', value['version'] == first['desktop_version'] and set(value['platforms']) == have,
                   str(sorted(value['platforms'])))
+            manifest_file = dist / channel / 'product-manifest.json'
+            try:
+                parsed = json.loads(manifest_file.read_text(encoding='utf-8')).get('release_id') == first['desktop_version']
+            except (OSError, ValueError, AttributeError):
+                parsed = False
+            check(channel + '/product-manifest.json 存在、可解析且版本一致', parsed)
             check(channel + '/product-manifest.json 有签名', (dist / channel / 'product-manifest.json.sig').is_file())
             # latest.json 里的签名与平台片段一致；更新包放在通道目录里分发时（没有 --download-base），那份副本的字节也要一致。
             for f in found:

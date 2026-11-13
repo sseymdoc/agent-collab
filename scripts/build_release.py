@@ -40,6 +40,10 @@ def check_protocol(protocol):
     missing = {'worker_requires', 'worker_optional', 'controller_min_worker', 'client_requires', 'client_optional'} - set(compat)
     if missing:
         raise ValueError('COMPAT must declare: ' + ', '.join(sorted(missing)))
+    unknown = set(compat) - {'worker_requires', 'worker_optional', 'worker_min_controller', 'controller_min_worker',
+                             'client_requires', 'client_optional'}
+    if unknown:
+        raise ValueError('unknown COMPAT keys: ' + ', '.join(sorted(unknown)))
     for key, value in compat.items():
         if key.endswith(('_requires', '_optional')):
             if names(value, 'COMPAT.' + key) - own:

@@ -101,7 +101,9 @@ class Redactor:
             for key, item in value.items():
                 name = str(key)
                 normalized = normalized_key(name)
+                # auth 与 *_auth_config（例如容器仓库的 auths）里是编码后的凭据，短值也替换。
                 if (SECRET_KEY.search(normalized) or re.search(r'(?:^|[_-])cookie(?:$|[_-])', normalized) or
+                        normalized == 'auth' or normalized.endswith('_auth_config') or
                         normalized in ('authorization', 'proxy-authorization', 'x-coordinator-token')):
                     item = self.mark('field')
                 elif normalized in CONTENT_KEYS:
@@ -242,7 +244,12 @@ def collect(args):
         projects = [v['path'] for v in bindings.values() if isinstance(v, dict) and isinstance(v.get('path'), str)]
     except (OSError, ValueError, AttributeError):
         notes.append('项目绑定缺失或不可读；只使用通用路径规则')
-    attempts, attempts_truncated = attempt_directories(state)
+    try:
+        attempts, attempts_truncated = attempt_directories(state)
+    except OSError:
+        # attempt 目录坏了（例如成了普通文件）只影响依赖它的部分。
+        attempts, attempts_truncated = [], False
+        notes.append('attempt 目录不可读；没有收集 attempt 相关的令牌与任务日志')
     # 仅这些本产品令牌用于内存中的精确替换；不导出、不打印，不读客户端或官方 CLI 凭据。
     token_paths = [state / 'worker/node.token', state / 'controller/admin.token']
     token_paths += [folder / 'lease.token' for folder in attempts]

@@ -925,9 +925,11 @@ impl BlobSink {
     fn create(dir: &Path) -> Result<Self> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let path = dir.join(format!(".agent-collab-{}-{nanos:08x}.part", std::process::id()));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
             .open(&path)
             .map_err(|e| io(format!("无法在目标目录创建临时文件：{e}")))?;
         Ok(Self { path, file: Some(file), hasher: Sha256::new(), bytes: 0 })

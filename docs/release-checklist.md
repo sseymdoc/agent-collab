@@ -78,7 +78,7 @@
 
 首选公开仓库 `<owner>/agent-collab` 的 Releases，不默认新增下载站、域名或对象存储。
 
-- **版本化产物放 Release 附件**：tag `desktop-v<版本>`（例如 `desktop-v0.3.0`）。附件：`agent-collab-desktop-<版本>-windows-x64-setup.exe` 与 `.sig`、`agent-collab-desktop-<版本>-macos-arm64.dmg`、`agent-collab-desktop-<版本>-macos-arm64.app.tar.gz` 与 `.sig`、`agent-collab-<后台版本>.tar.gz` 与 `.sig`、`allowed_signers`、`product-manifest.json` 与 `.sig`（存档）、`SHA256SUMS`。下载地址模板：`https://github.com/<owner>/agent-collab/releases/download/desktop-v<版本>/<文件名>`，即 `manifest --download-base` 的值；更新包下载会重定向到 GitHub 的文件服务器，updater 跟随重定向。内部测试身份的文件不上传。
+- **版本化产物放 Release 附件**：tag `desktop-v<版本>`（例如 `desktop-v0.3.0`）。附件：`agent-collab-desktop-<版本>-windows-x64-setup.exe` 与 `.sig`、`agent-collab-desktop-<版本>-macos-arm64.dmg`、`agent-collab-desktop-<版本>-macos-arm64.app.tar.gz` 与 `.sig`、`agent-collab-<后台版本>.tar.gz` 与 `.sig`、`allowed_signers`、`product-manifest.json` 与 `.sig`（存档）、`SHA256SUMS`。下载地址模板：`https://github.com/<owner>/agent-collab/releases/download/desktop-v<版本>/<文件名>`；`manifest --download-base` 的值是去掉文件名的部分（`…/releases/download/desktop-v<版本>`），文件名由 `manifest` 追加；更新包下载会重定向到 GitHub 的文件服务器，updater 跟随重定向。内部测试身份的文件不上传。
 - **通道文件放不重定向的 https 地址**：桌面端按 `<通道根>/<通道>/latest.json`、`<通道根>/<通道>/product-manifest.json(.sig)` 取，取产品发行清单时**不跟随重定向**（`update.rs` 的 `fetch`），而 Release 附件的下载地址都会重定向，所以通道文件不能放 Release 附件。通道文件放同一仓库的 GitHub Pages：通道根 `https://<owner>.github.io/agent-collab/desktop`（项目 Pages 没有自定义域名时直接返回 200，不跳转）。通道根编进正式版程序，以后给 Pages 配自定义域名会变成 301，取清单会失败，所以不要配；确需迁移时先发一个带新通道根的版本。Pages 的内容有缓存，推送后要等几分钟才对所有用户生效，回退同样。
 - **通道与“最新 Release”分开**：桌面 stable 只由 `stable/latest.json` 决定，不使用 GitHub 的 `releases/latest`（仓库里别的发布也可能成为“最新”）。
 - **动作与条件**（各自独立，前一步不授权后一步）：

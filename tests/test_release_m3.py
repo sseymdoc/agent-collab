@@ -102,7 +102,8 @@ class ProtocolCheckTests(unittest.TestCase):
                     {'COMPAT': dict(protocol.COMPAT, worker_requires='clients')},
                     {'COMPAT': dict(protocol.COMPAT, client_requires=('not-a-feature',))},
                     {'COMPAT': dict(protocol.COMPAT, worker_optional=('not-a-feature',))},
-                    {'COMPAT': {k: v for k, v in protocol.COMPAT.items() if k != 'worker_requires'}}):
+                    {'COMPAT': {k: v for k, v in protocol.COMPAT.items() if k != 'worker_requires'}},
+                    {'COMPAT': dict(protocol.COMPAT, workers_min_controller='9.0.0')}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 legacy.builder.check_protocol(dict(good, **bad))
 

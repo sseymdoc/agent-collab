@@ -311,6 +311,21 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertNotIn(value, json.dumps(clean))
         self.assertNotIn('short', redactor.text('Cookie: sid=short'))
 
+    def test_registry_auth_values_are_redacted_even_when_short(self):
+        redactor = d.Redactor(home='/home/u', username='u', hostname='h')
+        clean = redactor.value({'DOCKER_AUTH_CONFIG': json.dumps({'auths': {'registry.example': {'auth': 'dXNlcjpwYXNz'}}}),
+                                'auth_health': 'ok'})
+        self.assertNotIn('dXNlcjpwYXNz', json.dumps(clean))
+        self.assertEqual(clean['auth_health'], 'ok')
+
+    def test_unreadable_attempt_directory_leaves_the_rest_of_the_export(self):
+        import shutil
+        shutil.rmtree(self.state / 'worker/attempts')
+        self.write(self.state / 'worker/attempts', 'not a directory')
+        status, _, error = self.run_cli()
+        self.assertEqual(status, 0, error)
+        self.assertIn('runtime', self.report()['sections'])
+
     def test_bare_basic_and_bearer_credentials_are_redacted(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')
         clean = redactor.text('ERROR Basic dXNlcjpwYXNz then Bearer abc')

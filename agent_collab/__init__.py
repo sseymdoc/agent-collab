@@ -6,3 +6,4 @@ __version__ = '0.1.0.dev0'
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         _stream.reconfigure(errors='backslashreplace')
+del _stream
