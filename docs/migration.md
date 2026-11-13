@@ -154,7 +154,7 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 - 已排空且不可达的旧节点记录：升级后用节点退役（`docs/protocol.md` §13.5）处理，保留历史引用；它们不计入“节点都上报模型目录”的条件。
 - 正式身份的发行（ADR 0004）已签名、公证并经门禁：生产机器上只装正式身份的桌面端；候选与内部测试身份（`cand`、`itest`）不用于生产。正式版的实例为空，与命令行安装的生产节点是同一前缀：桌面端发现它时只报告，接管走切换步骤，不经向导替换。
 - 升级顺序与兼容：先节点、后 controller；每次升级前用 `agent-collab release compat --release <发行包> --as worker|controller` 核对目标 controller（或现有节点），结论为 reject 时不升级。
-- 每个节点升级前 `GET /nodes` 的 `pending_writebacks` 为 0、节点本机没有 claimed/queued/running/finished 的写回操作（安装器会拒绝）；有待确认的写回先在项目页处理。
+- 每个节点升级前 `GET /nodes` 的 `pending_writebacks` 为 0、节点本机没有 claimed/queued/running/finished 的写回操作、也没有已开始未上报的契约自动回写（安装器会拒绝）；有待确认的写回先在项目页处理。
 - 生产节点的发行包带 OpenSSH 来源签名，第一次经新安装器升级时固定 `allowed_signers`（正式发行密钥，不是测试密钥）。
 - 当天的实例外备份用 `agent-collab maintenance backup` 创建、`export` 导出到 controller 主机之外并核对哈希；恢复预览的 verdict 与身份结转计划随切换记录保存。
 - Windows 生产节点仍是 rc10：它的周期认证探测会弹出控制台窗口（M3 联调里实测到），升级到含 `CREATE_NO_WINDOW` 修复的版本后消失；本机 controller 的计划任务改用 `pythonw.exe` 也只在新版本里。

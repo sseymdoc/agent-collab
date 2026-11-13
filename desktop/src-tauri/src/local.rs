@@ -556,6 +556,11 @@ pub async fn diagnostics_save(window: tauri::WebviewWindow, app: AppHandle, id: 
     let Some(dest) = super::dialog::save(&window, format!("agent-collab-diagnostics-{}.zip", &id[..8])).await? else {
         return Ok(json!({ "cancelled": true }));
     };
+    // 选中的就是暂存包本身（含目录别名）：它已经在那里，不复制，也不能在最后删掉。
+    if std::fs::canonicalize(&dest).ok().zip(std::fs::canonicalize(&file).ok()).is_some_and(|(a, b)| a == b) {
+        let bytes = std::fs::metadata(&file).map_err(io)?.len();
+        return Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes }));
+    }
     // 先复制到目标目录里的临时文件，成功后再改名覆盖：复制中途出错不会损坏用户原有的同名文件。
     // 临时文件名不可预测，并以 create_new 独占创建：不会覆盖已有文件，也不会跟随同名链接。
     let staging = dest.with_file_name(format!(".agent-collab-diagnostics-{}.part", uuid::Uuid::new_v4()));

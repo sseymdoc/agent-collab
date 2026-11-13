@@ -1012,6 +1012,9 @@ async fn blob_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, s
     Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes }))
 }
 
+/// 备份导出（生成归档与下载）的总时限。
+const BACKUP_EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// 把 controller 上的一份备份导出到这台机器（“另存为”选定的位置），之后它才算实例外的备份。
 /// 归档的 SHA-256 由 controller 在响应头里给出（`X-Content-SHA256`），落盘前核对，不符则不保存。
 /// 备份含任务、项目与设置等敏感数据：只存到用户自己选的位置，不进入诊断导出。
@@ -1027,7 +1030,8 @@ async fn backup_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64,
     };
     shell.lock().current(epoch)?;
     let _exporting = Exporting::start(&shell)?;
-    let mut response = shell.send(epoch, &active, active.http.api.get(url)).await?;
+    // controller 先生成并核对归档再回响应头，大备份可能超过常规客户端 60 秒的读超时：用不带读超时的客户端，整体限时。
+    let mut response = shell.send(epoch, &active, active.http.bulk.get(url).timeout(BACKUP_EXPORT_TIMEOUT)).await?;
     if !response.status().is_success() {
         let status = response.status();
         let body = read_body(response).await.unwrap_or_default();

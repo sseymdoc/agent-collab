@@ -277,9 +277,11 @@ class MaintenanceTests(ClientCase):
                     ('project_plan', 'requested', 'plan'), ('probe', 'received', 'probe'), ('project_apply', 'failed', 'done')]):
                 self.app.store.put('node_op', str(i), dict(op_id=str(i), node_id='a', kind=kind, status=status,
                     params=dict(application_id=application), deadline_at='2099-01-01T00:00:00.000Z', finished_at=None))
+            self.app.store.put('integration_target', 'it', dict(target_node_id='b', pending=dict(job_id='job-b')))
+            self.app.store.put('integration_target', 'idle', dict(target_node_id='a', pending=None))
         nodes = {n['node_id']: n for n in self.call('GET', '/nodes')['nodes']}
         self.assertEqual(nodes['a']['pending_writebacks'], 3)
-        self.assertEqual(nodes['b']['pending_writebacks'], 1)
+        self.assertEqual(nodes['b']['pending_writebacks'], 2)
 
     def successful(self):
         node = self.node()
@@ -461,6 +463,16 @@ class MaintenanceTests(ClientCase):
         self.assertEqual(preview['verdict'], 'safe', preview)
         self.app.store.prune_events(1)
         self.assertEqual(self.call('GET', '/maintenance/restore-preview?backup_id=' + ident)['verdict'], 'needs_reconcile')
+
+    def test_download_registered_after_backup_needs_reconcile(self):
+        job = self.job()
+        ident, source = self.create_backup()
+        self.assertEqual(m.restore_preview(self.app.store, source, activity={'disposable': True})['verdict'], 'safe')
+        with self.app.store.transaction():
+            self.app.store.put('download', 'd1', dict(download_id='d1', job_id=job['job_id'], checkpoint_id='cp'))
+        preview = m.restore_preview(self.app.store, source, activity={'disposable': True})
+        self.assertEqual(preview['verdict'], 'needs_reconcile')
+        self.assertIn('download', [c['kind'] for c in preview['changes']])
 
     def test_restore_does_not_redispatch_snapshot_writebacks_and_carries_scope_reduction(self):
         client = self.pair('owner', name='reduced')

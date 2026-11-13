@@ -448,7 +448,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - `GET /events?before=<seq>&limit=<n>`（read）→ `{"events": [...], "min_seq"}`：序号小于 `before` 的最近 `limit` 条全局事件，按序号升序；`before=0` 表示从最新一条开始。用于从新到旧翻看活动。不带 `before` 时仍是 `after=<seq>` 的向后续读。
 - `GET /jobs/{id}/events?before=<seq>&limit=<n>`（read）→ `{"events": [...]}`：该 job 序号小于 `before` 的事件，按序号升序，最多 `limit` 条（1–1000，缺省 200）。
 - `GET /nodes` 的每个节点带 `attempts`：该节点上有效（assigned、leased、running）的 attempt，`[{"attempt_id", "job_id", "title", "status", "epoch", "lease_expires_at", "harness", "model", "effort", "coordinates"}]`；`coordinates` 为 true 表示它是受管协调回合。
-- `GET /nodes`（包括 `retired=1`）的每个节点带整数 `pending_writebacks`：该节点状态为 `requested/received` 的 `project_apply/project_recover` 操作，加上 `target_node_id` 为该节点且状态为 `started` 的应用，按 `application_id` 去重。同一应用的写入与恢复操作只算一项；没有应用 ID 的操作各算一项。其他种类、已结束操作、本机应用不计入。
+- `GET /nodes`（包括 `retired=1`）的每个节点带整数 `pending_writebacks`：该节点状态为 `requested/received` 的 `project_apply/project_recover` 操作，加上 `target_node_id` 为该节点且状态为 `started` 的应用，按 `application_id` 去重；再加上 `target_node_id` 为该节点、仍有待写入条目（`pending`）的契约自动回写，每个任务算一项。同一应用的写入与恢复操作只算一项；没有应用 ID 的操作各算一项。其他种类、已结束操作、本机应用不计入。
 - `GET /checkpoints/{id}/files`（read）→ `{"checkpoint_id", "manifest_sha256", "files": [{"path", "sha256", "size", "executable"}]}`；文件内容用 `GET /blobs/<sha256>` 读取。
 
 ## 13. 项目、输入与成果应用、节点管理（向后兼容；旧字段语义不变）

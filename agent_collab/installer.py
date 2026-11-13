@@ -973,6 +973,14 @@ def refuse_active_worker(config, allow_active=False):
             raise ValueError('Worker writeback record unreadable; cannot prove idle') from None
         if state in ('claimed', 'queued', 'running', 'finished'):
             counts[state] = counts.get(state, 0) + 1
+    for path in (Path(config['state_dir']) / 'worker/integrations').glob('*/*/progress.json'):
+        try:
+            progress = read_json(path)
+            busy = progress['started'] and not progress['reported']
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ValueError('Worker integration record unreadable; cannot prove idle') from None
+        if busy:
+            counts['integrating'] = counts.get('integrating', 0) + 1
     if counts:
         raise ValueError('Worker has {} pending writebacks ({}); drain first, or explicitly pass --allow-active'.format(
             sum(counts.values()), ', '.join('{}={}'.format(k, v) for k, v in sorted(counts.items()))))
@@ -1522,7 +1530,8 @@ def release_compatibility(config, manifest):
                 nodes = client.json('GET', '/nodes')['nodes']
             except (APIError, ConnectionFailure):
                 pass
-    except (OSError, ConnectionFailure, APIError):
+    except (OSError, RuntimeError, ConnectionFailure, APIError):
+        # RuntimeError：受管 Linux 首次安装时服务账户与 admin.token 还不存在，读令牌的命令失败。
         return dict(decision='degraded', unchecked=['controller 不可达或缺少获授权的管理凭据；未核对在线兼容性'])
     results = [evaluate_compat(manifest, info, kind, nodes) for kind in components(config)]
     for result in results:
@@ -1878,12 +1887,16 @@ def recover_update(config, old, args):
             validate_paths(saved['config'], saved)
         if before == target:
             raise ValueError('same-version update cannot be located relative to switch; manual review required')
+        # 接管旧事务留下的锁时不删锁目录（删掉再建之间别的安装能抢到它），只原子改写 owner.json。
         if lock.exists():
             if set(p.name for p in lock.iterdir()) - {'owner.json'}:
                 raise ValueError('unexpected install lock contents; manual review required')
-            (lock / 'owner.json').unlink(missing_ok=True)
-            lock.rmdir()
-        lock.mkdir()
+        else:
+            try:
+                lock.mkdir()
+            except FileExistsError:
+                owned = False  # 锁归另一个安装进程：不改它的 journal
+                raise ValueError('another installation took the install lock; retry recovery after it finishes') from None
         write_json(lock / 'owner.json', dict(pid=os.getpid()))
         value.update(pid=os.getpid(), status='running', recovered_at=timestamp())
         journal.save()
@@ -1932,7 +1945,10 @@ def recover_update(config, old, args):
             write_launchers(active_config)
             manager.register()
         if back:
+            started_at = time.time()
             start_desired(manager, active_config, desired)
+            if active_config['service'] and desired.get('worker') == 'running' and (directory / 'agent_collab/release.py').is_file():
+                wait_worker_status(active_config, directory, manifest, started_at, timeout=min(60, args.health_timeout))
             wait_doctor(active_config, args.health_timeout if active_config['service'] else 0, desired=desired)
             restore_drain(journal, active_config)
             write_json(prefix / 'installation.json', dict(saved, desired=desired))

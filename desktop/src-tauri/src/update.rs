@@ -342,9 +342,21 @@ fn same_controller(offer: &Offer, features: &Option<Vec<String>>) -> Result<()> 
     Ok(())
 }
 
+/// 当前设置的通道。设置文件读不出或损坏时报错，不拿缺省通道去核对检查或下载的结果。
+fn usable_channel((settings, broken): (Settings, bool)) -> Result<String> {
+    if broken {
+        return Err(invalid("更新设置文件读不出或已损坏：请在维护页重新保存更新设置"));
+    }
+    Ok(settings.channel)
+}
+
+fn settings_channel(app: &AppHandle) -> Result<String> {
+    usable_channel(read_settings(app))
+}
+
 /// 下载与安装前核对：这次检查的通道仍是当前设置的通道。
 fn same_channel(app: &AppHandle, offer: &Offer) -> Result<()> {
-    if offer.channel != load_settings(app).channel {
+    if offer.channel != settings_channel(app)? {
         return Err(invalid("更新通道已经改变，先重新检查更新"));
     }
     Ok(())
@@ -437,11 +449,11 @@ pub fn update_settings(
     if !channels().contains(&channel.as_str()) {
         return Err(invalid(format!("这个构建只有这些通道：{}", channels().join("、"))));
     }
+    // 先写入新通道再作废缓存，并在持有下载缓存的锁时写入：完成的下载在同一把锁下核对通道，
+    // 两边怎样交错都不会把旧通道的字节留在缓存里。是否换了通道也在锁内判断：两个并发的保存不会都以为没换。
+    let mut bytes = lock(&updates.bytes);
     let changed = load_settings(&app).channel != channel;
     let settings = Settings { channel, auto_check, auto_download, auto_install };
-    // 先写入新通道再作废缓存，并在持有下载缓存的锁时写入：完成的下载在同一把锁下核对通道，
-    // 两边怎样交错都不会把旧通道的字节留在缓存里。
-    let mut bytes = lock(&updates.bytes);
     write_json(&settings_path(&app)?, &settings)?;
     if changed {
         // 换了通道：上一个通道检查到的版本与下载好的包都作废。
@@ -590,7 +602,7 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
             save_journal(&app, &journal)?;
             let size = bytes.len();
             let mut slot = lock(&updates.bytes);
-            if load_settings(&app).channel != channel || updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            if settings_channel(&app).ok().as_ref() != Some(&channel) || updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                 drop(slot);
                 journal.finish("failed", Some("下载期间更新通道已经改变，本次下载作废".into()));
                 save_journal(&app, &journal)?;
@@ -640,12 +652,19 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
     // 安装程序要替换随包运行时，正在运行的本机助手占着它的文件（Windows 上写不进去）：关闸，等它们结束（最多 60 秒，
     // 等不到就这次不安装、不结束它们）；安装程序没能接管时重新开闸（helper::Gate::exclusive）。
     let version = update.version.clone();
+    let expected = channel.clone();
     let installing = tauri::async_runtime::spawn_blocking(move || {
         let result = helper::GATE.exclusive(Duration::from_secs(60), || {
             // 等助手的这段时间里可能开始了新的操作（例如备份导出）：关闸之后再核对一次空闲条件。
             let blocked = blockers(&app.state::<Shell>());
             if !blocked.is_empty() {
                 return Err(err("busy", format!("现在不能安装：{}", blocked.join("；"))));
+            }
+            // 与 update_settings 同一把锁：核对通道代次后一直持有到安装程序接管，等待期间换过通道就不装旧通道的包。
+            let updates = app.state::<Updates>();
+            let held = lock(&updates.bytes);
+            if updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation || settings_channel(&app).ok() != Some(expected) {
+                return Err(invalid("等待期间切换了更新通道或设置已损坏，这次不安装，请重新检查"));
             }
             let mut journal = journals(&journal_dir(&app)?)
                 .into_iter()
@@ -663,6 +682,7 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
                 save_journal(&app, &journal)?;
                 return Err(update_error(e));
             }
+            drop(held);
             Ok(app)
         });
         (result, bytes)
@@ -751,6 +771,13 @@ pub fn pep440_key(version: &str) -> Option<(Vec<u64>, u8, u64, u8, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_settings_never_stand_in_for_the_channel() {
+        assert!(usable_channel((Settings::cautious(), true)).is_err());
+        let channel = Settings::defaults().channel;
+        assert_eq!(usable_channel((Settings::defaults(), false)).ok(), Some(channel));
+    }
 
     #[test]
     fn downloaded_bytes_must_match_the_manifest_entry_for_this_platform() {

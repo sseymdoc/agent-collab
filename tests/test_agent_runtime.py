@@ -639,12 +639,22 @@ class XcodeShimTests(unittest.TestCase):
         calls = []
         missing = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 2)
         present = lambda argv, **kw: subprocess.CompletedProcess(argv, 0)
-        with patch.object(commands.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name):
+        with patch.object(commands.shutil, 'which', side_effect=lambda name, path=None: None if path else '/usr/bin/' + name):
             self.assertIsNone(commands.which('git', system='Darwin', runner=missing))
             self.assertEqual(calls, [['/usr/bin/xcode-select', '-p']])  # 只查询，不运行 git 本身
             self.assertEqual(commands.which('git', system='Darwin', runner=present), '/usr/bin/git')
             self.assertEqual(commands.which('git', system='Linux', runner=missing), '/usr/bin/git')
             self.assertEqual(commands.which('node', system='Darwin', runner=missing), '/usr/bin/node')
+
+    def test_real_tool_later_in_path_is_found_after_a_shim(self):
+        from agent_collab.adapters import commands
+        import subprocess
+        missing = lambda argv, **kw: subprocess.CompletedProcess(argv, 2)
+        found = lambda name, path=None: '/usr/bin/' + name if path is None else (
+            '/opt/homebrew/bin/' + name if '/opt/homebrew/bin' in path.split(os.pathsep) and '/usr/bin' not in path.split(os.pathsep) else None)
+        with patch.object(commands.shutil, 'which', side_effect=found), \
+                patch.dict(commands.os.environ, {'PATH': os.pathsep.join(['/usr/bin', '/opt/homebrew/bin'])}):
+            self.assertEqual(commands.which('git', system='Darwin', runner=missing), '/opt/homebrew/bin/git')
 
     def test_detect_and_git_scan_do_not_run_shims_on_a_clean_mac(self):
         import subprocess
@@ -652,7 +662,7 @@ class XcodeShimTests(unittest.TestCase):
         probed = []
         commands = {name: dict(argv=[], env={}, disabled=None) for name in ('codex', 'claude')}
         with patch('agent_collab.adapters.commands.platform.system', return_value='Darwin'), \
-             patch('agent_collab.adapters.commands.shutil.which', side_effect=lambda name: '/usr/bin/' + name if name in ('git', 'python3') else None), \
+             patch('agent_collab.adapters.commands.shutil.which', side_effect=lambda name, path=None: '/usr/bin/' + name if name in ('git', 'python3') and path is None else None), \
              patch('agent_collab.adapters.commands.subprocess.run', return_value=subprocess.CompletedProcess([], 2)), \
              patch('agent_collab.node_agent.probe', side_effect=lambda argv, **kw: probed.append(argv)):
             tools = detect(commands=commands)['tools']

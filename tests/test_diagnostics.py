@@ -484,6 +484,16 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertNotIn(secret, data)
             self.assertNotIn(secret, output)
 
+    def test_acronym_credential_keys_are_redacted_in_the_export(self):
+        self.write(self.state / 'worker/agent.log', '{"level":"ERROR","APIToken":"synthetic-short-acro","OAuthSecret":"another-short"}')
+        status, output, _ = self.run_cli()
+        self.assertEqual(status, 0)
+        with zipfile.ZipFile(self.output) as archive:
+            data = ''.join(archive.read(name).decode('utf-8') for name in archive.namelist())
+        for secret in ('synthetic-short-acro', 'another-short'):
+            self.assertNotIn(secret, data)
+            self.assertNotIn(secret, output)
+
     def test_recent_errors_are_bounded(self):
         self.write(self.state / 'worker/agent.log', '\n'.join('error %d' % i for i in range(100)))
         self.assertEqual(self.run_cli()[0], 0)

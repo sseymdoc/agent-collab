@@ -120,6 +120,10 @@ def pending_writebacks(store, node_id):
         if op['node_id'] == node_id and op['kind'] in ('project_apply', 'project_recover') and op['status'] in ('requested', 'received'):
             ident = op.get('params', {}).get('application_id')
             pending.add(('application', ident) if ident else ('operation', op['op_id']))
+    # 契约自动回写：controller 还在等这个节点写入并上报的条目。
+    for record in store.all('integration_target'):
+        if record.get('target_node_id') == node_id and record.get('pending'):
+            pending.add(('integration', record['pending'].get('job_id')))
     return len(pending)
 
 
@@ -186,7 +190,7 @@ def restore_preview(store, source, activity=None, work_dir=None):
     current = records(store.db)
     plan = identities(saved, current)
     kinds = {'job', 'attempt', 'checkpoint', 'assessment', 'publication', 'application', 'integration_target',
-             'project', 'settings', 'client', 'node', 'client_token', 'node_token', 'baseline', 'dismissal', 'effects', 'node_op'}
+             'project', 'settings', 'client', 'node', 'client_token', 'node_token', 'baseline', 'dismissal', 'effects', 'node_op', 'download'}
     changes, reconcile = [], False
     jobs = {ident: value for (kind, ident), value in current.items() if kind == 'job'}
     def disposable_job(ident):
@@ -215,7 +219,7 @@ def restore_preview(store, source, activity=None, work_dir=None):
         if kind in ('client', 'node'):
             entry.update(revoked_at=value.get('revoked_at'), retired_at=value.get('retired_at'),
                          consequence='撤销/退役不会复活；备份后新增身份需重新配对。')
-        safe = kind in ('job', 'attempt', 'checkpoint', 'assessment', 'publication', 'dismissal') and disposable_job(
+        safe = kind in ('job', 'attempt', 'checkpoint', 'assessment', 'publication', 'dismissal', 'download') and disposable_job(
             ident if kind == 'job' else value.get('job_id'))
         if kind in ('application', 'integration_target'):
             entry.update(status=value.get('status'), target_node_id=value.get('target_node_id'),

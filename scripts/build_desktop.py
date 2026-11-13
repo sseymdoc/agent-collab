@@ -86,7 +86,7 @@ def payload_manifest(resources, build):
     for path in sorted(resources.rglob('*')):
         if path.is_symlink():
             raise SystemExit('随包载荷里不应有链接：%s' % path)
-        if path.is_file() and path.name != 'payload.json':
+        if path.is_file() and path != resources / 'payload.json':
             files[path.relative_to(resources).as_posix()] = dict(sha256=sha256(path), size=path.stat().st_size)
     data = json.dumps(dict(schema=1, build=build, files=files), sort_keys=True, separators=(',', ':')).encode()
     (resources / 'payload.json').write_bytes(data)
@@ -230,6 +230,9 @@ def build(args):
     release = Path(args.release)
     shutil.copy2(str(release), str(resources / 'release' / release.name))
     backend = release_manifest(release)
+    # 桌面端只认 agent-collab-<版本>.tar.gz（build.rs、helper::release_version）：改过名的包放进去会找不到。
+    if release.name != 'agent-collab-%s.tar.gz' % backend['version']:
+        raise SystemExit('后台发行包文件名应为 agent-collab-%s.tar.gz（按包内版本），实际是 %s' % (backend['version'], release.name))
     if args.release_signature:
         verify_release_signature(release, args.release_signature, args.allowed_signers)
         shutil.copy2(args.release_signature, str(resources / 'release' / (release.name + '.sig')))

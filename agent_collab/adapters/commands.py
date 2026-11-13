@@ -19,11 +19,14 @@ def which(name, system=None, runner=None):
     path = shutil.which(name)
     if path and name in XCODE_SHIMS and (system or platform.system()) == 'Darwin' and path == '/usr/bin/' + name:
         try:
-            if (runner or subprocess.run)(['/usr/bin/xcode-select', '-p'], capture_output=True, timeout=10,
-                                          stdin=subprocess.DEVNULL).returncode != 0:
-                return None
+            usable = (runner or subprocess.run)(['/usr/bin/xcode-select', '-p'], capture_output=True, timeout=10,
+                                                stdin=subprocess.DEVNULL).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
-            return None
+            usable = False
+        if not usable:
+            # 跳过占位程序所在的 /usr/bin，接着找 PATH 里后面的目录（例如 Homebrew 装的真实工具）。
+            rest = [d for d in os.environ.get('PATH', os.defpath).split(os.pathsep) if d and d.rstrip('/') != '/usr/bin']
+            return shutil.which(name, path=os.pathsep.join(rest)) if rest else None
     return path
 
 

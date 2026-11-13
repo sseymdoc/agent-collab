@@ -33,7 +33,8 @@ CONTENT_KEYS = {'input', 'inputs', 'prompt', 'task_input', 'source', 'source_cod
 
 
 def normalized_key(name):
-    return re.sub(r'([a-z])([A-Z])', r'\1_\2', name).lower()
+    name = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)  # APIToken → API_Token
+    return re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name).lower()
 
 
 def encoded(value):

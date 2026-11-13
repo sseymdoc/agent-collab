@@ -327,6 +327,23 @@ class WritebackTests(unittest.TestCase):
             ins.write_json(path, {'state': 'reported' if '0' in path.name else 'abandoned'})
         ins.refuse_active_worker(config)
 
+    def test_started_unreported_integration_refuses(self):
+        config = {'state_dir': str(self.state), 'role': 'worker'}
+        path = self.state / 'worker/integrations/job/checkpoint/progress.json'
+        path.parent.mkdir(parents=True)
+        ins.write_json(path, {'started': True, 'reported': False})
+        with self.assertRaises(ValueError) as error:
+            ins.refuse_active_worker(config)
+        self.assertIn('integrating=1', str(error.exception))
+        ins.write_json(path, {'started': True, 'reported': True})
+        ins.refuse_active_worker(config)
+
+    def test_first_linux_install_without_admin_token_is_degraded(self):
+        config = {'state_dir': str(self.state), 'role': 'controller', 'system': 'Linux', 'service': True, 'bind': '127.0.0.1:1'}
+        with patch.object(ins, 'run', side_effect=RuntimeError('sudo failed (exit 1)')), \
+                patch.object(ins.os, 'getuid', return_value=501, create=True):
+            self.assertEqual(ins.release_compatibility(config, {})['decision'], 'degraded')
+
     def test_drain_waits_for_writebacks_zero_and_reports_missing_field(self):
         clock = [0]
         client = Mock()
