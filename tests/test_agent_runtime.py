@@ -628,3 +628,37 @@ class RuntimeTests(unittest.TestCase):
             self.cycles(2)
         self.until(lambda: bool(self.fake.completions))
         self.assertEqual(self.fake.completions[assignment['attempt_id']]['failure_class'], 'infra_retryable')
+
+
+class XcodeShimTests(unittest.TestCase):
+    """干净的 macOS（没装开发者工具）上 /usr/bin/git、/usr/bin/python3 只是占位程序：运行它们会在用户桌面弹出安装提示。"""
+
+    def test_shims_without_developer_tools_count_as_missing(self):
+        from agent_collab.adapters import commands
+        import subprocess
+        calls = []
+        missing = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 2)
+        present = lambda argv, **kw: subprocess.CompletedProcess(argv, 0)
+        with patch.object(commands.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name):
+            self.assertIsNone(commands.which('git', system='Darwin', runner=missing))
+            self.assertEqual(calls, [['/usr/bin/xcode-select', '-p']])  # 只查询，不运行 git 本身
+            self.assertEqual(commands.which('git', system='Darwin', runner=present), '/usr/bin/git')
+            self.assertEqual(commands.which('git', system='Linux', runner=missing), '/usr/bin/git')
+            self.assertEqual(commands.which('node', system='Darwin', runner=missing), '/usr/bin/node')
+
+    def test_detect_and_git_scan_do_not_run_shims_on_a_clean_mac(self):
+        import subprocess
+        from agent_collab import project
+        probed = []
+        commands = {name: dict(argv=[], env={}, disabled=None) for name in ('codex', 'claude')}
+        with patch('agent_collab.adapters.commands.platform.system', return_value='Darwin'), \
+             patch('agent_collab.adapters.commands.shutil.which', side_effect=lambda name: '/usr/bin/' + name if name in ('git', 'python3') else None), \
+             patch('agent_collab.adapters.commands.subprocess.run', return_value=subprocess.CompletedProcess([], 2)), \
+             patch('agent_collab.node_agent.probe', side_effect=lambda argv, **kw: probed.append(argv)):
+            tools = detect(commands=commands)['tools']
+            with tempfile.TemporaryDirectory() as root:
+                (Path(root) / '.git').mkdir()
+                self.assertEqual(project.git_info(Path(root)), {'available': False})
+        self.assertIsNone(tools['git'])
+        self.assertIsNone(tools['python3'])
+        self.assertEqual(probed, [])

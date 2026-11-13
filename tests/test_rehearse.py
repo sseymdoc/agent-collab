@@ -121,8 +121,8 @@ class RehearseTests(ControllerCase):
         config.write_text(json.dumps(tc.CONFIG), encoding='utf-8')
         real = rehearse.restore
 
-        def lossy(data, source):
-            generation = real(data, source)
+        def lossy(data, source, **kwargs):
+            generation = real(data, source, **kwargs)
             with sqlite3.connect(str(data / 'controller.db')) as db:
                 first = db.execute('SELECT MIN(seq) FROM events').fetchone()[0]
                 db.execute('DELETE FROM events WHERE seq=?', (first,))
@@ -141,8 +141,8 @@ class RehearseTests(ControllerCase):
         config.write_text(json.dumps(tc.CONFIG), encoding='utf-8')
         real = rehearse.restore
 
-        def reassigned(data, source):
-            generation = real(data, source)
+        def reassigned(data, source, **kwargs):
+            generation = real(data, source, **kwargs)
             with sqlite3.connect(str(data / 'controller.db')) as db:
                 db.execute('UPDATE events SET job_id=? WHERE seq=(SELECT MIN(seq) FROM events WHERE job_id IS NOT NULL)', (str(uuid.uuid4()),))
             db.close()

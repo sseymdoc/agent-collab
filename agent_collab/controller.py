@@ -350,7 +350,8 @@ class App:
                     else:
                         identity = self._authenticate(headers, method)
                         # Expiry is an independent authoritative fact, even when a request is rejected.
-                        self._expire(self.clock())
+                        if not (method in ('GET', 'HEAD') and (route.startswith('/maintenance/') or route == '/settings/backups')):
+                            self._expire(self.clock())
                         self.store.db.execute('SAVEPOINT request')
                         self.request = (identity, method, route)
                         try:
@@ -366,12 +367,16 @@ class App:
             # §12.1：客户端据此确认应答来自它配对的那个 controller。
             result.headers.append(('X-Controller-Id', self.controller_id))
         if is_head:
-            result.headers.append(('Content-Length', str(len(result.body))))
+            if not any(key.lower() == 'content-length' for key, _ in result.headers):
+                result.headers.append(('Content-Length', str(len(result.body))))
             result.body, result.stream = b'', None
         return result
 
     @staticmethod
     def error(exc):
+        from .backup import BackupError
+        if isinstance(exc, BackupError):
+            return APIError(exc.code, str(exc), **exc.details).response()
         if isinstance(exc, APIError):
             return exc.response()
         if isinstance(exc, d.PolicyError):
@@ -448,6 +453,8 @@ class App:
         meta = self.meta()
         return {'controller_id': meta['controller_id'], 'authority_generation': meta['authority_generation'],
                 'version': RELEASE['version'], 'git_commit': RELEASE['git_commit'], 'features': list(p.FEATURES),
+                # 兼容检查（ADR 0004 第 4 条，`agent-collab release compat` 与桌面端更新前的核对）用这两项。
+                'protocol_version': p.PROTOCOL_VERSION, 'compat': p.COMPAT,
                 # 客户端在扫描本地输入时据此判断哪些文件超出上传上限（§13.2）。
                 'limits': {k: self.config[k] for k in ('max_blob_bytes', 'max_json_bytes')}}
 
@@ -2056,6 +2063,9 @@ class App:
             self.coordinator_guard(job['work_package_id'], headers)
             return self.idempotent(route, data, lambda: self._integration(job, data, identity))
         self.allow(identity)
+        if route.startswith('/maintenance/') or route == '/settings/backups':
+            from .maintenance import api
+            return api(self, method, route, query, data, identity)
         if route == '/client':
             # 连接自检与自我撤销不需要任何 scope：只读客户端也要能确认身份、断开连接。
             if method == 'GET':
@@ -2166,6 +2176,10 @@ class App:
                 return self.idempotent(route, data, lambda: self._record_download(job, data, identity))
             if len(pieces) == 3 and method == 'POST' and pieces[2] == 'logs':
                 return self.idempotent(route, data, lambda: self._request_log(job, data, identity))
+            if len(pieces) == 3 and method == 'POST' and pieces[2] == 'dismiss':
+                from .maintenance import dismiss
+                self.coordinator_guard(job['work_package_id'], headers)
+                return self.idempotent(route, data, lambda: dismiss(self, job, data, identity))
             if len(pieces) == 3 and method == 'POST' and pieces[2] in ('cancel', 'retry', 'assess'):
                 if pieces[2] != 'cancel':
                     self.coordinator_guard(job['work_package_id'], headers)
@@ -2209,9 +2223,11 @@ class App:
             action = self._maintenance if pieces[2] == 'maintenance' else self._retire
             return self.idempotent(route, data, lambda: action(node, data, identity))
         if route == '/nodes' and method == 'GET':
+            from .maintenance import pending_writebacks
             if query.get('retired', [''])[0] == '1':
                 # 已退役的节点：只保留身份与历史引用，不带调度信息。
-                return response({'nodes': [n for n in self.store.all('node') if n.get('retired_at')]})
+                return response({'nodes': [dict(n, pending_writebacks=pending_writebacks(self.store, n['node_id']))
+                                            for n in self.store.all('node') if n.get('retired_at')]})
             nodes = []
             jobs = [j for j in self.store.all('job') if j['status'] in ('queued', 'recovering', 'waiting_capability')]
             for node in self.active_nodes():
@@ -2229,6 +2245,7 @@ class App:
                 maintenance = node.get('maintenance')
                 # 维护：已请求但还有任务在跑是 draining，跑完后是 active。
                 nodes.append(dict(node, active_attempts=len(attempts), attempts=current, last_rejection_reasons=reasons,
+                                  pending_writebacks=pending_writebacks(self.store, node['node_id']),
                                   maintenance_state=('draining' if attempts else 'active') if maintenance else 'none'))
             return response({'nodes': nodes})
         if pieces[0] == 'nodes' and len(pieces) == 3 and pieces[2] == 'drain' and method == 'POST':
@@ -2549,6 +2566,8 @@ class App:
         if attempt['status'] != 'succeeded' or job['cancel']['requested_at']:
             raise APIError('conflict', 'publication requires a successful current attempt')
         cp = self.get('checkpoint', data['checkpoint_id'])
+        if self.store.get('dismissal', cp['checkpoint_id']):
+            raise APIError('checkpoint_dismissed', 'checkpoint was explicitly dismissed')
         if cp['attempt_id'] != attempt['attempt_id'] or cp['state'] not in ('durable', 'verified') or cp['kind'] != 'final':
             raise APIError('conflict', 'publication requires the attempt final durable checkpoint')
         if type(data.get('expected_base_version')) is not int or data['expected_base_version'] != job['delivery_version']:
@@ -2882,13 +2901,13 @@ def database_references(db, blobs):
     return references
 
 
-def backup(data_dir, dest, clock=time.time):
+def backup(data_dir, dest, clock=time.time, record_store=None):
     data_dir, dest = Path(data_dir).resolve(), Path(dest).resolve()
     if dest == data_dir or data_dir in dest.parents or dest in data_dir.parents:
         raise ValueError('backup destination must be separate from the data directory')
     if not (data_dir / 'controller.db').is_file():
         raise ValueError('controller database does not exist')
-    dest.mkdir(parents=True, exist_ok=True)
+    dest.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Serialize writers to this backup destination independently of a running server.
     with ControllerLock(dest):
         stage = dest / ('.backup-' + new_id() + '.db')
@@ -2934,13 +2953,18 @@ def backup(data_dir, dest, clock=time.time):
                 stage.unlink()
             if manifest_stage is not None and manifest_stage.exists():
                 manifest_stage.unlink()
-    store = Store(data_dir)
-    try:
-        with store.transaction():
-            store.put('backup', 'latest', {'time': clock(), 'destination': str(dest)})
-            store.event('controller.backup', {'db_sha256': manifest['db_sha256']}, d.timestamp(clock()))
-    finally:
-        store.close()
+    def record(store):
+        store.put('backup', 'latest', {'time': clock(), 'destination': str(dest)})
+        store.event('controller.backup', {'db_sha256': manifest['db_sha256']}, d.timestamp(clock()))
+    if record_store is not None:
+        record(record_store)  # Online maintenance already owns the request transaction.
+    else:
+        store = Store(data_dir)
+        try:
+            with store.transaction():
+                record(store)
+        finally:
+            store.close()
     return manifest
 
 
@@ -3016,6 +3040,12 @@ def barrier(data_dir, request_id, reason, clock=time.time):
                 meta = store.get('meta', 'controller')
                 if not meta['dispatch_paused'] or (meta.get('intake') or {}).get('mode', 'open') == 'open':
                     raise ValueError('barrier requires dispatch to be paused and intake to be closed or restricted first')
+                from .maintenance import pending_results
+                from .backup import BackupError
+                pending = pending_results(store)
+                if pending:
+                    raise BackupError('barrier_pending_results', 'unhandled publishable results: ' +
+                                      ', '.join(item['job_id'] for item in pending), pending_results=pending)
                 before = meta['authority_generation']
                 active = sum(a['status'] in p.ATTEMPT_ACTIVE for a in store.all('attempt'))
                 meta = revoke_execution(store, before + 1, clock, void_unclaimed=True)
@@ -3028,79 +3058,10 @@ def barrier(data_dir, request_id, reason, clock=time.time):
             store.close()
 
 
-def restore(data_dir, source_dir, clock=time.time):
-    data_dir, source_dir = Path(data_dir).resolve(), Path(source_dir).resolve()
-    if data_dir == source_dir or data_dir in source_dir.parents or source_dir in data_dir.parents:
-        raise ValueError('restore source must be separate from the data directory')
-    with ControllerLock(data_dir), ControllerLock(source_dir):
-        manifest = json.loads((source_dir / 'backup-manifest.json').read_text(encoding='utf-8'))
-        if manifest.get('version') != 1 or type(manifest.get('authority_generation')) is not int:
-            raise ValueError('invalid backup manifest')
-        p.check_sha256(manifest['db_sha256'])
-        database_name = manifest.get('database', 'controller.db')
-        if database_name not in ('controller.db', 'controller-' + manifest['db_sha256'] + '.db'):
-            raise ValueError('unsafe backup database name')
-        source_database = source_dir / database_name
-        if file_hash(source_database) != manifest['db_sha256']:
-            raise ValueError('backup database hash mismatch')
-        source_blobs, target_blobs = BlobStore(source_dir), BlobStore(data_dir)
-        listed = {}
-        for entry in manifest['blobs']:
-            digest, size = p.check_sha256(entry['sha256']), entry['size']
-            if type(size) is not int or size < 0 or digest in listed:
-                raise ValueError('invalid blob inventory')
-            if not source_blobs.exists(digest, size) or file_hash(source_blobs.path(digest)) != digest:
-                raise ValueError('backup blob hash/size mismatch')
-            listed[digest] = size
-        source = sqlite3.connect(str(source_database))
-        try:
-            if source.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
-                raise ValueError('backup database integrity check failed')
-            saved_meta = json.loads(source.execute("SELECT data FROM records WHERE kind='meta' AND id='controller'").fetchone()[0])
-            if saved_meta['authority_generation'] != manifest['authority_generation'] or database_references(source, source_blobs) != listed:
-                raise ValueError('backup inventory/generation mismatch')
-        finally:
-            source.close()
-        current_generation, current_seq = 0, 0
-        database = data_dir / 'controller.db'
-        if database.exists():
-            current = Store(data_dir)
-            try:
-                current_generation = current.get('meta', 'controller')['authority_generation']
-                sequence = current.db.execute("SELECT seq FROM sqlite_sequence WHERE name='events'").fetchone()
-                current_seq = sequence[0] if sequence else 0
-                current.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            finally:
-                current.close()
-        for digest, size in listed.items():
-            if not target_blobs.exists(digest, size) or file_hash(target_blobs.path(digest)) != digest:
-                target_blobs.max_bytes = max(target_blobs.max_bytes, size)
-                target_blobs.put(digest, source_blobs.read(digest))
-        stage_dir = data_dir / ('.restore-' + new_id())
-        stage_dir.mkdir()
-        try:
-            shutil.copyfile(str(source_database), str(stage_dir / 'controller.db'))
-            stage = Store(stage_dir)
-            try:
-                with stage.transaction():
-                    stage.db.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='events'", (current_seq,))
-                    # Backup rollback loses live facts; freeze execution until explicit reconciliation.
-                    meta = revoke_execution(stage, max(current_generation, manifest['authority_generation']) + 1, clock)
-                    stage.db.execute("DELETE FROM records WHERE kind='session'")
-                    stage.event('controller.restored', {'authority_generation': meta['authority_generation']}, d.timestamp(clock()))
-                stage.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                stage.db.execute('PRAGMA journal_mode=DELETE')
-            finally:
-                stage.close()
-            for suffix in ('-wal', '-shm'):
-                path = Path(str(database) + suffix)
-                if path.exists():
-                    path.unlink()
-            os.replace(str(stage_dir / 'controller.db'), str(database))
-            sync_directory(data_dir)
-        finally:
-            shutil.rmtree(str(stage_dir))
-        return meta['authority_generation']
+def restore(data_dir, source_dir, clock=time.time, identity=None):
+    """Compatibility return value; public maintenance CLI also reports the full restore receipt."""
+    from .maintenance import restore_offline
+    return restore_offline(data_dir, source_dir, identity=identity, clock=clock)['authority_generation']
 
 
 def parse_bind(value, tls_cert=None, tls_key=None):
@@ -3206,6 +3167,14 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.send_header('Connection', 'close')
             self.end_headers()
             self.close_connection = True
+            if not any(key.lower() == 'content-type' and value == 'text/event-stream' for key, value in result.headers):
+                try:
+                    for chunk in result.stream:
+                        self.wfile.write(chunk)
+                    self.wfile.flush()
+                finally:
+                    result.stream.close()
+                return
             query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
             cursor = int(query.get('cursor', [headers.get('last-event-id', '0')])[0])
             last_ping = time.monotonic()
@@ -3314,6 +3283,7 @@ def main(argv=None):
             command.add_argument('--dest', required=True)
         elif name == 'restore':
             command.add_argument('--from', dest='source', required=True)
+            command.add_argument('--identity', choices=('carry-forward', 'keep', 'revoke-all'))
         elif name == 'prune-events':
             command.add_argument('--keep', type=int, required=True)
         elif name == 'barrier':
@@ -3327,7 +3297,7 @@ def main(argv=None):
         elif args.command == 'backup':
             print(json.dumps(backup(args.data_dir, args.dest)))
         elif args.command == 'restore':
-            print(json.dumps({'authority_generation': restore(args.data_dir, args.source)}))
+            print(json.dumps({'authority_generation': restore(args.data_dir, args.source, identity=args.identity)}))
         elif args.command == 'barrier':
             print(json.dumps(barrier(args.data_dir, args.request_id, args.reason), ensure_ascii=False))
         else:
@@ -3367,6 +3337,9 @@ def main(argv=None):
                     store.close()
                 print(code)
     except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
+        from .backup import BackupError
+        if isinstance(exc, BackupError):
+            parser.exit(1, json.dumps({'error': exc.result()}, ensure_ascii=False) + '\n')
         parser.exit(1, type(exc).__name__ + ': ' + str(exc) + '\n')
     return 0
 

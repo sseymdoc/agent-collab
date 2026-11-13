@@ -19,11 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT))
 from agent_collab.installer import safe_name, schema_fingerprint, validate_payload, validate_version
+from agent_collab.release import parse_version
 
 
 def build_release(source, output, version):
     source, output = Path(source), Path(output)
     validate_version(version)
+    parse_version(version)
     files = {}
     for directory in ('agent_collab', 'installer'):
         for path in sorted((source / directory).rglob('*')):
@@ -46,6 +48,10 @@ def build_release(source, output, version):
     if 'agent_collab/installer.py' not in files or 'installer/entry.py' not in files:
         raise ValueError('source is missing the installer')
     schema = json.loads(files['installer/release-schema.json'])
+    protocol_tree = ast.parse(files['agent_collab/protocol.py'].decode('utf-8'))
+    protocol = {target.id: ast.literal_eval(node.value) for node in protocol_tree.body
+                if isinstance(node, ast.Assign) for target in node.targets
+                if isinstance(target, ast.Name) and target.id in ('PROTOCOL_VERSION', 'FEATURES', 'COMPAT')}
     # Read the schema literal without importing or executing the source being packaged.
     tree = ast.parse(files['agent_collab/store.py'].decode('utf-8'))
     ddl = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
@@ -63,6 +69,7 @@ def build_release(source, output, version):
     manifest = dict(version=version, git_commit=commit, git_dirty=dirty,
                     built_at=datetime.now(timezone.utc).isoformat(), python_requires='>=3.9',
                     ui_built='agent_collab/static/index.html' in files,
+                    protocol_version=protocol['PROTOCOL_VERSION'], features=protocol['FEATURES'], compat=protocol['COMPAT'],
                     controller_schema_fingerprint=fingerprint, **schema)
     manifest['files'] = {name: dict(sha256=hashlib.sha256(data).hexdigest(), size=len(data))
                          for name, data in files.items()}

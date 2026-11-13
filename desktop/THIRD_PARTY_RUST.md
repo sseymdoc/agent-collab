@@ -1,8 +1,8 @@
 # 桌面外壳的 Rust 依赖
 
-由 `desktop/src-tauri/Cargo.lock` 经 `cargo metadata --filter-platform` 生成，列出进入各目标构建的 crate（含间接依赖）与 Cargo.toml 里声明的许可证。目标：Windows x64、macOS arm64。共 324 个。
+由 `desktop/src-tauri/Cargo.lock` 经 `cargo metadata --filter-platform` 生成，列出进入各目标构建的 crate（含间接依赖）与 Cargo.toml 里声明的许可证。目标：Windows x64、macOS arm64。共 345 个。
 
-MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上对应版本。目前的开发候选安装包没有随附本清单与各 crate 的许可证文本；正式分发之前要把它们放进安装包（见 `docs/release-checklist.md`）。
+MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上对应版本。桌面安装包在 `resources/licenses/` 里随附本清单与各 crate 的许可证文本 `THIRD_PARTY_RUST_LICENSES.txt`（`scripts/rust_licenses.py` 从本机 cargo 缓存里的 crate 包收集）；依赖变化后两份一起重新生成。少数 crate 的包里没有许可证文件，那份文本开头单独列出它们与声明的许可证。
 
 | crate | 版本 | 许可证 | 目标 |
 | --- | --- | --- | --- |
@@ -36,8 +36,10 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | cfg_aliases | 0.2.2 | MIT | 全部 |
 | chacha20 | 0.10.2 | MIT OR Apache-2.0 | 全部 |
 | chrono | 0.4.45 | MIT OR Apache-2.0 | 全部 |
+| constant_time_eq | 0.6.1 | CC0-1.0 OR MIT-0 OR Apache-2.0 | Windows x64 |
 | cookie | 0.18.2 | MIT OR Apache-2.0 | 全部 |
 | core-foundation | 0.10.1 | MIT OR Apache-2.0 | macOS arm64 |
+| core-foundation | 0.9.4 | MIT OR Apache-2.0 | macOS arm64 |
 | core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 | macOS arm64 |
 | core-graphics | 0.25.0 | MIT OR Apache-2.0 | macOS arm64 |
 | core-graphics-types | 0.2.0 | MIT OR Apache-2.0 | macOS arm64 |
@@ -71,8 +73,10 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | embed_plist | 1.2.2 | MIT OR Apache-2.0 | macOS arm64 |
 | equivalent | 1.0.3 | Apache-2.0 OR MIT | 全部 |
 | erased-serde | 0.4.11 | MIT OR Apache-2.0 | 全部 |
+| errno | 0.3.14 | MIT OR Apache-2.0 | macOS arm64 |
 | fastrand | 2.5.0 | Apache-2.0 OR MIT | 全部 |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | 全部 |
+| filetime | 0.2.29 | MIT/Apache-2.0 | macOS arm64 |
 | find-msvc-tools | 0.1.15 | MIT OR Apache-2.0 | 全部 |
 | flate2 | 1.1.11 | MIT OR Apache-2.0 | 全部 |
 | fnv | 1.0.7 | Apache-2.0 / MIT | 全部 |
@@ -139,6 +143,7 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | markup5ever | 0.39.0 | MIT OR Apache-2.0 | 全部 |
 | memchr | 2.8.3 | Unlicense OR MIT | 全部 |
 | mime | 0.3.18 | MIT OR Apache-2.0 | 全部 |
+| minisign-verify | 0.3.0 | MIT | 全部 |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | 全部 |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 | 全部 |
 | mio | 1.2.4 | MIT | 全部 |
@@ -155,10 +160,12 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | objc2-exception-helper | 0.1.1 | Zlib OR Apache-2.0 OR MIT | macOS arm64 |
 | objc2-foundation | 0.3.2 | MIT | macOS arm64 |
 | objc2-io-surface | 0.3.2 | Zlib OR Apache-2.0 OR MIT | macOS arm64 |
+| objc2-osa-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | macOS arm64 |
 | objc2-quartz-core | 0.3.2 | Zlib OR Apache-2.0 OR MIT | macOS arm64 |
 | objc2-web-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | macOS arm64 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | 全部 |
 | option-ext | 0.2.0 | MPL-2.0 | 全部 |
+| osakit | 0.3.1 | MIT OR Apache-2.0 | macOS arm64 |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 | 全部 |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | 全部 |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 | 全部 |
@@ -189,14 +196,18 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 | 全部 |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | 全部 |
 | reqwest | 0.12.28 | MIT OR Apache-2.0 | 全部 |
+| reqwest | 0.13.5 | MIT OR Apache-2.0 | 全部 |
 | rfd | 0.17.2 | MIT | 全部 |
 | ring | 0.17.14 | Apache-2.0 AND ISC | 全部 |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | 全部 |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 | 全部 |
+| rustix | 1.1.6 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | macOS arm64 |
 | rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT | 全部 |
 | rustls-native-certs | 0.8.5 | Apache-2.0 OR ISC OR MIT | 全部 |
 | rustls-pki-types | 1.16.0 | MIT OR Apache-2.0 | 全部 |
+| rustls-platform-verifier | 0.7.1 | MIT OR Apache-2.0 | 全部 |
 | rustls-webpki | 0.103.16 | ISC | 全部 |
+| rustversion | 1.0.23 | MIT OR Apache-2.0 | Windows x64 |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 | 全部 |
 | same-file | 1.0.6 | Unlicense/MIT | 全部 |
 | schannel | 0.1.30 | MIT | Windows x64 |
@@ -242,18 +253,23 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | syn | 3.0.10 | MIT OR Apache-2.0 | 全部 |
 | sync_wrapper | 1.0.2 | Apache-2.0 | 全部 |
 | synstructure | 0.14.0 | MIT | 全部 |
+| system-configuration | 0.7.0 | MIT OR Apache-2.0 | macOS arm64 |
+| system-configuration-sys | 0.6.0 | MIT OR Apache-2.0 | macOS arm64 |
 | tao | 0.37.2 | Apache-2.0 | 全部 |
+| tar | 0.4.46 | MIT OR Apache-2.0 | macOS arm64 |
 | tauri | 2.12.5 | Apache-2.0 OR MIT | 全部 |
 | tauri-build | 2.7.4 | Apache-2.0 OR MIT | 全部 |
 | tauri-codegen | 2.7.4 | Apache-2.0 OR MIT | 全部 |
 | tauri-macros | 2.7.4 | Apache-2.0 OR MIT | 全部 |
 | tauri-plugin | 2.7.2 | Apache-2.0 OR MIT | 全部 |
 | tauri-plugin-notification | 2.8.1 | Apache-2.0 OR MIT | 全部 |
+| tauri-plugin-updater | 2.14.1 | Apache-2.0 OR MIT | 全部 |
 | tauri-runtime | 2.12.2 | Apache-2.0 OR MIT | 全部 |
 | tauri-runtime-wry | 2.12.3 | Apache-2.0 OR MIT | 全部 |
 | tauri-utils | 2.10.2 | Apache-2.0 OR MIT | 全部 |
 | tauri-winres | 0.3.7 | MIT | 全部 |
 | tauri-winrt-notification | 0.8.1 | MIT OR Apache-2.0 | Windows x64 |
+| tempfile | 3.27.0 | MIT OR Apache-2.0 | 全部 |
 | tendril | 0.5.1 | MIT OR Apache-2.0 | 全部 |
 | thiserror | 2.0.21 | MIT OR Apache-2.0 | 全部 |
 | thiserror-impl | 2.0.21 | MIT OR Apache-2.0 | 全部 |
@@ -278,6 +294,7 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | tracing-core | 0.1.36 | MIT | 全部 |
 | tray-icon | 0.25.1 | MIT OR Apache-2.0 | 全部 |
 | try-lock | 0.2.5 | MIT | 全部 |
+| typed-path | 0.13.0 | MIT OR Apache-2.0 | Windows x64 |
 | typeid | 1.0.3 | MIT OR Apache-2.0 | 全部 |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | 全部 |
 | unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | 全部 |
@@ -308,6 +325,7 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | windows-interface | 0.59.3 | MIT OR Apache-2.0 | Windows x64 |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 | Windows x64 |
 | windows-numerics | 0.3.1 | MIT OR Apache-2.0 | Windows x64 |
+| windows-registry | 0.6.1 | MIT OR Apache-2.0 | Windows x64 |
 | windows-result | 0.4.1 | MIT OR Apache-2.0 | Windows x64 |
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 | Windows x64 |
 | windows-sys | 0.60.2 | MIT OR Apache-2.0 | Windows x64 |
@@ -320,13 +338,16 @@ MPL-2.0 的 crate（文件级著佐权）未作修改，源码见 crates.io 上�
 | winreg | 0.56.0 | MIT | Windows x64 |
 | writeable | 0.6.4 | Unicode-3.0 | 全部 |
 | wry | 0.57.2 | Apache-2.0 OR MIT | 全部 |
+| xattr | 1.7.0 | MIT OR Apache-2.0 | macOS arm64 |
 | yoke | 0.8.4 | Unicode-3.0 | 全部 |
 | yoke-derive | 0.8.4 | Unicode-3.0 | 全部 |
 | zerofrom | 0.1.8 | Unicode-3.0 | 全部 |
 | zerofrom-derive | 0.1.8 | Unicode-3.0 | 全部 |
 | zeroize | 1.9.1 | Apache-2.0 OR MIT | 全部 |
+| zeroize_derive | 1.5.0 | Apache-2.0 OR MIT | 全部 |
 | zerotrie | 0.2.5 | Unicode-3.0 | 全部 |
 | zerovec | 0.11.9 | Unicode-3.0 | 全部 |
 | zerovec-derive | 0.11.7 | Unicode-3.0 | 全部 |
+| zip | 9.5.1 | MIT | Windows x64 |
 | zlib-rs | 0.6.8 | Zlib | 全部 |
 | zmij | 1.0.23 | MIT | 全部 |

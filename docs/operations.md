@@ -503,6 +503,26 @@ PY
 
 恢复继续沿用既有语义：旧执行租约/generation 被 fence，旧协调租约不能取得新协调权；节点身份凭据保留用于心跳对账，不代表旧执行权复活。备份不含 `admin.token`，新隔离目录首次启动会创建新管理令牌；覆盖已有数据目录时沿用该目录原有管理令牌，不能宣称所有恢复都会轮换它。CLI 没有启动演练 controller，不会让真实节点连接演练实例。
 
+## 诊断导出
+
+`agent-collab diagnostics` 只落本机，不自动上传或发送。导出不停止服务、不运行认证探测、不访问网络；controller 信息由调用方取得后通过 `--controller-info` 传入。`--profile` 在离线契约下明确拒绝，不读取配对凭据；需要 controller 信息时改用 JSON 文件。
+
+```sh
+agent-collab diagnostics export --out /local/diagnostics.zip --prefix /local/code --state-dir /local/state
+agent-collab diagnostics export --out /local/diagnostics-cand.zip --instance cand --controller-info /local/controller-info.json
+agent-collab diagnostics preview /local/diagnostics.zip
+agent-collab diagnostics preview /local/diagnostics.zip --show logs/000.txt
+```
+
+- 收集运行包版本、Python、操作系统与架构；安装器只读发现中的服务状态、自启动、期望状态、服务归属与运行上下文；已安装版本的发行清单元数据；节点 `status.json` 中的版本、版本目录、心跳、认证健康摘要与最近错误。缺失、不可读或无效的可选 JSON 如实标记，不把未知状态当作健康。
+- 日志只读固定位置的末尾：`<prefix>/installer.log`、`<state-dir>/installer.log`、`worker/agent.log`、`controller/controller.log`，以及 `logs/` 下 installer、worker、controller 的 `.log`、`.out.log`、`.err.log`。不读取系统 journal，也不递归扫描任意文件。源路径经脱敏后保存在清单里；包内文件使用 `logs/000.txt` 这样的编号名称。
+- 默认不读取 attempt 的 stdout/stderr。显式加 `--include-task-logs` 才收集 `worker/attempts/<UUID>/`、`checks/<编号>/`、`step-<编号>/` 下的 `stdout.jsonl` 与 `stderr.log`；命令在 stderr 和预览的 notes 中提示“任务原始日志可能包含项目内容”，并继续脱敏。分享前应检查预览。
+- 不收集客户端凭据、系统凭据存储、官方 CLI 配置与认证材料、配对码、私钥文件、任务输入、项目源码、成果、数据库或备份；不打开 `.codex`、`.claude`、`.ssh`。仅固定位置的本产品 `worker/node.token`、`controller/admin.token` 与有界 attempt 的 `lease.token` 可读取至内存，用于精确替换日志里的同值，每个最多 4096 字节，令牌文件本身不入包、不打印。其他读取（包括 `--controller-info`）拒绝 `.token`、`.pem`、`.key`、`.p12`、`.pfx`、`.db`、`.sqlite`、`.sqlite3`、`.bak` 文件。项目绑定只读 `worker/project-bindings.json` 中的目录字符串，不打开项目目录。
+- 所有收集到的文本与 JSON 值统一处理 Authorization/Bearer、`X-Coordinator-Token`、token/secret/password/code/key 字段、JWT、`sk-` API key、至少 32 字符的 URL-safe base64/十六进制串与 PEM 私钥块。替换为固定占位符，并按类别统计；长提交哈希也可能被保守脱敏。用户家目录变为 `~`，用户名变为 `<user>`，主机名变为 `<host>`，已知绑定目录只留目录名。JSON 中的任务输入、源码与成果内容字段省略。统计表示本次采集实际执行的替换次数，预览及最近错误的副本不重复计数。
+- 每个日志最多读取和导出 256 KiB；`--max-bytes` 控制日志合计读取及导出上限，缺省 4 MiB，允许 1 字节至 64 MiB。最多记录 128 个日志、检查 128 个 attempt；清单标明库存截断、原始大小、读取字节、导出字节与截断情况。截断的首行丢弃，防止残缺凭据绕过规则。最近错误来自已收集的日志尾部，按文件顺序保留最后 50 条，每条最多 2000 字符，不代表跨文件的时间排序。
+- 单个 JSON 最多读取 1 MiB，超限时标记未收集和截断，不解析残缺 JSON；`diagnostics.json` 最多 2 MiB，超限则导出失败。controller 信息文件也受此限制。预览不解压文件，只接受本格式的有限文件名与大小，`--show` 日志最多 256 KiB、摘要最多 2 MiB。
+- `--out` 必须是尚不存在的本机 `.zip` 文件；拒绝网络路径、网络映射盘、符号链接、重解析点及多硬链接输入文件。日志打开前拒绝 FIFO、设备等非普通文件，打开后再次核对句柄。先创建同目录临时文件并限制权限，再写入、同步并原子改名。POSIX 为 `0600`，Windows 的 DACL 只保留当前用户；权限收紧失败则不写入诊断内容。stdout 输出文件列表、大小、截断与脱敏统计以及完整结构化摘要。
+
 ## 旧任务
 
 codex-collaborate 旧任务继续由原 launcher 管理；只读查看：`"$PREFIX/bin/agent-collab" legacy list --state-root <旧状态目录>`。

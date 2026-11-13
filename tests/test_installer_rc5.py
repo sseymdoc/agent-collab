@@ -91,6 +91,10 @@ class WorkerInstallTests(unittest.TestCase):
         pythonw.write_bytes(b'fixture')
         xml = task()
         self.assertEqual(xml.find('.//{*}Command').text, str(pythonw))
+        # controller 也是后台服务：同样不用会新建控制台的 python.exe（all-in-one 的两个任务都用 pythonw.exe）。
+        both = ins.render_services(dict(config, role='all-in-one'), directory, 'S-1-5-21-1-2-3-4')
+        self.assertEqual({name: ET.fromstring(data).find('.//{*}Command').text for name, data in both.items()},
+                         {'agent-collab-controller.xml': str(pythonw), 'agent-collab-worker.xml': str(pythonw)})
         # 重复挂在时间触发器上（注册即生效）；登录触发器只负责登录时立即启动。
         self.assertIsNone(xml.find('.//{*}LogonTrigger/{*}Repetition'))
         timer = xml.find('.//{*}TimeTrigger')

@@ -1,10 +1,28 @@
 """Identity of the running package, independent of cwd and install pointers."""
 import json
+import re
 from pathlib import Path
 
 from . import __version__ as VERSION
 
 _VERSION_DIRECTORY = Path(__file__).resolve().parents[1]
+
+
+def parse_version(text):
+    """Return a sortable key for X.Y.Z[{a|b|rc}N][.devN], a strict PEP 440 subset."""
+    match = re.fullmatch(r'([0-9]+)\.([0-9]+)\.([0-9]+)(?:(a|b|rc)([0-9]+))?(?:\.dev([0-9]+))?', text) if isinstance(text, str) else None
+    if match is None:
+        raise ValueError('invalid version; expected X.Y.Z[{a|b|rc}N][.devN]')
+    major, minor, patch, pre, number, dev = match.groups()
+    # A bare .dev precedes every prerelease. Within a prerelease, .dev precedes that release.
+    stage = {'a': 0, 'b': 1, 'rc': 2}.get(pre, -1 if dev is not None else 3)
+    return (int(major), int(minor), int(patch), stage, int(number or 0),
+            dev is None, int(dev or 0))
+
+
+def compare_versions(a, b):
+    left, right = parse_version(a), parse_version(b)
+    return (left > right) - (left < right)
 
 
 def version_directory():

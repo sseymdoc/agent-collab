@@ -199,15 +199,23 @@ python -m agent_collab.controller prune-events --data-dir /local/controller-data
 python -m agent_collab.controller barrier --data-dir /local/controller-data --request-id <UUID v4> --reason "<原因>"
 ```
 
-backup 不是只读操作：它在源数据目录上打开数据库（必要时补建表、执行轻量迁移），快照之后再写一条 `backup/latest` 记录与一条 `controller.backup` 事件（快照里不含这两条，清单的 `event_seq` 是快照里最后一条事件）。所以不要用新版本的 `controller backup` 去备份仍在运行的旧版本 controller 的数据目录；要只读地取副本时用 SQLite 的只读连接（`mode=ro`）加 backup API。在 macOS 系统 SQLite 上观察到目的目录每次留下一对 `.backup-<uuid>.db-shm` / `.db-wal` 旁文件，可以删除。
+backup 不是只读操作：先用独立 SQLite 连接取得已提交的一致快照，再写源库的 `backup/latest`（时间、目的位置）与 `controller.backup` 事件。快照里不含这些新记录；在线维护请求的未提交记录也不包含在快照内。命令行路径在记录时构造 Store，可能补建表或执行轻量迁移；在线维护复用现有请求事务，不另开写事务。因此不要用新版本 backup 命令接触仍运行的旧版数据库。只读盘点、列表、核对和预览均不调用 backup，也不处理到期状态。
 
-backup 可与 serve 并行，使用 SQLite backup API 取得一致快照，仅复制该快照引用且已存在的 blobs。缺失的 uploading 数据可以保留为缺失；durable/protected 数据缺失则备份失败。目的目录包含不可变 `controller-<db_sha256>.db`、blob 子目录、`backup-manifest.json`（database、db_sha256、blob hash/size 清单、authority_generation、event_seq、created_at；`event_seq` 是快照里最后一条事件的序号，之后用 `GET /activity?after=<event_seq>` 查看这份备份之后产生了什么）。blob 增量复制，先完成新数据库，再原子切换清单；切换中断仍可使用上次清单。历史数据库和多余 blob 不自动删除。
+backup 不改变派单暂停、提交闸门、任务状态或执行代次，不需要为了备份修改或恢复这些开关。目的目录锁只串行化该目录的备份写入，不停止 controller。失败发生在清单切换前时，上次清单仍有效；源库的最新备份记录与事件只在快照完成后写入。若记录阶段失败，已经发布的备份文件仍可能有效，但不能据此宣称维护操作成功；在线请求的失败记录与幂等回执正常保存，查看 operation.error 并重新核对。
 
-restore 必须停止同目录 controller，校验清单、数据库和每个 blob 后，在数据目录暂存并原子替换数据库。generation 更新为 `max(当前,备份)+1`，旧租约全部撤销，旧活动任务变为 waiting_reconcile，取消中的任务保留 cancel_requested；所有派单暂停，旧 UI sessions 清除，节点先完成新 generation 心跳对账。管理员核对工作区和副作用后，对可继续的 job 显式 retry，再解除 dispatch 暂停。当前目录的 admin.token 保留；恢复到新目录时下次 App 启动生成新管理员令牌。
+备份只复制该快照引用且已存在的 blobs，缺失上传可以保留；缺失 durable/protected 数据则拒绝。载荷为不可变 `controller-<db_sha256>.db`、blobs 与 `backup-manifest.json`（数据库摘要、blob hash/size 清单、authority_generation、event_seq、created_at）。数据库包含项目、输入基线、模型/协调/保留设置、客户端与节点凭据哈希。`config.json`、TLS 文件、admin.token、系统凭据存储、节点配置、项目本机绑定、应用 journal 与用户目录不在载荷里；换机器恢复须另行提供必要配置并核对路径/运行账户，不假定系统凭据跨设备可用。归档是敏感恢复材料，不进入诊断包或发行产物。
 
-恢复到原目录保留事件序号的高水位，新事件不会重用备份之后曾分配的 seq。恢复到全新目录无法知道备份之外的旧 seq，客户端应重新登录并获取快照/游标。备份数据库包含节点身份哈希等控制状态，备份目录须按状态目录保护；同机器目录备份不等于实例外备份。
+维护 API 与公共 CLI 见 `docs/protocol.md` §14。在线创建仅使用状态根（data_dir 的父目录）的 `backups/managed-<时间>-<短ID>`，与安装器的 upgrade 目录同级。API 不接受服务器路径。操作同步完成，数据库保存操作 ID、步骤、结果或失败原因；request_id 原样重放返回同一结果。列表展示实例内位置、schema、摘要、大小与最近核对；导出为确定性 tar，接收端核对哈希后保存。位置标签 instance 不表示实例外副本，实例外保存必须实际发生。保留份数由 `PUT /settings/backups` 管理，缺省 8，只清理 managed，保护最新及唯一有效恢复点。
 
-barrier 是切换屏障（`docs/protocol.md` §13.9，使用场景见 `docs/migration.md`）：在已停止的 controller 上运行（命令取得数据目录的锁），要求派单已暂停、提交闸门不是 `open`，否则拒绝。它把 generation 加一并撤销此前签发的全部执行权，处理与 restore 相同，但数据不回退：attempt 的租约令牌作废，进行中的 attempt 记为失联，未结束的任务变为 waiting_reconcile（取消中的保留 cancel_requested），协调租约失效，节点下次心跳被要求对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果，不再推进 generation。普通的停止再启动保留 generation、租约与协调租约。
+恢复和核对只在临时副本打开备份数据库，源目录不再加锁，不创建 WAL/SHM，也不删除已有旁文件。归档只包含清单列出的载荷。恢复先核对数据库完整性、schema、全部 blob 及引用，失败指出对象且不替换当前库；通过后持有目标 controller 锁，在目标目录暂存修改并原子替换数据库。离线入口为 `agent-collab maintenance restore --data-dir D --from <目录或tar> [--identity carry-forward|keep|revoke-all] [--dry-run]`；旧 controller restore 使用同一规则，仍返回代次。
+
+当前库可读时默认拒绝优先结转授权：已撤销/删除客户端、已退役/删除节点及已消失/替换的凭据不复活，缩减的客户端权限不扩大；新增身份及新凭据逐项列为需要重新配对。当前库不可读或不存在时，必须显式 keep 或 revoke-all；keep 提示无法确认备份之后的撤销，revoke-all 撤销全部客户端与节点凭据。未用配对码与浏览器会话总是清除。目标目录已有 admin.token 保留；新目录下次启动生成新管理员令牌。
+
+generation 更新为 max(可读当前库,备份)+1，全部旧执行权撤销，旧活动任务变为 waiting_reconcile，取消中的保留 cancel_requested；派单暂停，普通提交闸门按备份原值。快照中未结束节点操作记为 timed_out，不重新下发，应用仍须对账。节点和本机项目文件写入不会被撤回。先核对工作区、副作用与未确认写回，再显式 retry 或应用恢复，最后解除派单暂停。授权策略、执行代次和未结束操作分别记录在恢复结果中；结果进入 `controller.restored` 事件、maintenance_op 及状态根 `restore-results/<op_id>.json`。
+
+恢复到原目录保留可读当前库的事件序号高水位；灾难恢复无法得知备份之外的旧序号，客户端应重新配对或取得快照/游标。只读恢复预览比较任务、成果、写回、项目、策略与身份；disposable 只覆盖任务和写回。信息不足为 needs_reconcile，损坏/不兼容为 blocked，不凭 disposable=true 宣称无损回退。dry-run 只检查离线恢复计划，不替代业务影响预览。
+
+barrier 是可选切换屏障，不用于普通更新。要求 controller 停止、派单暂停、提交闸门不是 open，且最新成功 attempt 的最新 durable 成果已发布或明确弃置。`GET /maintenance/barrier-preview` 列出待处理项；`POST /jobs/{id}/dismiss` 用 tasks 权限、request_id、expected_version、reason 记录弃置，保留数据并禁止以后发布该检查点。barrier 在同一 BEGIN IMMEDIATE 事务内重查这些条件并推进代次，存在未处理成果就拒绝并列出；不要求历史检查点都发布，也不恢复被撤销的授权。同一 request_id 重放不再推进代次。普通重启保留代次、租约与协调租约。
 
 prune-events 只裁剪事件内容，保留 event_id/hash 去重账本，防止迟到重发重复改变状态。旧游标收到 snapshot_required 后重新请求快照。没有后台 blob GC 或幂等/去重账本淘汰策略。
 

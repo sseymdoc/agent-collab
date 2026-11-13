@@ -16,6 +16,7 @@ import { ProjectDetail } from './pages/ProjectDetail'
 import { Activity } from './pages/Activity'
 import { Unfinished } from './pages/JobResult'
 import { BuildMark } from './pages/Wizard'
+import { Maintenance, useAutoUpdate } from './pages/Maintenance'
 import { useNotifier } from './notify'
 import './styles.css'
 
@@ -102,12 +103,13 @@ function App() {
   return <Shell key={phase.generation} onLeave={() => isDesktop ? leave(null) : void api.logout().catch(() => {}).finally(() => leave(null))} />
 }
 
-const NAV = [['overview', '总览'], ['projects', '项目'], ['jobs', '任务'], ['activity', '活动'], ['nodes', '设备'], ['settings', '设置']]
+const NAV = [['overview', '总览'], ['projects', '项目'], ['jobs', '任务'], ['activity', '活动'], ['nodes', '设备'], ['maintenance', '维护'], ['settings', '设置']]
 
 function Shell({ onLeave }: { onLeave: () => void }) {
   const hash = useHash()
   // 通知去重表与“连接建立时的最大序号”挂在 Shell 上，随连接切换（generation）重建。
   const notify = useNotifier()
+  useAutoUpdate((title, body) => { void invoke('notify', { title, body }).catch(() => {}) })
   const live = useLive(true, notify)
   const who = session()
   const [info, setInfo] = useState<any>(null)
@@ -141,6 +143,7 @@ function Shell({ onLeave }: { onLeave: () => void }) {
         : page === 'jobs' && id ? <JobDetail key={id} id={id} tick={live.tick} />
         : page === 'jobs' ? <Jobs tick={live.tick} />
         : page === 'settings' ? <Settings tick={live.tick} onLeave={onLeave} />
+        : page === 'maintenance' ? <Maintenance tick={live.tick} />
         : <Overview tick={live.tick} />}
       <footer><BuildMark info={info} /></footer>
     </main>

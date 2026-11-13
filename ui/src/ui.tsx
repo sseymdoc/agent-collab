@@ -64,6 +64,8 @@ const TONE: Record<string, string> = {
 
 export function Badge({ v }: { v?: string | null }) {
   if (!v) return <span className="badge muted">{UNKNOWN}</span>
+  // 接口字段是对象时（例如 acceptance）按文本显示，不让整页因渲染对象而卸载。
+  if (typeof v !== 'string') return <span className="badge muted">{show(v)}</span>
   return <span className={'badge ' + (TONE[v] ?? 'muted')} title={v}>{LABEL[v] ?? v}</span>
 }
 

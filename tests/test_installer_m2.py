@@ -84,6 +84,7 @@ class InstallerM2Tests(unittest.TestCase):
                 text = 'state = running' if system == 'Darwin' else 'Running' if system == 'Windows' else 'active'
             return subprocess.CompletedProcess(argv, 0, text, '')
         stack.enter_context(patch.object(ins, 'run', side_effect=runner))
+        stack.enter_context(patch.object(ins, 'release_compatibility', return_value={'decision': 'accept'}))
         stack.enter_context(patch.object(ins.platform, 'system', return_value=system))
         stack.enter_context(patch.object(ins.os, 'getuid', return_value=501, create=True))
         stack.enter_context(patch.object(ins.Path, 'home', return_value=self.temp / 'home'))
@@ -227,6 +228,36 @@ class InstallerM2Tests(unittest.TestCase):
         self.invoke(self.offline_args('--uninstall', '--purge-code'))
         self.assertFalse((self.prefix / 'runtime').exists())
 
+    @patch.object(ins.platform, 'system', return_value='Darwin')
+    def test_purge_keeps_the_runtime_this_uninstaller_runs_from(self, _system):
+        # Windows 上经已安装的启动器卸载时，进程就是 runtime 里的 Python，删不掉它的 DLL；其余照常卸载，再次卸载删掉运行时。
+        self.invoke(self.offline_args('--release', str(self.v1), '--runtime', str(self.runtime_source('first'))))
+        with patch.object(ins, 'runtime_in_use', return_value=True):
+            out, _ = self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        self.assertIn('was kept', out)
+        self.assertTrue((self.prefix / 'runtime').is_dir())
+        self.assertFalse((self.prefix / 'versions').exists())
+        self.assertFalse((self.prefix / 'bin').exists())
+        self.assertIsNone(ins.read_json(self.prefix / 'installation.json')['version'])
+        self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        self.assertFalse((self.prefix / 'runtime').exists())
+
+    @patch.object(ins.platform, 'system', return_value='Darwin')
+    def test_uninstall_finishes_a_purge_whose_runtime_is_already_broken(self, _system):
+        # 上一次 --purge-code 删运行时删到一半（Windows 上被别的进程占着文件）：解释器已经残缺，再次卸载不能先去运行它。
+        self.invoke(self.offline_args('--release', str(self.v1), '--runtime', str(self.runtime_source('first'))))
+        with patch.object(ins, 'runtime_in_use', return_value=True):
+            self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        for python in (self.prefix / 'runtime').rglob('python3'):
+            python.write_text('#!/bin/sh\nexit 1\n')
+        self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        self.assertFalse((self.prefix / 'runtime').exists())
+
+    def test_runtime_in_use_only_for_the_running_interpreter_on_windows(self):
+        here = Path(sys.executable).resolve().parent
+        self.assertEqual(ins.runtime_in_use(here), os.name == 'nt')
+        self.assertFalse(ins.runtime_in_use(self.temp))
+
     def test_runtime_unsafe_archives_rejected_without_partial_directories(self):
         for form, name, link in (('tar', '../escape', None), ('zip', '/absolute', None),
                                  ('tar', 'bin/python3', '../../../outside'),
@@ -295,7 +326,7 @@ class InstallerM2Tests(unittest.TestCase):
         report = json.loads(out)
         self.assertEqual(set(report), {'prefix', 'installed', 'version', 'previous_version', 'role', 'instance',
             'service', 'desired', 'desired_source', 'services', 'autostart', 'service_owner', 'runtime', 'python',
-            'state_dir', 'identity', 'controller_data', 'context'})
+            'state_dir', 'identity', 'controller_data', 'context', 'interrupted'})
         self.assertEqual(report['identity'], {'node_id': config['node_id'], 'controller': config['controller_url'], 'paired': True})
         self.assertNotIn('private', out)
         self.assertEqual(report['desired_source'], 'recorded')
@@ -328,7 +359,7 @@ class InstallerM2Tests(unittest.TestCase):
         config, directory = self.installation('Windows', desired={'worker': 'running'})
         with self.managers('Windows'), patch.object(ins, 'drain_client', return_value=(object(), 'node')), \
                 patch.object(ins, 'drain_and_wait', return_value=False), patch.object(ins, 'set_drain'), \
-                patch.object(ins, 'wait_worker_status'), patch.object(ins, 'wait_doctor'):
+                patch.object(ins, 'wait_worker_status'), patch.object(ins, 'wait_doctor', return_value={'ok': True}):
             stop = ins.Services.stop
             def observe(manager, *args, **kwargs):
                 stop(manager, *args, **kwargs)

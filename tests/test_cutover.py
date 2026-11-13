@@ -154,6 +154,8 @@ class BarrierTests(CutoverCase):
         self.call('POST', '/dispatch', {'request_id': uid(), 'paused': False,
                                         'expected_version': self.call('GET', '/overview')['controller']['metadata_version']})
         self.set_intake('closed', reason='切换')
+        # 新屏障要求先明确处置成功但未发布的成果；弃置保留检查点与历史。
+        self.mutate(finished, 'dismiss', reason='切换前明确弃置')
         self.app.close()
         with self.assertRaises(ValueError):  # 闸门已关、没暂停派单
             barrier(data, uid(), '切换', clock=self.clock)

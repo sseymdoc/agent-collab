@@ -3,12 +3,28 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 
 HARNESSES = ('codex', 'claude')
 CODEX_CLEARED_ENV = ('CODEX_THREAD_ID', 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE')
 # Windows 服务由无控制台的 pythonw 运行：短命控制台子进程不加此标志会各自弹出一个窗口（每轮登录探测闪两个）。
 NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+# macOS 没装开发者工具时，/usr/bin 下的这些命令只是占位程序：一运行，系统就在用户桌面弹出“安装命令行开发者工具”。
+XCODE_SHIMS = ('git', 'python3')
+
+
+def which(name, system=None, runner=None):
+    """shutil.which，但把 macOS 上没有开发者工具时的占位程序当作没有（xcode-select -p 只查询，不触发安装提示）。"""
+    path = shutil.which(name)
+    if path and name in XCODE_SHIMS and (system or platform.system()) == 'Darwin' and path == '/usr/bin/' + name:
+        try:
+            if (runner or subprocess.run)(['/usr/bin/xcode-select', '-p'], capture_output=True, timeout=10,
+                                          stdin=subprocess.DEVNULL).returncode != 0:
+                return None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return path
 
 
 def resolve_commands(config=None, env=None, system=None, home=None, mac_dirs=None):

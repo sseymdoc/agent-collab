@@ -1,0 +1,36 @@
+{
+ "about": "crate 包里没有许可证文件时补充的原始文本与出处，由 scripts/rust_licenses.py 读取。提交号取自各 crate 包里的 .cargo_vcs_info.json（发布这个版本时的上游提交）；文件内容的 SHA-256 在 files 里，生成时核对。selectors 的源文件头写明 MPL-2.0，上游仓库根目录没有许可证文件，用 Mozilla 发布的原文。objc2 系列上游只有说明性的 LICENSE.md（列出各 crate 的许可与 Apple SDK 的说明），没有版权行；三选一的 crate 这里选用 MIT，与 objc2 本身一致，附 SPDX 的 MIT 原文。",
+ "files": {
+  "rust-alloc-no-stdlib-LICENSE": {"sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae", "source": "https://github.com/dropbox/rust-alloc-no-stdlib/blob/0a81fd6928ea3b33c8cd484aa4575d50ffb98012/LICENSE"},
+  "objc2-LICENSE.md": {"sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54", "source": "https://github.com/madsmtm/objc2/blob/<各 crate 的提交>/LICENSE.md（b4167b5、8852b42、d7d2fa2、7b1abfd、8d214f5 五个提交上内容相同）"},
+  "mac-notification-sys-LICENSE-MIT": {"sha256": "1299b4d9d15e9d67e4ac0e7d47ae9404887ca3cf0764aadeec7588d5a6e8e0cc", "source": "https://github.com/h4llow3En/mac-notification-sys/blob/deb559683962d314a7693478476bf8d052efa84e/LICENSE-MIT"},
+  "mac-notification-sys-LICENSE-Apache": {"sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1", "source": "https://github.com/h4llow3En/mac-notification-sys/blob/deb559683962d314a7693478476bf8d052efa84e/LICENSE-Apache"},
+  "tauri-LICENSE-MIT": {"sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d", "source": "https://github.com/tauri-apps/tauri/blob/59b63ab500da9859f12d8888c3298bc29bba0b92/LICENSE-MIT"},
+  "tauri-LICENSE-APACHE-2.0": {"sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594", "source": "https://github.com/tauri-apps/tauri/blob/59b63ab500da9859f12d8888c3298bc29bba0b92/LICENSE-APACHE-2.0"},
+  "webview2-rs-LICENSE": {"sha256": "0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73", "source": "https://github.com/wravery/webview2-rs/blob/<各 crate 的提交>/LICENSE（edc2caf、dffa41a 两个提交上内容相同）"},
+  "spdx-MIT.txt": {"sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5", "source": "https://github.com/spdx/license-list-data/blob/v3.27.0/text/MIT.txt"},
+  "mozilla-MPL-2.0.txt": {"sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04", "source": "https://www.mozilla.org/media/MPL/2.0/index.txt"}
+ },
+ "crates": {
+  "alloc-stdlib 0.3.0": {"commit": "dropbox/rust-alloc-no-stdlib@0a81fd6928ea3b33c8cd484aa4575d50ffb98012", "files": ["rust-alloc-no-stdlib-LICENSE"]},
+  "block2 0.6.2": {"commit": "madsmtm/objc2@b4167b582b2f75f9a1be75495c41b765344fd03c", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "dispatch2 0.3.1": {"commit": "madsmtm/objc2@8852b424193ca41602281b3d7540d7c8ed51e49a", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "mac-notification-sys 0.6.15": {"commit": "h4llow3En/mac-notification-sys@deb559683962d314a7693478476bf8d052efa84e", "files": ["mac-notification-sys-LICENSE-MIT", "mac-notification-sys-LICENSE-Apache"]},
+  "objc2 0.6.5": {"commit": "madsmtm/objc2@d7d2fa23ceaa5e6096c923b081040e5d81b3b9df", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-app-kit 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-core-foundation 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-core-graphics 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-encode 4.1.0": {"commit": "madsmtm/objc2@8d214f5477365ffcbcbb7de058c86ed9a518efb7", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-exception-helper 0.1.1": {"commit": "madsmtm/objc2@8d214f5477365ffcbcbb7de058c86ed9a518efb7", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-foundation 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-io-surface 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-osa-kit 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-quartz-core 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "objc2-web-kit 0.3.2": {"commit": "madsmtm/objc2@7b1abfd750a2cacaea71d6a56ecfb83cb7de560b", "election": "MIT", "files": ["objc2-LICENSE.md", "spdx-MIT.txt"]},
+  "selectors 0.38.0": {"commit": "servo/stylo@572ecba2d1600e7c3d490586692a209faf703baa", "files": ["mozilla-MPL-2.0.txt"], "note": "源文件头：This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0；未作修改，源码见 crates.io 与上游提交"},
+  "tauri-plugin 2.7.2": {"commit": "tauri-apps/tauri@59b63ab500da9859f12d8888c3298bc29bba0b92", "files": ["tauri-LICENSE-MIT", "tauri-LICENSE-APACHE-2.0"]},
+  "webview2-com 0.39.1": {"commit": "wravery/webview2-rs@edc2caf886175ccaebe86078c9cfe1ae2a187328", "files": ["webview2-rs-LICENSE"]},
+  "webview2-com-macros 0.8.1": {"commit": "wravery/webview2-rs@dffa41a8a46d3f5565eefbff2de57d38d399f158", "files": ["webview2-rs-LICENSE"]},
+  "webview2-com-sys 0.39.1": {"commit": "wravery/webview2-rs@edc2caf886175ccaebe86078c9cfe1ae2a187328", "files": ["webview2-rs-LICENSE"]}
+ }
+}

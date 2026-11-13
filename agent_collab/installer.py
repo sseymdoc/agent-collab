@@ -4,6 +4,7 @@ from contextlib import ExitStack, closing, contextmanager
 import hashlib
 import datetime
 import getpass
+import io
 import json
 import os
 import ntpath
@@ -123,15 +124,18 @@ def read_release(path):
             raise ValueError('release exceeds size/file limit')
         files[name] = read()
 
-    if zipfile.is_zipfile(str(path)):
-        with zipfile.ZipFile(str(path)) as archive:
+    source = io.BytesIO(path) if isinstance(path, bytes) else str(path)
+    if zipfile.is_zipfile(source):
+        with zipfile.ZipFile(source) as archive:
             for info in archive.infolist():
                 mode = info.external_attr >> 16
                 if info.is_dir() or stat.S_IFMT(mode) not in (0, stat.S_IFREG):
                     raise ValueError('only regular archive files are supported')
                 add(info.filename, info.file_size, lambda i=info: archive.read(i))
     else:
-        with tarfile.open(str(path), 'r:gz') as archive:
+        if isinstance(source, io.BytesIO):
+            source.seek(0)
+        with tarfile.open(fileobj=source, mode='r:gz') if isinstance(source, io.BytesIO) else tarfile.open(source, 'r:gz') as archive:
             for info in archive:
                 if not info.isfile():
                     raise ValueError('only regular archive files are supported')
@@ -171,10 +175,23 @@ def atomic_write(path, data, mode=0o600):
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(str(temporary), str(path))
+        replace_retrying(str(temporary), str(path))
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def replace_retrying(source, target, attempts=100, delay=0.05):
+    """os.replace；Windows 上目标文件正被别的进程打开（桌面端并发查询本机状态、杀毒软件扫描）时替换会被拒
+    （WinError 5/32），安装器不能因此中途失败：稍等再试。M3 干净虚拟机验证中实测：升级记录被并发读取时回退直接退出。"""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if os.name != 'nt' or attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def write_json(path, value):
@@ -301,16 +318,24 @@ def set_drain(client, node_id, value):
                 raise
 
 
-def drain_and_wait(client, node_id, timeout, clock=time.monotonic, sleep=time.sleep):
+def drain_and_wait(client, node_id, timeout, clock=time.monotonic, sleep=time.sleep, before_drain=None):
     original = get_node(client, node_id)['drain']
+    if before_drain:
+        before_drain(original)
     deadline = clock() + timeout
+    unchecked = False
     try:
         set_drain(client, node_id, True)
         while True:
             node = get_node(client, node_id)
             if node.get('drain') is not True:
                 raise ValueError('node drain changed concurrently; abort upgrade')
-            if type(node.get('active_attempts')) is int and node['active_attempts'] == 0:
+            if 'pending_writebacks' not in node and not unchecked:
+                print('Note: pending_writebacks missing; 未核对写回操作 (legacy controller).')
+                unchecked = True
+            idle_writebacks = ('pending_writebacks' not in node or
+                               (type(node['pending_writebacks']) is int and node['pending_writebacks'] == 0))
+            if type(node.get('active_attempts')) is int and node['active_attempts'] == 0 and idle_writebacks:
                 return original
             if clock() >= deadline:
                 raise ValueError('drain timed out; old version remains running')
@@ -497,7 +522,9 @@ def render_services(config, directory, user_sid=None, desired=None):
             ET.SubElement(restart, 'Interval').text = 'PT1M'
             ET.SubElement(restart, 'Count').text = '3'
             action = ET.SubElement(ET.SubElement(task, 'Actions', Context='CurrentUser'), 'Exec')
-            ET.SubElement(action, 'Command').text = worker_python(config['python']) if kind == 'worker' else config['python']
+            # 两个组件都用无控制台的 pythonw.exe：python.exe 由计划任务拉起时会新建控制台，Windows 11 上被默认终端接管成
+            # 一个可见窗口（M3 联调实测 controller 每次启动都弹出 Windows Terminal），关掉它就结束了服务。日志经 --service-log 写文件。
+            ET.SubElement(action, 'Command').text = worker_python(config['python'])
             cli = ['controller' if kind == 'controller' else 'agent'] + component_argv(config, kind)[1:]
             ET.SubElement(action, 'Arguments').text = subprocess.list2cmdline(
                 ['-B', str(prefix / 'launcher.py'), '--service-log', str(state / 'logs' / (kind + '.log'))] + cli)
@@ -798,7 +825,7 @@ def discover(config, old):
                 runtime=config.get('runtime') if installed else None, python=config['python'] if installed else None,
                 state_dir=str(state) if installed else None, identity=identity,
                 controller_data=controller_data,
-                context=service_context(probe_config))
+                context=service_context(probe_config), interrupted=interrupted_update(config, old))
 
 
 def write_launchers(config):
@@ -855,6 +882,10 @@ def doctor(config, offline=False, desired=None):
     report = dict(ok=False, current='unknown', manifest='unknown', schema='unknown',
                   services={kind: 'unknown' for kind in components(config)}, components={})
     try:
+        if desired is None and (prefix / 'installation.json').is_file():
+            recorded = read_json(prefix / 'installation.json')
+            desired, _ = desired_state(recorded, recorded['config'])
+            desired = {kind: desired[kind] for kind in components(config)}
         version = current_version(prefix, config['system'])
         report['current'] = version or 'unknown'
         if not version:
@@ -871,7 +902,12 @@ def doctor(config, offline=False, desired=None):
         healthy = True
         for kind in components(config):
             if offline or (desired or {}).get(kind) == 'stopped':
-                report['components'][kind] = 'unknown'
+                module = 'controller' if kind == 'controller' else 'node_agent'
+                # Import from the immutable target directory with this installation's interpreter.
+                # No command entry point, data initialisation, service start or socket binding.
+                run([config['python'], '-B', '-c',
+                     'import agent_collab.' + module], cwd=directory)
+                report['components'][kind] = dict(status='offline', imports='verified', runtime='unknown')
                 continue
             try:
                 if kind == 'controller':
@@ -914,6 +950,17 @@ def refuse_active_worker(config, allow_active=False):
     for path in (Path(config['state_dir']) / 'worker/attempts').glob('*/meta.json'):
         if read_json(path).get('state') in ('preparing', 'running'):
             raise ValueError('Worker has preparing/running attempts; drain first, or explicitly pass --allow-active')
+    counts = {}
+    for path in (Path(config['state_dir']) / 'worker/operations').glob('*.json'):
+        try:
+            state = read_json(path).get('state')
+        except (OSError, ValueError, AttributeError):
+            raise ValueError('Worker writeback record unreadable; cannot prove idle') from None
+        if state in ('claimed', 'queued', 'running', 'finished'):
+            counts[state] = counts.get(state, 0) + 1
+    if counts:
+        raise ValueError('Worker has {} pending writebacks ({}); drain first, or explicitly pass --allow-active'.format(
+            sum(counts.values()), ', '.join('{}={}'.format(k, v) for k, v in sorted(counts.items()))))
 
 
 def wait_worker_status(config, directory, manifest, started_at, timeout=60, clock=time.monotonic, sleep=time.sleep):
@@ -1282,15 +1329,356 @@ def cleanup_runtimes(prefix, record):
         print('Warning: unused runtime cleanup failed; retained for later review.', file=sys.stderr)
 
 
+OPENSSH_GUIDANCE = ('release signatures are checked with "ssh-keygen -Y verify" from OpenSSH 8.1 or later. On Windows enable the '
+                    'built-in optional feature "OpenSSH Client" (Settings > System > Optional features); if its version '
+                    '(ssh -V) is older than 8.1, install the client from Microsoft\'s Win32-OpenSSH release MSI '
+                    '(msiexec /i <OpenSSH-Win64.msi> ADDLOCAL=Client, installed to %ProgramFiles%\\OpenSSH). '
+                    'macOS ships /usr/bin/ssh-keygen')
+# 不认识 -Y 的旧版 ssh-keygen（OpenSSH 8.1 之前）：getopt 报未知选项并打印用法。
+UNSUPPORTED = re.compile(r'(unknown|illegal|invalid) option -- ?Y|usage: ssh-keygen', re.I)
+
+
+class VerifierUnavailable(ValueError):
+    """这个 ssh-keygen 不能用来验签（不支持 -Y verify，或无法运行）；与签名不符分开，后者说明包或身份不对。"""
+
+
+def ssh_keygen_candidates():
+    """依次尝试的 ssh-keygen。Windows：系统自带的 OpenSSH 客户端（PATH 里可能先排着 Git 的 MSYS 版），
+    再是 Microsoft Win32-OpenSSH 安装包的位置（它不加进 PATH），最后按 PATH；其他平台按 PATH。"""
+    found = []
+    if os.name == 'nt':
+        for base in (Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'OpenSSH',
+                     Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'OpenSSH'):
+            if (base / 'ssh-keygen.exe').is_file():
+                found.append(str(base / 'ssh-keygen.exe'))
+    on_path = shutil.which('ssh-keygen')
+    if on_path and os.path.normcase(os.path.abspath(on_path)) not in {os.path.normcase(os.path.abspath(p)) for p in found}:
+        found.append(on_path)
+    return found
+
+
+def openssh_version(executable):
+    """同目录 ssh -V 的输出，只用于说明（ssh-keygen 自己没有版本选项）。"""
+    ssh = Path(executable).with_name('ssh' + Path(executable).suffix)
+    try:
+        result = subprocess.run([str(ssh), '-V'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, **NO_WINDOW)
+        return (result.stderr or result.stdout).decode('utf-8', 'replace').strip().splitlines()[0][:80]
+    except (OSError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def verify_signature(executable, archive, signature, signers):
+    """核对的正是已经读入内存的字节：签名与 allowed_signers 写进私有临时目录再交给 ssh-keygen。
+    这也避开了 ssh-keygen 打不开的路径写法（例如桌面端资源目录的 Windows 长路径 \\\\?\\C:\\…）。
+    工具不支持 -Y verify 或无法运行时抛 VerifierUnavailable；签名、signer 或 namespace 不符时抛 ValueError。"""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='agent-collab-verify-') as folder:
+        signature_file, signers_file = Path(folder) / 'release.sig', Path(folder) / 'allowed_signers'
+        signature_file.write_bytes(signature)
+        signers_file.write_bytes(signers)
+        try:
+            result = subprocess.run([executable, '-Y', 'verify', '-f', str(signers_file), '-I', 'agent-collab-release',
+                                     '-n', 'agent-collab-release', '-s', str(signature_file)],
+                                    input=archive, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **NO_WINDOW)
+        except OSError as exc:
+            raise VerifierUnavailable('could not run %s: %s' % (executable, exc))
+    if not result.returncode:
+        return
+    output = (result.stderr or result.stdout).decode('utf-8', 'replace').strip()
+    if UNSUPPORTED.search(output):
+        version = openssh_version(executable)
+        raise VerifierUnavailable('%s does not support "ssh-keygen -Y verify"%s' % (executable, ' (%s)' % version if version else ''))
+    if not output or result.returncode < 0:
+        raise VerifierUnavailable('%s ended without a verification result (exit %s)' % (executable, result.returncode))
+    raise ValueError('release signature verification failed: ' + output.splitlines()[-1][:200])
+
+
+def verify_source(prefix, args, archive=None, version=None):
+    """Verify exactly the bytes later unpacked/saved. Trust changes occur only after verification."""
+    pinned = prefix / 'trust/allowed_signers'
+    supplied = Path(args.allowed_signers).expanduser() if args.allowed_signers else None
+    if pinned.is_symlink() or (prefix / 'trust').is_symlink():
+        raise ValueError('trust paths must not be symlinks')
+    trusted = pinned.read_bytes() if pinned.is_file() else None
+    chosen = supplied.read_bytes() if supplied else trusted
+    replacing = trusted is not None and chosen != trusted
+    if replacing and not args.replace_trust:
+        raise ValueError('allowed_signers differs from pinned trust; use --replace-trust')
+    if args.replace_trust and supplied is None:
+        raise ValueError('--replace-trust requires --allowed-signers')
+    signature = Path(args.signature).expanduser() if args.signature else None
+    if archive is None and version:
+        saved = prefix / 'release-sources' / validate_version(version)
+        if (saved / 'archive').is_file():
+            archive = (saved / 'archive').read_bytes()
+        if signature is None and (saved / 'archive.sig').is_file():
+            signature = saved / 'archive.sig'
+    signed = signature.read_bytes() if signature else None
+    if signed is not None:
+        if archive is None or chosen is None:
+            raise ValueError('signature verification requires the release archive and allowed_signers')
+        # 在改动安装、服务与信任之前核对；不能用的工具换下一个，签名不符立即拒绝（不再试别的工具）。
+        candidates, unavailable = ssh_keygen_candidates(), []
+        if not candidates:
+            raise VerifierUnavailable('release signature verification unavailable: ssh-keygen was not found; ' + OPENSSH_GUIDANCE)
+        for executable in candidates:
+            try:
+                verify_signature(executable, archive, signed, chosen)
+                break
+            except VerifierUnavailable as exc:
+                unavailable.append(str(exc))
+        else:
+            raise VerifierUnavailable('release signature verification unavailable: ' + '; '.join(unavailable) + '. ' + OPENSSH_GUIDANCE)
+        print('Release source verified: agent-collab-release (OpenSSH, %s).' % executable)
+    elif chosen is not None and not args.allow_unsigned:
+        raise ValueError('pinned/supplied trust requires --signature; use --allow-unsigned to explicitly override')
+    else:
+        print('Warning: 未验证来源 (unsigned release)' + ('; explicit --allow-unsigned override.' if chosen else '.'))
+    if chosen is not None and trusted != chosen:
+        print('Trust will be ' + ('replaced (--replace-trust).' if replacing else 'pinned on installation.'))
+    return dict(archive=archive, signature=signed, trust=chosen, previous_trust=trusted,
+                replace=replacing, verified=signed is not None)
+
+
+def save_source(prefix, version, source):
+    if source is None:
+        return
+    pinned = prefix / 'trust/allowed_signers'
+    if (pinned.read_bytes() if pinned.is_file() else None) != source['previous_trust']:
+        raise ValueError('pinned trust changed concurrently; rerun verification')
+    if source['archive'] is not None:
+        folder = prefix / 'release-sources' / validate_version(version)
+        if folder.is_symlink() or folder.parent.is_symlink():
+            raise ValueError('release source directory must not be a symlink')
+        folder.mkdir(parents=True, exist_ok=True)
+        atomic_write(folder / 'archive', source['archive'])
+        if source['signature'] is not None:
+            atomic_write(folder / 'archive.sig', source['signature'])
+        else:
+            (folder / 'archive.sig').unlink(missing_ok=True)
+    if source['trust'] is not None:
+        (prefix / 'trust').mkdir(exist_ok=True)
+        atomic_write(prefix / 'trust/allowed_signers', source['trust'])
+
+
+def release_compatibility(config, manifest):
+    from .client import APIError, Client, ConnectionFailure
+    from .release_tools import evaluate_compat
+    state = Path(config['state_dir'])
+    try:
+        if 'controller' in components(config):
+            address, ca, token = 'http://' + config['bind'], None, admin_token(config)
+        elif (state / 'worker/agent.json').is_file():
+            agent = read_json(state / 'worker/agent.json')
+            address, ca = agent['controller'], agent.get('ca_file')
+            # /client requires a client/admin credential; a node token is not a client token.
+            token = admin_token(config)
+        else:
+            return dict(decision='degraded', unchecked=['未配对；未核对 controller 兼容性'])
+        client = Client(address, token, ca, timeout=3)
+        info = client.json('GET', '/client')
+        nodes = None
+        if 'controller' in components(config):
+            try:
+                nodes = client.json('GET', '/nodes')['nodes']
+            except (APIError, ConnectionFailure):
+                pass
+    except (OSError, ConnectionFailure, APIError):
+        return dict(decision='degraded', unchecked=['controller 不可达或缺少获授权的管理凭据；未核对在线兼容性'])
+    results = [evaluate_compat(manifest, info, kind, nodes) for kind in components(config)]
+    for result in results:
+        if result['decision'] == 'reject':
+            raise ValueError('release compatibility reject: ' + json.dumps(result, ensure_ascii=False))
+    return dict(decision='degraded' if any(r['decision'] == 'degraded' for r in results) else 'accept', roles=results)
+
+
+JOURNAL_STEPS = ('compat', 'verify', 'prepare', 'backup', 'switch', 'health')
+
+
+def timestamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def pid_alive(pid):
+    if type(pid) is not int or pid <= 0:
+        return None
+    if os.name == 'nt':
+        # os.kill(pid, 0) is not a liveness probe on Windows (it can terminate the process).
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False if ctypes.get_last_error() == 87 else None
+        try:
+            code = wintypes.DWORD()
+            return code.value == 259 if kernel.GetExitCodeProcess(handle, ctypes.byref(code)) else None
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+
+
+def interrupted_update(config, old):
+    prefix = Path(config['prefix'])
+    path = prefix / 'update-journal.json'
+    lock = prefix / '.install-lock'
+    if not path.exists() and not lock.exists():
+        return None
+    try:
+        journal = read_json(path) if path.exists() else None
+        owner = read_json(lock / 'owner.json') if (lock / 'owner.json').is_file() else {}
+        if journal and journal['status'] in ('done', 'failed') and not lock.exists():
+            return None
+        pid = owner.get('pid') or (journal or {}).get('pid')
+        alive = pid_alive(pid)
+        return dict(status='running' if alive else 'interrupted' if alive is False else 'pending',
+                    pid=pid, pid_alive=alive, lock=lock.exists(),
+                    journal={k: journal.get(k) for k in ('op_id', 'operation', 'from', 'to', 'status', 'steps', 'desired')}
+                    if journal else None,
+                    current=current_version(prefix, config['system']), recorded=(old or {}).get('version'))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return dict(status='pending', message='update journal, lock or pointer cannot be read; manual review required')
+
+
+class UpdateJournal:
+    def __init__(self, prefix, value):
+        self.path, self.value = prefix / 'update-journal.json', value
+
+    def save(self):
+        self.value['updated_at'] = timestamp()
+        write_json(self.path, self.value)
+
+    @contextmanager
+    def step(self, name):
+        step = next(s for s in self.value['steps'] if s['name'] == name)
+        step.update(status='running', started_at=timestamp(), finished_at=None, note='')
+        self.save()
+        try:
+            yield step
+        except Exception as exc:
+            step.update(status='failed', finished_at=timestamp(), note=type(exc).__name__)
+            self.save()
+            raise
+        else:
+            step.update(status='done', finished_at=timestamp())
+            self.save()
+
+    def finish(self, status, note):
+        self.value.update(status=status, note=note, finished_at=timestamp())
+        self.save()
+
+
+def start_desired(manager, config, desired):
+    if all(desired.get(k) == 'stopped' for k in components(config)):
+        for kind in components(config):
+            print('kept stopped: ' + kind)
+    else:
+        manager.start()
+
+
+def activate_and_check(config, directory, manifest, desired, manager, args):
+    # all-in-one needs a listening controller only when pairing a running worker.
+    code = args.pairing_code
+    if config['role'] == 'all-in-one' and config['service'] and desired['controller'] == 'running':
+        Services(dict(config, role='controller'), directory).start()
+        if desired['worker'] == 'running' and not (Path(config['state_dir']) / 'worker/agent.json').exists():
+            if not code:
+                code = package_command(config, directory, 'controller', 'pairing-code', '--data-dir',
+                    str(Path(config['state_dir']) / 'controller'), '--node-id', config['node_id'], controller_user=True).stdout.strip()
+            wait_doctor(dict(config, role='controller'), args.health_timeout)
+    if desired.get('worker') == 'running':
+        pair_worker(config, directory, code)
+    configure_worker_workspace(config)
+    started_at = time.time()
+    if config['role'] == 'all-in-one' and config['service']:
+        worker_config = dict(config, role='worker')
+        worker_manager = Services(worker_config, directory)
+        worker_manager.desired = desired
+        start_desired(worker_manager, worker_config, desired)
+        if desired['controller'] == 'stopped':
+            print('kept stopped: controller')
+    else:
+        start_desired(manager, config, desired)
+    if config['service'] and desired.get('worker') == 'running':
+        if (directory / 'agent_collab/release.py').is_file():
+            wait_worker_status(config, directory, manifest, started_at, timeout=min(60, args.health_timeout))
+        else:
+            print('Note: target worker version predates status.json; health confirmed by service manager and doctor only.')
+    health_options = {'desired': desired} if 'stopped' in desired.values() else {}
+    return wait_doctor(config, args.health_timeout if config['service'] else 0, **health_options)
+
+
+def installation_record(config, old, version, desired):
+    previous = (old or {}).get('version')
+    changed = previous and (previous != version or old['config']['python'] != config['python'])
+    prior = old if changed else (old or {}).get('previous')
+    if prior:
+        prior = {k: v for k, v in prior.items() if k != 'previous'}
+    return dict(version=version, config=config, desired=desired, previous=prior)
+
+
+def restore_drain(journal, config, client=None):
+    saved = journal.value.get('drain')
+    if saved and saved['restore_required']:
+        client = client or drain_client(config)
+        if client[1] != saved['node_id']:
+            raise ValueError('node identity changed; drain restoration requires review')
+        set_drain(*client, saved['original'])
+        saved['restore_required'] = False
+        journal.save()
+
+
+@contextmanager
+def recovery_lock(prefix):
+    """An OS-held recovery mutex is released even if the recovering process is killed."""
+    path = prefix / '.recover-lock'
+    if path.is_symlink():
+        raise ValueError('recovery lock must not be a symlink')
+    with path.open('a+b') as stream:
+        if os.name == 'nt':
+            import msvcrt
+            stream.seek(0, os.SEEK_END)
+            if not stream.tell():
+                stream.write(b'0')
+                stream.flush()
+            stream.seek(0)
+            try:
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise ValueError('another recovery owns prefix') from None
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise ValueError('another recovery owns prefix') from None
+            try:
+                yield
+            finally:
+                fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 def transaction(config, old, manifest, files, args):
+    from .release import compare_versions, parse_version
     prefix = Path(config['prefix'])
     version, previous = manifest['version'], old.get('version') if old else None
     directory = prefix / 'versions' / version
     changing = previous and previous != version
-    if previous:
-        refuse_active_worker(config, args.allow_active)
-    if files is not None:
-        directory = install_version(prefix, manifest, files)
     manager = Services(config, directory)
     old_config = old['config'] if previous else config
     old_directory = prefix / 'versions' / previous if previous else directory
@@ -1300,102 +1688,224 @@ def transaction(config, old, manifest, files, args):
     manager.desired = old_manager.desired = desired
     if old:
         old = dict(old, desired=desired)
-    drain, drained, started, switched, stopped = None, None, False, False, False
+    journal = UpdateJournal(prefix, dict(op_id=str(uuid.uuid4()),
+        operation='rollback' if args.rollback else 'upgrade' if previous else 'install',
+        **{'from': previous, 'to': version}, pid=os.getpid(), started_at=timestamp(), status='running',
+        desired=desired, old=old, config=config, drain=None,
+        manifest_sha256=hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest(),
+        steps=[dict(name=name, status='pending', started_at=None, finished_at=None, note='') for name in JOURNAL_STEPS]))
+    journal.save()
+    drain, stopped, switched = None, False, False
     try:
-        if previous and (changing or config['service']) and desired.get('worker') == 'running' and (Path(config['state_dir']) / 'worker/agent.json').exists():
-            drain = drain_client(config)
-            drained = drain_and_wait(*drain, timeout=args.drain_timeout)
-        if previous and config['service']:
-            stopped = True
-            old_manager.stop()
-        if not previous:
-            ensure_state(config, directory, manifest)
-        with stopped_locks(old_config, old_directory):
+        with journal.step('compat') as step:
+            parse_version(version)
+            if previous and not args.rollback and not args.allow_downgrade and compare_versions(version, previous) < 0:
+                raise ValueError('downgrade refused; use --rollback or --allow-downgrade (schema checks still apply)')
             if previous:
                 refuse_active_worker(config, args.allow_active)
-            if changing:
-                # Repeat compatibility after stopping to close the migration/check race.
-                compatible_schema(config, manifest, old_directory)
-                backup_controller(old_config, old_directory)
-            switch_current(prefix, version, config['system'])
-            switched = True
-            write_launchers(config)
-            manager.register()
-        # all-in-one needs a listening controller before the node can pair.
-        code = args.pairing_code
-        if config['role'] == 'all-in-one' and config['service'] and desired['controller'] == 'running':
-            Services(dict(config, role='controller'), directory).start()
-            started = True
-            if desired['worker'] == 'running' and not (Path(config['state_dir']) / 'worker/agent.json').exists():
-                if not code:
-                    code = package_command(config, directory, 'controller', 'pairing-code', '--data-dir',
-                        str(Path(config['state_dir']) / 'controller'), '--node-id', config['node_id'], controller_user=True).stdout.strip()
-                controller_only = dict(config, role='controller')
-                wait_doctor(controller_only, args.health_timeout)
-        if desired.get('worker') == 'running':
-            pair_worker(config, directory, code)
-        configure_worker_workspace(config)
-        started_at = time.time()
-        if config['role'] == 'all-in-one' and config['service']:
-            worker_manager = Services(dict(config, role='worker'), directory)
-            worker_manager.desired = desired
-            worker_manager.start()
-            if desired['controller'] == 'stopped':
-                print('kept stopped: controller')
-        else:
-            manager.start()
-        started = config['service']
-        if config['service'] and desired.get('worker') == 'running':
-            if (Path(directory) / 'agent_collab/release.py').is_file():
-                wait_worker_status(config, directory, manifest, started_at, timeout=min(60, args.health_timeout))
-            else:
-                # rc4 及更早的 worker 不写 status.json：回退到这些版本时只能用服务管理器与 doctor 确认，
-                # 不能证明实际进程来自该版本目录（主控验收时另行核对进程）。
-                print('Note: target worker version predates status.json; health confirmed by service manager and doctor only.')
-        health_options = {'desired': desired} if 'stopped' in desired.values() else {}
-        wait_doctor(config, args.health_timeout if config['service'] else 0, **health_options)
-        if drain is not None:
-            set_drain(*drain, drained)
-            drain = None
-        interpreter_changed = previous and old_config['python'] != config['python']
-        record = dict(version=version, config=config, desired=desired,
-                      previous=old if changing or interpreter_changed else (old or {}).get('previous'))
-        # Retain one previous record, not an ever-growing nested history.
-        if record['previous']:
-            record['previous'] = {k: v for k, v in record['previous'].items() if k != 'previous'}
-        write_json(prefix / 'installation.json', record)
-    except Exception:
-        if switched or stopped or started:
-            try:
-                if switched and config['service']:
-                    manager.stop()
-                if previous and not switched:
-                    # A stop can fail after stopping only one component. No new code has run.
-                    old_manager.start()
-                    print('Restarted previous services after interrupted stop.', file=sys.stderr)
-                elif previous:
-                    with stopped_locks(config):
-                        target = read_installed(old_directory)
-                        compatible_schema(old_config, target, directory)
-                        switch_current(prefix, previous, config['system'])
-                        write_launchers(old_config)
-                        old_manager.register()
-                    old_manager.start()
-                    print('Restored previous version: ' + previous, file=sys.stderr)
+                if 'controller' in components(config):
+                    compatible_schema(old_config, manifest, old_directory)
+            step['result'] = release_compatibility(config, manifest) if config['service'] else dict(
+                decision='degraded', unchecked=['离线安装；未核对在线兼容性'])
+            if step['result']['decision'] == 'degraded':
+                print('Release compatibility: ' + json.dumps(step['result'], ensure_ascii=False))
+        with journal.step('verify') as step:
+            release_source = getattr(args, '_source', None)
+            if release_source is None:
+                release_source = verify_source(prefix, args, version=version)
+            step['note'] = 'OpenSSH source verified' if release_source['verified'] else '未验证来源 (unsigned release)'
+            if files is not None:
+                install_version(prefix, manifest, files)
+            elif read_installed(directory) != manifest:
+                raise ValueError('installed release changed during verification')
+            save_source(prefix, version, release_source)
+        with journal.step('prepare'):
+            if getattr(args, '_runtime_payload', None):
+                install_runtime(config, args._runtime_payload)
+            if previous and (changing or config['service']) and desired.get('worker') == 'running' and (Path(config['state_dir']) / 'worker/agent.json').exists():
+                drain = drain_client(config)
+                def remember_drain(original):
+                    journal.value['drain'] = dict(node_id=drain[1], original=original, restore_required=True)
+                    journal.save()
+                drained = drain_and_wait(*drain, timeout=args.drain_timeout, before_drain=remember_drain)
+                if journal.value['drain'] is None:
+                    remember_drain(drained)
+            if previous and config['service']:
+                stopped = True
+                old_manager.stop()
+            if not previous:
+                ensure_state(config, directory, manifest)
+        with stopped_locks(old_config, old_directory):
+            with journal.step('backup') as step:
+                if previous:
+                    refuse_active_worker(config, args.allow_active)
+                if changing:
+                    compatible_schema(config, manifest, old_directory)
+                    backup_controller(old_config, old_directory)
                 else:
-                    manager.remove()
-                    switch_current(prefix, None, config['system'])
-            except Exception as exc:
-                drain = None  # do not resume claims after an unsafe/failed rollback
-                print('Automatic rollback refused/failed ({}); service state is unknown. '
-                      'Check service status/schema and restore backup before restarting.'.format(type(exc).__name__), file=sys.stderr)
+                    step['note'] = 'No version change; no controller backup needed'
+            with journal.step('switch'):
+                switch_current(prefix, version, config['system'])
+                switched = True
+                write_launchers(config)
+                manager.register()
+        with journal.step('health') as step:
+            step['result'] = activate_and_check(config, directory, manifest, desired, manager, args)
+            step['note'] = 'Stopped components checked offline; no service start or socket listener'
+            restore_drain(journal, config, drain)
+            write_json(prefix / 'installation.json', installation_record(config, old, version, desired))
+        journal.finish('done', 'Update complete')
+    except Exception:
+        safe = True
+        try:
+            switched = switched or current_version(prefix, config['system']) != previous
+            if switched and config['service']:
+                manager.stop()
+            if previous and not switched and stopped:
+                start_desired(old_manager, old_config, desired)
+                print('Restarted previous services after interrupted stop.', file=sys.stderr)
+            elif previous and switched:
+                with stopped_locks(config):
+                    target = read_installed(old_directory)
+                    rollback_args = parser().parse_args(['--allow-unsigned'] if args.allow_unsigned else [])
+                    rollback_source = verify_source(prefix, rollback_args, version=previous)
+                    if rollback_source['archive'] is not None and read_release(rollback_source['archive'])[0] != target:
+                        raise ValueError('previous release archive differs from installed release')
+                    compatible_schema(old_config, target, directory)
+                    switch_current(prefix, previous, config['system'])
+                    write_launchers(old_config)
+                    old_manager.register()
+                start_desired(old_manager, old_config, desired)
+                write_json(prefix / 'installation.json', old)
+                print('Restored previous version: ' + previous, file=sys.stderr)
+            elif switched:
+                manager.remove()
+                switch_current(prefix, None, config['system'])
+            restore_drain(journal, old_config, drain)
+        except Exception as exc:
+            safe = False
+            print('Automatic rollback refused/failed ({}); service state is unknown. '
+                  'Use --discover and --recover after reviewing schema and service state.'.format(type(exc).__name__), file=sys.stderr)
+        journal.finish('failed' if safe else 'pending', 'Previous version restored' if safe else 'Recovery required')
+        raise
+
+
+def recover_update(config, old, args):
+    prefix = Path(config['prefix'])
+    path, lock = prefix / 'update-journal.json', prefix / '.install-lock'
+    if not path.is_file():
+        raise ValueError('no update journal; review legacy lock/pointer manually before retrying')
+    journal = UpdateJournal(prefix, read_json(path))
+    value = journal.value
+    if not isinstance(value, dict):
+        raise ValueError('invalid update journal; manual review required')
+    if value.get('status') in ('done', 'failed') and not lock.exists():
+        print('No interrupted update to recover.')
+        return
+    owner = read_json(lock / 'owner.json') if (lock / 'owner.json').is_file() else {}
+    if pid_alive(owner.get('pid', value.get('pid'))) is not False:
+        raise ValueError('installer PID is live or cannot be checked; refusing recovery')
+    guard = ExitStack()
+    guard.enter_context(recovery_lock(prefix))
+    try:
+        if read_json(path) != value:
+            raise ValueError('journal changed concurrently; rerun discovery')
+        current_owner = read_json(lock / 'owner.json') if (lock / 'owner.json').is_file() else {}
+        if current_owner != owner or pid_alive(current_owner.get('pid', value.get('pid'))) is not False:
+            raise ValueError('install lock owner changed; rerun discovery')
+        pointer = current_version(prefix, config['system'])
+        before, target = value.get('from'), value.get('to')
+        saved = value.get('old')
+        target_config = value['config']
+        desired, _ = desired_state({'desired': value['desired']}, target_config)
+        expected = installation_record(target_config, saved, target, desired)
+        if (value['operation'] not in ('install', 'upgrade', 'rollback') or
+                value['status'] not in ('running', 'pending', 'done', 'failed') or
+                [s['name'] for s in value['steps']] != list(JOURNAL_STEPS) or
+                pointer not in (before, target) or (old or {}).get('version') not in (before, target) or
+                (saved or {}).get('version') != before or
+                target_config['prefix'] != str(prefix) or target_config['system'] != config['system'] or
+                (old and old.get('version') == target and before != target and old != expected) or
+                (old and old.get('version') == before and dict(old, desired=desired) != saved and
+                 not (before is None and old.get('version') is None))):
+            raise ValueError('journal, current pointer and installation record cannot be reconciled')
+        validate_paths(target_config, saved)
+        if saved:
+            validate_paths(saved['config'], saved)
+        if before == target:
+            raise ValueError('same-version update cannot be located relative to switch; manual review required')
+        if lock.exists():
+            if set(p.name for p in lock.iterdir()) - {'owner.json'}:
+                raise ValueError('unexpected install lock contents; manual review required')
+            (lock / 'owner.json').unlink(missing_ok=True)
+            lock.rmdir()
+        lock.mkdir()
+        write_json(lock / 'owner.json', dict(pid=os.getpid()))
+        value.update(pid=os.getpid(), status='running', recovered_at=timestamp())
+        journal.save()
+        if pointer == target and old == expected and all(s['status'] == 'done' for s in value['steps']) and not args.rollback:
+            journal.finish('done', 'Committed update reconciled; stale lock removed')
+            return
+        back = args.rollback or pointer == before
+        if back and before is None:
+            if pointer is not None:
+                raise ValueError('first install has no previous release to roll back to')
+            restore_drain(journal, target_config)
+            journal.finish('failed', 'First install interrupted before switch; rerun installation')
+            return
+        version = before if back else target
+        active_config = dict(saved['config'] if back else target_config)
+        if args.admin_token_file:
+            active_config['admin_token_file'] = config['admin_token_file']
+        directory = prefix / 'versions' / validate_version(version)
+        manifest = read_installed(directory)
+        if manifest['version'] != version:
+            raise ValueError('recovery directory and manifest versions differ')
+        if not back and hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest() != value['manifest_sha256']:
+            raise ValueError('recovery manifest differs from journal')
+        if not back and any(s['status'] != 'done' for s in value['steps'][:4]):
+            raise ValueError('target pointer has incomplete preparation evidence')
+        source = verify_source(prefix, args, version=version)
+        if source['archive'] is not None and read_release(source['archive'])[0] != manifest:
+            raise ValueError('saved signed archive differs from installed release')
+        compatible_schema(active_config, manifest, directory)
+        refuse_active_worker(active_config, args.allow_active)
+        save_source(prefix, version, source)
+        manager = Services(active_config, directory)
+        manager.desired = desired
+        manager.check_ownership()
+        if active_config['service']:
+            Services(target_config, prefix / 'versions' / (pointer or target)).stop()
+        with stopped_locks(active_config, directory):
+            compatible_schema(active_config, manifest, directory)
+            refuse_active_worker(active_config, args.allow_active)
+            switch_current(prefix, version, active_config['system'])
+            write_launchers(active_config)
+            manager.register()
+        if back:
+            start_desired(manager, active_config, desired)
+            wait_doctor(active_config, args.health_timeout if active_config['service'] else 0, desired=desired)
+            restore_drain(journal, active_config)
+            write_json(prefix / 'installation.json', dict(saved, desired=desired))
+            journal.finish('failed', 'Interrupted update restored to previous version')
+        else:
+            switch = next(s for s in value['steps'] if s['name'] == 'switch')
+            switch.update(status='done', finished_at=timestamp(), note='Reconciled target pointer')
+            journal.save()
+            with journal.step('health') as step:
+                step['result'] = activate_and_check(active_config, directory, manifest, desired, manager, args)
+                step['note'] = 'Recovery health; stopped components checked offline'
+                restore_drain(journal, active_config)
+                write_json(prefix / 'installation.json', expected)
+            journal.finish('done', 'Interrupted update completed')
+    except Exception as exc:
+        journal.finish('pending', 'Recovery unresolved: ' + str(exc))
         raise
     finally:
-        if drain is not None and drained is not None:
-            try:
-                set_drain(*drain, drained)
-            except Exception:
-                print('Node may remain drained; restore its prior drain setting after review.', file=sys.stderr)
+        if value['status'] in ('done', 'failed') and lock.exists():
+            (lock / 'owner.json').unlink(missing_ok=True)
+            lock.rmdir()
+        guard.close()
 
 
 def remove_tree(path, attempts=40, delay=0.25):
@@ -1416,6 +1926,26 @@ def remove_tree(path, attempts=40, delay=0.25):
             time.sleep(delay)
 
 
+def runtime_in_use(runtime):
+    """这个进程是不是正从 runtime 目录里运行。Windows 不能删除正在运行的解释器和它加载的 DLL（WinError 5）：
+    经已安装的启动器卸载时，进程就是 runtime 里的 Python。"""
+    try:
+        return os.name == 'nt' and Path(runtime).resolve() in Path(sys.executable).resolve().parents
+    except OSError:
+        return False
+
+
+def purge_runtime(prefix):
+    runtime = prefix / 'runtime'
+    if not runtime.exists():
+        return
+    if runtime_in_use(runtime):
+        print('Runtime %s runs this uninstaller and was kept; run the uninstall with --purge-code again from the desktop '
+              'app or another Python to remove it.' % runtime)
+        return
+    remove_tree(runtime)
+
+
 def uninstall(config, old, purge_code):
     prefix = Path(config['prefix'])
     # 经安装后的启动器运行时，工作目录就是当前版本目录（launcher.py 会 chdir 进去）；Windows 不能删除进程自己的
@@ -1426,11 +1956,13 @@ def uninstall(config, old, purge_code):
             os.chdir(str(prefix))
     except OSError:
         os.chdir(str(prefix))
+    # 桌面端卸载时保留后台留下的说明（Windows 安装器钩子写的）：这次卸载之后它不再成立。
+    (prefix / 'desktop-uninstalled.txt').unlink(missing_ok=True)
     if not old or not old.get('version'):
         if old and purge_code and (prefix / 'versions').exists():
             remove_tree(prefix / 'versions')
-        if old and purge_code and (prefix / 'runtime').exists():
-            remove_tree(prefix / 'runtime')
+        if old and purge_code:
+            purge_runtime(prefix)
         print('No managed installation; state directory is retained.')
         return
     directory = prefix / 'versions' / old['version']
@@ -1440,8 +1972,6 @@ def uninstall(config, old, purge_code):
         switch_current(prefix, None, config['system'])
         if purge_code:
             remove_tree(prefix / 'versions')
-            if (prefix / 'runtime').exists():
-                remove_tree(prefix / 'runtime')
         elif directory.exists():
             remove_tree(directory)
         for name in ('bin', 'services'):
@@ -1449,6 +1979,9 @@ def uninstall(config, old, purge_code):
                 remove_tree(prefix / name)
         (prefix / 'launcher.py').unlink(missing_ok=True)
         write_json(prefix / 'installation.json', dict(version=None, previous=None, config=config))
+        if purge_code:
+            # 放在安装记录改写之后：运行时被保留时，再次卸载走“没有受管安装”的分支删掉它。
+            purge_runtime(prefix)
     print('Uninstalled; all state, backups, workspaces and tool login configuration are retained.')
 
 
@@ -1456,9 +1989,11 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument('--role', choices=ROLES)
     for name in ('release', 'version', 'prefix', 'state-dir', 'controller-url', 'pairing-code',
-                 'node-id', 'python', 'runtime', 'admin-token-file', 'ca-file', 'bind', 'physical-host-id', 'failure-domain', 'workspace-root', 'instance'):
+                 'node-id', 'python', 'runtime', 'admin-token-file', 'ca-file', 'bind', 'physical-host-id', 'failure-domain', 'workspace-root', 'instance',
+                 'signature', 'allowed-signers'):
         result.add_argument('--' + name)
-    for name in ('no-service', 'dry-run', 'uninstall', 'purge-code', 'rollback', 'drain', 'allow-active', 'discover'):
+    for name in ('no-service', 'dry-run', 'uninstall', 'purge-code', 'rollback', 'drain', 'allow-active', 'discover',
+                 'recover', 'allow-unsigned', 'replace-trust', 'allow-downgrade'):
         result.add_argument('--' + name, action='store_true')
     result.add_argument('--drain-timeout', type=float, default=300)
     result.add_argument('--health-timeout', type=float, default=60)
@@ -1512,7 +2047,8 @@ def validate_paths(config, old):
     for value in config.values():
         if isinstance(value, str) and any(ord(c) < 32 for c in value):
             raise ValueError('control characters are not allowed in paths/options')
-    for base, names in ((prefix, ('versions', 'runtime', 'bin', 'services', 'installation.json', 'launcher.py', 'current.txt')),
+    for base, names in ((prefix, ('versions', 'runtime', 'bin', 'services', 'installation.json', 'launcher.py', 'current.txt',
+                                  'update-journal.json', '.install-lock', '.recover-lock', 'trust', 'release-sources')),
                         (state, ('controller', 'worker', 'logs', 'backups'))):
         for name in names:
             if (base / name).is_symlink():
@@ -1558,7 +2094,8 @@ def preflight(config, args, old, operation):
             raise ValueError('--node-id differs from the existing identity')
         if args.controller_url and validate_url(identity['controller']) != validate_url(args.controller_url):
             raise ValueError('--controller-url differs from the existing identity')
-    if not args.runtime:
+    # 卸载不运行记录里的解释器：上一次 --purge-code 删到一半时它可能已经残缺，再次卸载正要接着删掉它。
+    if not args.runtime and operation != 'uninstall':
         probe = probe_python(config['python'], managed=config.get('runtime', {}).get('managed', False))
         print('Environment: {} {} / Python {}'.format(config['system'], platform.machine(), probe.stdout.strip()))
     Services(config, Path(config['prefix']) / 'versions' / ((old or {}).get('version') or 'pending')).check_ownership()
@@ -1617,6 +2154,9 @@ def service_command(argv):
             reason = 'installation platform or prefix does not match this invocation'
             raise ValueError(reason)
         version = current_version(prefix, config['system'])
+        if args.action != 'status' and interrupted_update(full_config, old):
+            reason = 'unfinished update; use install --discover and --recover before service changes'
+            raise ValueError(reason)
         if version != old['version']:
             reason = 'current pointer and installation record differ; inspect interrupted installation'
             raise ValueError(reason)
@@ -1650,12 +2190,17 @@ def service_command(argv):
             lock = prefix / '.install-lock'
             lock.mkdir()
             try:
+                write_json(lock / 'owner.json', dict(pid=os.getpid()))
                 if read_json(prefix / 'installation.json') != old:
                     reason = 'installation changed concurrently; rerun service command'
                     raise ValueError(reason)
                 if args.action == 'stop':
-                    reason = 'worker has preparing/running attempts; drain first or pass --allow-active'
-                    refuse_active_worker(config, args.allow_active)
+                    try:
+                        refuse_active_worker(config, args.allow_active)
+                    except ValueError as exc:
+                        # 原因只含数量与状态（执行中的 attempt、待上报的写回），不含路径，原样给出。
+                        reason = str(exc)
+                        raise
                 desired, source = desired_state(old, full_config, Services(full_config, directory).autostart()
                                                 if args.component and 'desired' not in old else None)
                 if args.action == 'stop':
@@ -1696,6 +2241,7 @@ def service_command(argv):
                 report['desired'] = desired
                 success = True
             finally:
+                (lock / 'owner.json').unlink(missing_ok=True)
                 lock.rmdir()
         print(json.dumps(report, ensure_ascii=False))
         return 0 if success else 1
@@ -1748,6 +2294,23 @@ def main(argv=None):
             report = doctor(config, offline=args.no_service, desired=old.get('desired') if old else None)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report['ok'] else 1
+        if args.recover:
+            if args.release or args.uninstall or args.drain or args.runtime:
+                raise ValueError('--recover only combines with --rollback and recovery options')
+            if old:
+                config['service'] = old['config']['service']
+            if not (0 <= args.drain_timeout <= 86400 and 0 <= args.health_timeout <= 600):
+                raise ValueError('invalid drain/health timeout')
+            validate_paths(config, old)
+            if args.dry_run:
+                print(json.dumps(interrupted_update(config, old), ensure_ascii=False))
+                return 0
+            recover_update(config, old, args)
+            return 0
+        interrupted = interrupted_update(config, old)
+        if interrupted:
+            raise ValueError('unfinished update or install lock; use --discover (read-only), then --recover '
+                             'or --recover --rollback; do not replace current/installation.json manually')
         if sum(bool(v) for v in (args.rollback, args.uninstall, args.drain)) > 1:
             raise ValueError('choose only one of --rollback, --uninstall, --drain')
         if args.purge_code and not args.uninstall:
@@ -1759,7 +2322,13 @@ def main(argv=None):
         if operation == 'install':
             if not args.release:
                 raise ValueError('--release must name a local tar.gz or zip; no downloads are performed')
-            manifest, files = read_release(Path(args.release))
+            archive = Path(args.release).read_bytes()
+            args._source = verify_source(prefix, args, archive=archive)
+            manifest, files = read_release(archive)
+            from .release import compare_versions, parse_version
+            parse_version(manifest['version'])
+            if old and old.get('version') and not args.allow_downgrade and compare_versions(manifest['version'], old['version']) < 0:
+                raise ValueError('downgrade refused; use --rollback or --allow-downgrade (schema checks still apply)')
             if args.version and args.version != manifest['version']:
                 raise ValueError('--version does not match the release manifest')
             if not old and prefix.exists() and any(prefix.iterdir()):
@@ -1775,6 +2344,9 @@ def main(argv=None):
             manifest = read_installed(prefix / 'versions' / target)
             if manifest['version'] != target:
                 raise ValueError('previous directory and manifest versions differ')
+            args._source = verify_source(prefix, args, version=target)
+            if args._source['archive'] is not None and read_release(args._source['archive'])[0] != manifest:
+                raise ValueError('saved release archive differs from installed release')
             # Preserve the previous interpreter/configuration, plus this invocation's admin credential path.
             config = dict(old['previous']['config'], admin_token_file=config.get('admin_token_file'))
         pointer = current_version(prefix, system) if old else None
@@ -1783,6 +2355,7 @@ def main(argv=None):
         if old and pointer != old['version'] and not interrupted_uninstall:
             raise ValueError('current pointer and installation record differ; inspect interrupted installation')
         runtime_payload = read_runtime(Path(args.runtime).expanduser()) if args.runtime else None
+        args._runtime_payload = runtime_payload
         if runtime_payload:
             runtime_id, entries, python = runtime_payload
             config['python'] = str(prefix / 'runtime' / runtime_id / python)
@@ -1792,7 +2365,7 @@ def main(argv=None):
                  'Acquire prefix install lock; keep code and state separate']
         if operation in ('install', 'rollback'):
             steps += ['Stage immutable version ' + manifest['version'],
-                      'If changing a paired worker: API drain and wait for zero active attempts',
+                      'If changing a paired worker: API drain and wait for zero attempts and pending writebacks when available',
                       'Stop managed services (or require manual processes stopped); check state locks',
                       'Check schema compatibility; back up existing controller before switching',
                       'Keep existing identity/data; initialize only missing state and pair only a new worker',
@@ -1803,7 +2376,7 @@ def main(argv=None):
                       'Remove current pointer, launchers and active code' + (' plus all archived versions' if args.purge_code else ''),
                       'Retain ALL state, backups, business workspaces and official tool login configuration']
         else:
-            steps += ['API drain this node and wait for zero active attempts; leave it drained']
+            steps += ['API drain this node; wait for zero attempts and available pending_writebacks; leave it drained']
         for index, step in enumerate(steps, 1):
             print('{}. {}'.format(index, step))
         print('Service management: ' + ('enabled' if config['service'] else 'disabled; runtime checks are unknown'))
@@ -1811,6 +2384,8 @@ def main(argv=None):
         print('Review placeholders and validate the complete proxy configuration before an operator reload. '
               'Provider login must be completed locally by the user.')
         if args.dry_run:
+            if manifest and config['service']:
+                print('Release compatibility: ' + json.dumps(release_compatibility(config, manifest), ensure_ascii=False))
             if runtime_payload:
                 print('Runtime structure verified; Python version/import probe runs after staging on installation.')
             print('Dry run complete: no filesystem writes or API mutations were performed.')
@@ -1834,18 +2409,19 @@ def main(argv=None):
         try:
             lock.mkdir()
         except FileExistsError:
-            raise ValueError('another install owns prefix; after a crash, review state before removing .install-lock') from None
+            raise ValueError('another install owns prefix; after a crash use --discover and --recover') from None
+        completed = False
         try:
+            write_json(lock / 'owner.json', dict(pid=os.getpid()))
             # Guard a second installer finishing between our initial read and lock acquisition.
             latest = read_json(prefix / 'installation.json') if (prefix / 'installation.json').is_file() else None
             if latest != old:
                 raise ValueError('installation changed concurrently; rerun')
-            if runtime_payload:
-                install_runtime(config, runtime_payload)
             if operation == 'uninstall':
                 uninstall(config, old, args.purge_code)
             elif (old and not config['service'] and 'desired' in old
                   and manifest['version'] == old['version'] and config == old['config']
+                  and not args.runtime and not args.allowed_signers and not args.signature
                   and (not args.pairing_code or 'worker' not in components(config)
                        or (Path(config['state_dir']) / 'worker/agent.json').is_file())):
                 if read_installed(prefix / 'versions' / old['version']) != manifest:
@@ -1863,8 +2439,16 @@ def main(argv=None):
                 transaction(config, old, manifest, files, args)
             if operation != 'uninstall':
                 cleanup_runtimes(prefix, read_json(prefix / 'installation.json'))
+            completed = True
+        except Exception:
+            journal_path = prefix / 'update-journal.json'
+            completed = not journal_path.exists() or read_json(journal_path).get('status') in ('done', 'failed')
+            raise
         finally:
-            lock.rmdir()
+            # BaseException models process termination: preserve lock and running journal for recovery.
+            if completed and lock.exists():
+                (lock / 'owner.json').unlink(missing_ok=True)
+                lock.rmdir()
         return 0
     except (ValueError, KeyError, TypeError, OSError, RuntimeError, sqlite3.Error, tarfile.TarError,
             zipfile.BadZipFile, subprocess.SubprocessError, APIError, ConnectionFailure) as exc:

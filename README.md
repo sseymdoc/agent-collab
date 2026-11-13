@@ -50,8 +50,11 @@
 | `agent_collab/installer.py`、`installer/` | 安装、升级、回退、卸载与服务模板 |
 | `agent_collab/project.py`、`agent_collab/project_cli.py`、`agent_collab/node_projects.py` | 项目：本机扫描与基线、应用与取消、远端节点写回 |
 | `agent_collab/credstore.py` | CLI 与自动化客户端的凭据后端（系统凭据存储等） |
+| `agent_collab/maintenance.py`、`diagnostics.py`、`release_tools.py` | 维护操作（备份、核对、恢复预览、切换前清点）、不含凭据的诊断导出、发行清单与兼容判断 |
 | `desktop/` | Tauri 桌面端外壳（Rust）与随包本机助手 |
 | `ui/` | React + TypeScript 控制台源码，构建到 `agent_collab/static/` |
+| `scripts/` | 后台发行包与桌面安装包的构建、签名、门禁，第三方许可核对，发行密钥与通道文件的本机工具 |
+| `release-keys/` | 正式发行的公钥、`allowed_signers` 与指纹（私钥不在仓库里） |
 | `docs/` | 协议契约、组件说明、安装与运维、架构决定 |
 | `tests/` | 契约、恢复、并发、故障注入与本机多进程端到端测试 |
 

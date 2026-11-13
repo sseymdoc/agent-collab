@@ -30,7 +30,7 @@ CI（`.github/workflows/ci.yml`）在 Ubuntu、Windows、macOS 的 Python 3.13 �
 | 安装器、服务模板、升级与回退、发行包 | [docs/install.md](docs/install.md) |
 | 运维流程：配对、排空迁移、备份与实例外拉取、隔离恢复 | [docs/operations.md](docs/operations.md) |
 | 技术栈、依赖、拓扑、开发隔离 | [docs/adr/](docs/adr/) |
-| 许可证、第三方来源、发布前隐私复查 | [docs/release-checklist.md](docs/release-checklist.md)、[THIRD_PARTY.md](THIRD_PARTY.md) |
+| 许可证、第三方来源、桌面安装包门禁、签名公证与更新、发行托管、发布前隐私复查 | [docs/release-checklist.md](docs/release-checklist.md)、[THIRD_PARTY.md](THIRD_PARTY.md) |
 
 改运行时行为之前，先找到入口、权威实现和受影响的调用方；实现与文档契约不一致时，先弄清哪一边对再动手。协议变更在同一改动里依次改 `docs/protocol.md`、实现和测试。
 

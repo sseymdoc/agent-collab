@@ -71,7 +71,8 @@ def rehearse(backup_dir, work_dir, config=None):
     finally:
         source.close()
     data = work / 'controller'
-    generation = restore(data, backup_dir)
+    # 预演在没有当前数据库的隔离副本上恢复，要核对的正是备份里的状态：沿用备份里的凭据（--identity keep）。
+    generation = restore(data, backup_dir, identity='keep')
     if config:
         # 配置文件不在备份集里；给出时复制进副本，模型设置迁移据此取协调 profile。
         shutil.copyfile(str(config), str(data / 'config.json'))

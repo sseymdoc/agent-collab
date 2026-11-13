@@ -21,7 +21,7 @@ import unicodedata
 import uuid
 
 from . import protocol as p
-from .adapters.commands import NO_WINDOW
+from .adapters.commands import NO_WINDOW, which
 from .artifacts import DEFAULT_EXCLUDES, atomic_write, validate_excludes, workspace_excluded
 
 # 项目输入的缺省排除：版本库元数据、依赖与构建缓存、常见的凭据文件。用户可以在界面或命令行调整。
@@ -140,7 +140,7 @@ def git_info(root):
     """Git 项目的分支、提交与未提交改动数；不是 Git 项目或取不到时返回 None。只读，不改动仓库。"""
     if not (root / '.git').exists():
         return None
-    git = shutil.which('git')
+    git = which('git')
     if not git:
         return {'available': False}
     # 不运行仓库配置里的 fsmonitor 钩子，不写索引锁：选中的目录不一定可信，查询不应该执行其中配置的程序。

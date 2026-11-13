@@ -9,6 +9,8 @@ name = "agent_collab_desktop_lib"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 随包载荷清单的摘要（build.rs）；与运行时同一版本，已在依赖树里。
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -27,6 +29,10 @@ tauri-plugin-notification = "2"
 # 以下两项本来就在依赖树里（由 tauri、reqwest 带入）：生成 request_id 与应用 ID；解码 PEM 证书。
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+# 桌面更新：Tauri 官方 updater 负责检查、下载、验签与安装（只用 Rust API，页面经 update_* 命令）；
+# minisign-verify 已由它带入，用同一把公钥核对随更新发布的产品发行清单（ADR 0004）。
+tauri-plugin-updater = "2"
+minisign-verify = "0.3"
 
 [features]
 # 仅内部测试版用：编译进自动化钩子、对话框替身与助手位置覆盖（见 docs/desktop.md“自动化钩子”）。默认关闭。
