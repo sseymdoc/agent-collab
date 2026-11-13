@@ -38,7 +38,9 @@
 | `not_found` | controller 上没有这个对象，或本机没有这条连接 |
 | `io` | 本机文件读写失败 |
 | `not_bound` | 这个项目在这台机器上还没有选定目录 |
-| `busy` | 已有一项项目操作在进行（同一时间只运行一项） |
+| `busy` | 已有一项项目操作在进行（同一时间只运行一项）；或桌面端更新的下载、安装正在进行，或现在不满足安装更新的空闲条件 |
+| `incompatible` | 检查到的新版本与当前 controller 不兼容（缺少必需的 features），不下载也不安装 |
+| `not_configured` | 这个构建没有配置更新通道（没有 updater 公钥或更新地址） |
 | `cancelled` | 操作被用户取消 |
 | `helper_unavailable` | 本机助手不可用（安装包不完整） |
 | 其他 | 本机助手返回的错误码原样透出：`not_a_directory`、`unstable`、`path_conflict`、`unicode_conflict`、`source_changed`、`unfinished_application`、`insufficient_space`、`blob_mismatch`、`target_not_empty`、`no_application`、`no_snapshot` |
@@ -179,7 +181,7 @@ cd ../desktop && cargo tauri build         # Windows：NSIS 安装包；macOS：
 - Windows 安装器钩子（`windows/hooks.nsh`，`bundle.windows.nsis.installerHooks`）：复制文件之前清空受管的 `resources/app`、`runtime`、`release` 与 `payload.json`，覆盖安装与更新因此不留上一版删除或改名的模块；中途被打断时载荷不完整，助手拒绝启动，重新运行安装程序修复。卸载时若有本构建实例的本机后台（或上次没清除完的程序文件），询问是否一并卸载：选“是”用随包的运行时与本机助手运行 `install --uninstall --purge-code`（与“卸载本机后台”相同），没有完全清除时如实提示并可以取消这次卸载；静默卸载与选择“否”保留后台，在前缀里写 `desktop-uninstalled.txt`；更新模式不经过这里。行为表见 [install.md](install.md)“卸载桌面端时的本机后台”。安装后钩子记下界面语言，卸载向导与安装向导语言一致（`bundle.windows.nsis.languages` 为英文与简体中文：中文系统显示中文，其他系统用英文）。`windows/instance.nsh` 由 `build.rs` 按实例名生成（前缀目录名与实例名）。安装包在 `resources/licenses/` 里随附许可材料。
 - 随包发行包的文件名在构建时写进 `AGENT_COLLAB_BUNDLED_RELEASE`（`build.rs` 读 `resources/release/` 里唯一的那个），运行时只用它。
 - 构建身份与更新在构建时给出（ADR 0004 第 1 条）：`AGENT_COLLAB_BUILD_KIND`（`formal`、`candidate`、`internal-test`）、`AGENT_COLLAB_INSTANCE` 与 `AGENT_COLLAB_LOCAL_PORT`（正式版空 / 18669，候选 `cand` / 18769，内部测试 `itest` / 18779）、`AGENT_COLLAB_UPDATE_BASE` 与 `AGENT_COLLAB_UPDATE_CHANNELS`。本机部署的前缀、状态目录与服务名都带实例名，与正式版分开。正式身份的构建不能带 `automation` 与实例名（`build.rs` 拒绝），其余由发行门禁核对。
-- 发行构建用 `scripts/build_desktop.py`：`build`（组装载荷、按身份生成配置、构建、平台签名与公证的接入点、从最终产物生成更新签名）、`manifest`（产品发行清单与 `latest.json`）、`gate`（发行门禁）。签名顺序：macOS 先签随包运行时里的嵌套代码再生成载荷清单，应用由 Tauri 按 `signingIdentity` 签名（候选用临时签名 `-`，正式用 Developer ID 与 hardened runtime），公证与 stapling 之后才打更新归档；Windows 有证书时运行时二进制在生成载荷清单前签名，安装包由 Tauri 按证书签名，之后才生成更新签名。更新签名用 `tauri signer sign --app-version` 绑定版本，必须对应最后实际分发的字节。
+- 发行构建用 `scripts/build_desktop.py`：`build`（组装载荷、按身份生成配置、构建、平台签名与公证的接入点、从最终产物生成更新签名）、`manifest`（产品发行清单与 `latest.json`）、`sign`（在唯一的签名机上给不带更新签名构建的平台片段补更新签名）、`gate`（发行门禁）。签名顺序：macOS 先签随包运行时里的嵌套代码再生成载荷清单，应用由 Tauri 按 `signingIdentity` 签名（候选用临时签名 `-`，正式用 Developer ID 与 hardened runtime），公证与 stapling 之后才打更新归档；Windows 有证书时运行时二进制在生成载荷清单前签名，安装包由 Tauri 按证书签名，之后才生成更新签名。更新签名用 `tauri signer sign --app-version` 绑定版本，必须对应最后实际分发的字节。
 - 构建身份有三种，界面与 `app_info` 如实标明：
   - 正式版：版本号不带预发布后缀，不带 `automation`，实例名为空。
   - 开发候选版（可对外试用）：版本号带预发布后缀，不带 `automation`；用独立的应用标识与实例名构建，数据目录、安装前缀与服务名都与正式版分开。

@@ -92,12 +92,29 @@ def payload_manifest(resources, build):
     return hashlib.sha256(data).hexdigest(), len(files)
 
 
+def verify_release_signature(release, signature, signers):
+    """随包的后台发行包签名用安装器同一套核对（同一字节、signer 与 namespace）；核对不过就不打包，门禁据此记 signed。"""
+    sys.path.insert(0, str(ROOT))
+    from agent_collab import installer
+    archive, signed, trusted = Path(release).read_bytes(), Path(signature).read_bytes(), Path(signers).read_bytes()
+    reasons = []
+    for executable in installer.ssh_keygen_candidates():
+        try:
+            installer.verify_signature(executable, archive, signed, trusted)
+            return
+        except installer.VerifierUnavailable as exc:
+            reasons.append(str(exc))
+        except ValueError as exc:
+            raise SystemExit('后台发行包的来源签名核对不通过：%s' % exc)
+    raise SystemExit('没有能核对来源签名的 ssh-keygen：%s' % ('; '.join(reasons) or '找不到 ssh-keygen'))
+
+
 def tauri_signature(tauri, key, version, path):
     """Tauri updater 签名（minisign），--app-version 把版本写进受签名保护的注释，updater 据此拒绝版本错配。"""
     env = dict(os.environ, TAURI_SIGNING_PRIVATE_KEY_PASSWORD=os.environ.get('TAURI_SIGNING_PRIVATE_KEY_PASSWORD', ''))
     signature = Path(str(path) + '.sig')
     signature.unlink(missing_ok=True)
-    run(tauri + ['signer', 'sign', '-f', str(key), '-p', env['TAURI_SIGNING_PRIVATE_KEY_PASSWORD'], '--app-version', version, str(path)], env=env)
+    run(tauri + ['signer', 'sign', '-f', str(key), '--app-version', version, str(path)], env=env)
     if not signature.is_file():
         raise SystemExit('签名文件没有生成：%s' % signature)
     return signature.read_text(encoding='utf-8').strip()
@@ -149,7 +166,8 @@ def build(args):
     src, out = Path(args.src).resolve(), Path(args.out).resolve()
     tauri = shlex.split(args.tauri, posix=os.name != 'nt') if isinstance(args.tauri, str) else args.tauri
     commit = git(src, 'rev-parse', 'HEAD')
-    dirty = bool(git(src, 'status', '--porcelain', '--untracked-files=no'))
+    # 复制进包的是 desktop/、agent_collab/ 与许可材料：这些路径下未跟踪的文件也算改动（被忽略的生成物不算）。
+    dirty = bool(git(src, 'status', '--porcelain', '--untracked-files=all', '--', 'desktop', 'agent_collab', *LICENSE_FILES.values()))
     if dirty and not args.allow_dirty:
         raise SystemExit('源检出有未提交的改动；发行构建只从干净提交进行')
     if (kind == 'formal') == ('-' in version):
@@ -179,6 +197,7 @@ def build(args):
     shutil.copy2(str(release), str(resources / 'release' / release.name))
     backend = release_manifest(release)
     if args.release_signature:
+        verify_release_signature(release, args.release_signature, args.allowed_signers)
         shutil.copy2(args.release_signature, str(resources / 'release' / (release.name + '.sig')))
         shutil.copy2(args.allowed_signers, str(resources / 'release' / 'allowed_signers'))
     # 许可材料随桌面安装包分发（在载荷清单里，受同样的核对）：本项目许可证、第三方清单、页面与 Rust 依赖的许可证文本。

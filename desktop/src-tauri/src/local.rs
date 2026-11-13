@@ -13,6 +13,15 @@ use tauri::{AppHandle, Manager, State};
 use super::helper::{self, Captured, Helper};
 use super::{bundle, data_dir, device_name, err, helper_unavailable, invalid, io, pair, validate, BridgeError, Result, Shell};
 
+/// 按实例区分的名字：安装目录与系统凭据存储的服务名都用它，两边不会对不上。
+pub fn instance_name(instance: &str) -> String {
+    if instance.is_empty() {
+        "agent-collab".to_string()
+    } else {
+        format!("agent-collab-{instance}")
+    }
+}
+
 /// 本机部署的实例名：正式版为空串；开发候选版与内部测试版在构建时给出（环境变量 `AGENT_COLLAB_INSTANCE`），
 /// 安装到独立的前缀与状态目录，服务名带实例后缀，与同一台机器上的正式安装互不触碰。
 pub const INSTANCE: &str = match option_env!("AGENT_COLLAB_INSTANCE") {
@@ -66,8 +75,7 @@ impl Deployment<'_> {
     }
 
     fn directory(&self, kind: &str) -> PathBuf {
-        let name = if self.instance.is_empty() { "agent-collab".to_string() } else { format!("agent-collab-{}", self.instance) };
-        self.home.join(".local").join(kind).join(name)
+        self.home.join(".local").join(kind).join(instance_name(self.instance))
     }
 
     /// 安装前缀（代码）。实例为空时与安装器的缺省值相同。

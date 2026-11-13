@@ -88,7 +88,7 @@ class MaintenanceTests(ClientCase):
         self.assertIsNone(self.app.store.get('client', new['client_id']))
         self.assertTrue(self.app.meta()['dispatch_paused'])
         self.assertEqual(self.app.meta()['authority_generation'], 2)
-        receipt = json.loads((self.temp / 'restore-results' / (result['op_id'] + '.json')).read_text())
+        receipt = json.loads((self.temp / 'restore-results' / (result['op_id'] + '.json')).read_text(encoding='utf-8'))
         event = next(e for e in self.app.store.events() if e['type'] == 'controller.restored')
         self.assertEqual(receipt, event['payload'])
 
@@ -169,7 +169,7 @@ class MaintenanceTests(ClientCase):
         node.upload(b'content')
         node.checkpoint(a, manifest(b'content'))
         ident, source = self.create_backup()
-        saved = json.loads((source / 'backup-manifest.json').read_text())
+        saved = json.loads((source / 'backup-manifest.json').read_text(encoding='utf-8'))
         digest = p.sha256_bytes(b'content')
         blob = source / 'blobs' / digest[:2] / digest[2:4] / digest
         blob.unlink()
@@ -437,7 +437,7 @@ class MaintenanceTests(ClientCase):
 
     def test_incompatible_schema_is_blocked_and_source_unchanged(self):
         ident, source = self.create_backup()
-        saved = json.loads((source / 'backup-manifest.json').read_text())
+        saved = json.loads((source / 'backup-manifest.json').read_text(encoding='utf-8'))
         path = source / saved['database']
         db = sqlite3.connect(str(path))
         db.execute('PRAGMA user_version=999')

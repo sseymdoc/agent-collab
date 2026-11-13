@@ -17,7 +17,7 @@ import { Activity } from './pages/Activity'
 import { Unfinished } from './pages/JobResult'
 import { BuildMark } from './pages/Wizard'
 import { Maintenance, useAutoUpdate } from './pages/Maintenance'
-import { useNotifier } from './notify'
+import { notifyPrefs, useNotifier } from './notify'
 import './styles.css'
 
 try { applyTheme(localStorage.getItem('ac_theme')) } catch { /* 存储不可用时跟随系统 */ }
@@ -46,6 +46,8 @@ function Login({ onDone }: { onDone: () => void }) {
 }
 
 function App() {
+  // 自动更新的提示与事件通知共用“通知”设置里的总开关。
+  useAutoUpdate((title, body) => { if (notifyPrefs().enabled) void invoke('notify', { title, body }).catch(() => {}) })
   // 每次建立连接 generation 加一，主界面按它整体重建：上一条连接留下的弹窗、表单和在途请求的结果随之丢弃。
   const [phase, setPhase] = useState<{ at: 'boot' | 'login' | 'ready'; generation: number; reason: string | null; error: string | null }>(
     { at: 'boot', generation: 0, reason: null, error: null })
@@ -109,7 +111,6 @@ function Shell({ onLeave }: { onLeave: () => void }) {
   const hash = useHash()
   // 通知去重表与“连接建立时的最大序号”挂在 Shell 上，随连接切换（generation）重建。
   const notify = useNotifier()
-  useAutoUpdate((title, body) => { void invoke('notify', { title, body }).catch(() => {}) })
   const live = useLive(true, notify)
   const who = session()
   const [info, setInfo] = useState<any>(null)

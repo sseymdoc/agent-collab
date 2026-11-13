@@ -32,11 +32,7 @@ use validate::API_PREFIX as API;
 /// 系统凭据存储里的服务名，按构建身份的实例分开（ADR 0004 第 1 条）：正式版 `agent-collab`，
 /// 候选版 `agent-collab-cand`，内部测试版 `agent-collab-itest`。不同身份互相读不到对方的凭据。
 fn service_name() -> String {
-    if local::INSTANCE.is_empty() {
-        "agent-collab".to_string()
-    } else {
-        format!("agent-collab-{}", local::INSTANCE)
-    }
+    local::instance_name(local::INSTANCE)
 }
 const MAX_BODY: usize = 16 * 1024 * 1024;
 /// 60 秒没有收到任何字节（含 SSE 心跳）即认为连接停滞。
@@ -111,7 +107,7 @@ fn http_error(what: &str, status: StatusCode, body: &[u8]) -> BridgeError {
 }
 
 fn helper_unavailable() -> BridgeError {
-    err("helper_unavailable", "本机助手不可用：安装包不完整，或随包载荷核对没有通过（“关于”里有原因）；重新运行安装程序修复")
+    err("helper_unavailable", "本机助手不可用：安装包不完整，或随包载荷核对没有通过（窗口底部的版本信息里有原因）；重新运行安装程序修复")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -215,6 +211,24 @@ struct Shell {
     ops: projects::Ops,
     /// 本机部署的安装与服务启停逐个进行。
     deploying: tokio::sync::Mutex<()>,
+    /// 进行中的备份导出数：导出期间不安装桌面端更新（安装会重启应用，导出随之中断）。
+    exports: std::sync::atomic::AtomicUsize,
+}
+
+/// 备份导出期间计数，离开作用域即减一。
+struct Exporting<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Exporting<'a> {
+    fn new(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Exporting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Shell {
@@ -225,6 +239,7 @@ impl Shell {
             http: tls::http(None)?,
             ops: projects::Ops::default(),
             deploying: tokio::sync::Mutex::new(()),
+            exports: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -972,6 +987,7 @@ async fn backup_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64,
         return Ok(json!({ "cancelled": true }));
     };
     shell.lock().current(epoch)?;
+    let _exporting = Exporting::new(&shell.exports);
     let mut response = shell.send(epoch, &active, active.http.api.get(url)).await?;
     if !response.status().is_success() {
         let status = response.status();

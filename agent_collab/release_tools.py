@@ -84,7 +84,11 @@ def evaluate_compat(manifest, controller_info, role='worker', nodes=None):
                         unchecked.append('节点 ' + label + ' 未报告版本')
                     elif minimum and compare_versions(node_version, minimum) < 0:
                         reasons.append('节点 ' + label + ' 低于 controller_min_worker ' + minimum)
-                    node_compat = node.get('compat', identity.get('compat', {}))
+                    node_compat = node.get('compat', identity.get('compat'))
+                    if node_compat is None:
+                        # 节点注册目前只报版本与提交，没有兼容声明：如实列为未核对，不当作“没有要求”。
+                        unchecked.append('节点 ' + label + ' 未报告兼容声明，未核对它要求的 features 与最低 controller 版本')
+                        node_compat = {}
                     required = _features(node_compat.get('worker_requires', []))
                     if required - target_features:
                         reasons.append('目标 controller 缺少节点 ' + label + ' 必需 features')
@@ -136,7 +140,9 @@ def main(argv=None):
                         raise ValueError('--url and --controller differ')
                     args.url = args.controller
                     connection = cli.Conn(args)
-                    info = connection.call('GET', '/client')
+                    status, info = connection.send('GET', '/client')
+                    if status != 200:
+                        raise ValueError('GET /client returned HTTP %d' % status)
                     if args.role == 'controller':
                         status, body = connection.send('GET', '/nodes')
                         if status == 200:

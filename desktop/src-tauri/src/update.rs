@@ -295,6 +295,16 @@ struct Offer {
     manifest: Value,
     /// 检查时对当前 controller 的兼容结论；reject 时不下载也不安装（不只靠页面的按钮状态）。
     compat: Value,
+    /// 检查时的通道；之后改了通道，这次的结果与已下载的包都不再有效。
+    channel: String,
+}
+
+/// 下载与安装前核对：这次检查的通道仍是当前设置的通道。
+fn same_channel(app: &AppHandle, offer: &Offer) -> Result<()> {
+    if offer.channel != load_settings(app).channel {
+        return Err(invalid("更新通道已经改变，先重新检查更新"));
+    }
+    Ok(())
 }
 
 fn refused(offer: &Offer) -> Option<BridgeError> {
@@ -342,6 +352,9 @@ fn blockers(shell: &Shell) -> Vec<String> {
     if shell.deploying.try_lock().is_err() {
         found.push("本机部署的安装或服务操作正在进行".into());
     }
+    if shell.exports.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        found.push("正在把备份导出到这台机器".into());
+    }
     found
 }
 
@@ -362,9 +375,22 @@ pub fn update_status(app: AppHandle, shell: State<'_, Shell>, updates: State<'_,
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn update_settings(app: AppHandle, channel: String, auto_check: bool, auto_download: bool, auto_install: bool) -> Result<Value> {
+pub fn update_settings(
+    app: AppHandle,
+    updates: State<'_, Updates>,
+    channel: String,
+    auto_check: bool,
+    auto_download: bool,
+    auto_install: bool,
+) -> Result<Value> {
     if !channels().contains(&channel.as_str()) {
         return Err(invalid(format!("这个构建只有这些通道：{}", channels().join("、"))));
+    }
+    if load_settings(&app).channel != channel {
+        // 换了通道：上一个通道检查到的版本与下载好的包都作废。
+        *lock(&updates.offer) = None;
+        *lock(&updates.bytes) = None;
+        *lock(&updates.last_check) = None;
     }
     let settings = Settings { channel, auto_check, auto_download, auto_install };
     write_json(&settings_path(&app)?, &settings)?;
@@ -381,11 +407,16 @@ async fn fetch(url: url::Url) -> std::result::Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(format!("{url} 返回 HTTP {}", response.status().as_u16()));
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > MANIFEST_LIMIT {
-        return Err(format!("{url} 超过 1 MiB"));
+    // 边读边数，超过上限就停：不把过大的响应整个读进内存。
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > MANIFEST_LIMIT {
+            return Err(format!("{url} 超过 1 MiB"));
+        }
+        body.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(body)
 }
 
 /// 取回并核对新版本的产品发行清单：签名有效、发行 ID 等于 updater 宣布的版本、身份与本构建一致。
@@ -438,7 +469,7 @@ pub async fn update_check(app: AppHandle, updates: State<'_, Updates>, features:
                 "summary": summary(&manifest),
                 "compat": verdict,
             });
-            *lock(&updates.offer) = Some(Offer { update, manifest, compat: verdict });
+            *lock(&updates.offer) = Some(Offer { update, manifest, compat: verdict, channel: settings.channel.clone() });
             result
         }
     };
@@ -455,6 +486,7 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>) -> Res
         if let Some(e) = refused(offer) {
             return Err(e);
         }
+        same_channel(&app, offer)?;
         offer.update.clone()
     };
     let mut journal = Journal::new(&current_version(&app), &update.version, &load_settings(&app).channel);
@@ -508,6 +540,7 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
         if let Some(e) = refused(offer) {
             return Err(e);
         }
+        same_channel(&app, offer)?;
         offer.update.clone()
     };
     let bytes = lock(&updates.bytes).take().filter(|(version, _)| *version == update.version).map(|(_, bytes)| bytes);

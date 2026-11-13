@@ -48,7 +48,7 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 
 预演把备份集恢复到 `--work`，用新版本代码打开，核对：controller 身份不变；节点身份与节点凭据集合不变；每个任务的契约、`request_id`、`request_hash` 不变；已结束任务的状态与交付版本不变；检查点、发布与验收记录不变；模型设置按规则迁移（升级前的数据库得到 `gpt-6-astra / xhigh` 与 `high、xhigh、max` 的许可范围，协调模型取 `--config` 里的 profile）；旧根工作包的策略可读；已确认检查点引用的 blob 齐全；事件历史保留。
 
-副本的恢复代次加一、派单暂停、原有 attempt 全部撤销，旧 attempt 的迟到结果在副本上被隔离（报告的 `late_results_fenced`）。预演全程不监听端口，副本接不到任何节点；生产数据目录不被接触，备份集的清单、数据库与 blob 内容不变（报告的 `backup_content_unchanged`；核对与恢复只在独立副本打开 SQLite，不在原始备份集加锁或创建旁文件）。预演后删除 `--work` 即可。
+副本的恢复代次加一、派单暂停、原有 attempt 全部撤销，旧 attempt 的迟到结果在副本上被隔离（报告的 `late_results_fenced`）。预演全程不监听端口，副本接不到任何节点；生产数据目录不被接触，备份集的清单、数据库与 blob 内容不变（报告的 `backup_content_unchanged`；预演读取原始备份集时以只读、immutable 方式打开数据库，不加锁也不创建旁文件；恢复只写入独立副本）。预演后删除 `--work` 即可。
 
 报告的 `nodes_without_model_catalog` 列出仍参与运行（未排空、未退役）而尚未上报模型目录的节点：controller 升级后只会按旧适配器的固定组合给它们派单。已排空且不可达、或已退役的节点不在其中，也不计入切换前置条件。
 

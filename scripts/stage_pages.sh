@@ -14,9 +14,11 @@ done
 import json, sys
 latest = json.load(open(sys.argv[1], encoding='utf-8'))
 urls = [p['url'] for p in latest['platforms'].values()]
-bad = [u for u in urls if not u.startswith('https://') or '/releases/download/' not in u]
+# 版本化下载地址必须是这个版本的 Release（tag desktop-v<版本>），旧版本的地址会让 updater 取到别的包。
+tag = '/releases/download/desktop-v%s/' % latest['version']
+bad = [u for u in urls if not u.startswith('https://') or tag not in u]
 if bad or not urls:
-    sys.exit('latest.json 的更新包地址应指向 https 的版本化下载位置（manifest --download-base）：%s' % (bad or '没有平台'))
+    sys.exit('latest.json 的更新包地址应指向这个版本的 https 下载位置（…%s，manifest --download-base）：%s' % (tag, bad or '没有平台'))
 print('latest.json %s：%s' % (latest['version'], ', '.join(sorted(latest['platforms']))))
 EOF
 mkdir -p "$out/desktop/$channel"

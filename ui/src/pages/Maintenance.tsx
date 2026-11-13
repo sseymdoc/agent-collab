@@ -114,7 +114,9 @@ function LocalBackend() {
   const [out, setOut] = useState<string | null>(null)
   const load = () => invoke('local_discover').then(setD, e => setMsg([errText(e), 'err']))
   useEffect(() => { void load() }, [])
-  if (!d || !installed(d.install)) return null
+  // 第一次读取就失败时也要说明原因，不能整块消失。
+  if (!d) return msg ? <Section title="本机后台"><p className={msg[1]}>{msg[0]}</p></Section> : null
+  if (!installed(d.install)) return null
   const i = d.install
   // 安装器 discover 的 interrupted：上一次更新的 journal 摘要与当前指针（docs/install.md“中断与恢复”）。
   const stuck = i.interrupted && i.interrupted.status !== 'running' ? i.interrupted : null
@@ -163,7 +165,14 @@ function Backups({ tick }: { tick: number }) {
       恢复在 controller 停止后于 controller 所在机器上进行（见下方说明），这里只提供恢复前的影响预览。</p>
     <div className="actions">
       <input placeholder="备注（可选）" value={label} onChange={e => setLabel(e.target.value)} maxLength={80} />
-      <Action label="立即备份" scope="maintain" run={async () => { await api.createBackup(label.trim()); setLabel(''); await list.reload() }} />
+      <Action label="立即备份" scope="maintain" run={async () => {
+        // 维护操作失败（例如磁盘写满）时接口仍是 200，结果在 maintenance_op 里：按失败显示，不显示“已提交”。
+        const r: any = await api.createBackup(label.trim())
+        await list.reload()
+        const op = r?.maintenance_op
+        if (op?.status === 'failed') throw new Error('备份没有完成：' + (op.error?.message ?? op.error?.code ?? '未知原因'))
+        setLabel('')
+      }} />
     </div>
     <table className="grid"><thead><tr><th>时间</th><th>类型</th><th>位置</th><th>schema</th><th>内容</th><th>核对</th><th></th></tr></thead><tbody>
       {items.map(b => <tr key={b.id}>
@@ -303,7 +312,9 @@ function Diagnostics() {
 }
 
 // 自动检查（桌面端，启动后约 20 秒与每天一次由外壳发出 auto_check）：按本机的更新策略检查、下载，空闲时安装。
-// 检查时带上当前连接的 controller features 做兼容判断；不兼容（reject）时不下载、不安装，只提示。
+// 挂在 App 上（不随连接页与主界面切换卸载），否则启动时还在连接页就会错过这一次检查。
+// 已连接时带上 controller 的 features 做兼容判断（旧 controller 没有这个字段按空表，不当作未知）；不兼容（reject）时不下载、不安装，只提示。
+// 检查失败不打扰（“维护”页手动检查时显示原因）；下载或安装失败要提示。
 export function useAutoUpdate(notify: (title: string, body: string) => void) {
   useEffect(() => {
     if (!isDesktop) return
@@ -313,16 +324,22 @@ export function useAutoUpdate(notify: (title: string, body: string) => void) {
       if (e.payload?.phase !== 'auto_check' || busy) return
       busy = true
       try {
-        const st = await invoke('update_status')
-        if (!st.identity?.configured || !st.settings?.auto_check) return
-        const r = await invoke('update_check', { features: session()?.controller?.features ?? null })
+        let st: any, r: any
+        try {
+          st = await invoke('update_status')
+          if (!st.identity?.configured || !st.settings?.auto_check) return
+          const who = session()
+          r = await invoke('update_check', { features: who ? (who.controller?.features ?? []) : null })
+        } catch { return }
         if (!r.available) return
         notify('桌面端有新版本 ' + r.version, r.compat?.verdict === 'reject' ? '与当前 controller 不兼容，先升级 controller；详见“维护”页' : '在“维护”页查看并安装')
         if (r.compat?.verdict === 'reject' || !st.settings.auto_download) return
-        await invoke('update_download')
-        const now = await invoke('update_status')
-        if (st.settings.auto_install && !now.blockers?.length) await invoke('update_install')
-      } catch { /* 自动检查失败不打扰；“维护”页手动检查时显示原因 */ } finally { busy = false }
+        try {
+          await invoke('update_download')
+          const now = await invoke('update_status')
+          if (st.settings.auto_install && !now.blockers?.length) await invoke('update_install')
+        } catch (err) { notify('桌面端更新 ' + r.version + ' 没有完成', errText(err) + '；在“维护”页查看') }
+      } finally { busy = false }
     })
     return () => { void off.then((f: () => void) => f()) }
   }, []) // eslint-disable-line

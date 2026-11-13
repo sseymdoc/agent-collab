@@ -22,6 +22,31 @@ from agent_collab.installer import safe_name, schema_fingerprint, validate_paylo
 from agent_collab.release import parse_version
 
 
+def check_protocol(protocol):
+    """协议字段写进清单前先校验：坏值打出的包要到升级时才失败。"""
+    if set(protocol) != {'PROTOCOL_VERSION', 'FEATURES', 'COMPAT'}:
+        raise ValueError('protocol.py must define PROTOCOL_VERSION, FEATURES and COMPAT')
+    version, features, compat = protocol['PROTOCOL_VERSION'], protocol['FEATURES'], protocol['COMPAT']
+    if type(version) is not int or version < 1:
+        raise ValueError('PROTOCOL_VERSION must be a positive integer')
+    def names(value, label):
+        if not isinstance(value, (list, tuple)) or any(not isinstance(x, str) or not x for x in value) or len(set(value)) != len(value):
+            raise ValueError(label + ' must be a list of distinct non-empty strings')
+        return set(value)
+    own = names(features, 'FEATURES')
+    if not isinstance(compat, dict):
+        raise ValueError('COMPAT must be a dict')
+    for key, value in compat.items():
+        if key.endswith(('_requires', '_optional')):
+            names(value, 'COMPAT.' + key)
+        elif key.endswith(('_min_worker', '_min_controller')):
+            parse_version(value)
+        else:
+            raise ValueError('unknown COMPAT key: ' + key)
+    if not names(compat.get('client_optional', ()), 'COMPAT.client_optional') | names(compat.get('client_requires', ()), 'COMPAT.client_requires') <= own:
+        raise ValueError('COMPAT client features must be features of this release')
+
+
 def build_release(source, output, version):
     source, output = Path(source), Path(output)
     validate_version(version)
@@ -52,6 +77,7 @@ def build_release(source, output, version):
     protocol = {target.id: ast.literal_eval(node.value) for node in protocol_tree.body
                 if isinstance(node, ast.Assign) for target in node.targets
                 if isinstance(target, ast.Name) and target.id in ('PROTOCOL_VERSION', 'FEATURES', 'COMPAT')}
+    check_protocol(protocol)
     # Read the schema literal without importing or executing the source being packaged.
     tree = ast.parse(files['agent_collab/store.py'].decode('utf-8'))
     ddl = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)

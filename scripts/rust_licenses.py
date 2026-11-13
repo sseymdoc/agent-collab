@@ -172,7 +172,7 @@ def main(argv=None):
     problems = ['cargo 缓存里没有 %s' % c for c in absent] + problems + check(listed, deps, texts, extra)
     if problems:
         raise SystemExit('\n'.join(problems))
-    OUT.write_text(render(listed, deps, texts, extra), encoding='utf-8', newline='\n')
+    OUT.write_bytes(render(listed, deps, texts, extra).encode('utf-8'))  # LF everywhere; write_text(newline=) needs 3.10
     print('%s：%d 个 crate，其中 %d 个用补充文本' % (OUT.relative_to(ROOT), len(listed), sum(1 for c in listed if not texts.get(c))))
     return 0
 

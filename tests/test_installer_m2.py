@@ -458,8 +458,9 @@ class InstallerM2Tests(unittest.TestCase):
         if os.name == 'nt':
             self.skipTest('baseline byte fixtures use POSIX paths')
         # 固定路径下由基线 f7ebb3e 生成的完整模板 SHA-256，覆盖文件名、argv 与序列化格式。
+        # 有意的变化：controller 单元的 ReadWritePaths 加上 <state>/backups（维护 API 的在线备份写在那里）。
         expected = {
-            'Linux': {'agent-collab-controller.service': '0059f8db1ae5d564a819b69bcbdd53da187eb6303415db86d5d1123717af6fe8',
+            'Linux': {'agent-collab-controller.service': '2e3408734f7055a5623cce5ccf39315a0736f5b42aa7c18b3a2a3d6442b336ce',
                       'agent-collab-worker.service': 'f152907307b89aaab62067e83ff0d9642c6dda4b612cf3098d358d49d748ecd5'},
             'Darwin': {'agent-collab-controller.plist': 'e058cc8cedee7f3fe64976ccba0f12f21c89a3bea8a2b55e1fd19f6c833c0dab',
                        'agent-collab-worker.plist': 'ed2c1bda5d5829e6db6d1a28ad07a1c61fe39937038e7b767c1035c6af6a65e3'},

@@ -192,14 +192,17 @@ class DiagnosticsTests(unittest.TestCase):
         info = self.root / 'controller.json'
         self.write(info, {'client': {'token': 'client-fake-secret'}, 'nodes': [{'username': 'remote-user', 'hostname': 'remote-host'}],
                          'doctor': {'last_error': 'Authorization: Bearer remote-fake-secret'},
-                         'events': [{'input': 'PRIVATE-TASK-INPUT', 'note': '/Users/remote-user/demo'}]})
+                         'events': [{'input': 'PRIVATE-TASK-INPUT', 'note': '/Users/remote-user/demo'},
+                                    {'type': 'job.created', 'payload': {'contract': {'goal': 'PRIVATE-GOAL',
+                                     'acceptance': [{'text': 'PRIVATE-ACCEPTANCE'}]}}}]})
         with mock.patch('agent_collab.cli.Conn', side_effect=AssertionError('credentials')), \
                 mock.patch('agent_collab.cli.request') as request, mock.patch('urllib.request.urlopen') as network:
             status, output, error = self.run_cli('--controller-info', str(info))
         self.assertEqual((status, error), (0, ''))
         request.assert_not_called()
         network.assert_not_called()
-        for secret in ('client-fake-secret', 'remote-fake-secret', 'remote-user', 'remote-host', 'PRIVATE-TASK-INPUT'):
+        for secret in ('client-fake-secret', 'remote-fake-secret', 'remote-user', 'remote-host', 'PRIVATE-TASK-INPUT',
+                       'PRIVATE-GOAL', 'PRIVATE-ACCEPTANCE'):
             self.assertNotIn(secret, output)
         self.assertIn('controller', self.report()['sections'])
 
@@ -279,6 +282,17 @@ class DiagnosticsTests(unittest.TestCase):
         os.link(link, second)
         with self.assertRaises(ValueError):
             d.read_file(link, 100)
+
+    def test_short_identity_is_replaced_only_as_a_whole_word(self):
+        redactor = d.Redactor(home='/home/ann', username='ann', hostname='box')
+        self.assertEqual(redactor.text('ann@box: channel annotate inbox box-2'), '<user>@<host>: channel annotate inbox box-2')
+
+    def test_malformed_agent_state_leaves_the_rest_of_the_export(self):
+        self.write(self.state / 'worker/agent.json', '{not json')
+        self.assertEqual(self.run_cli()[0], 0)
+        sections = self.report()['sections']
+        self.assertEqual(sections['deployment']['status'], 'unavailable')
+        self.assertIn('runtime', sections)
 
     def test_oversized_json_is_not_partially_parsed(self):
         info = self.root / 'huge.json'

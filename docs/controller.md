@@ -209,7 +209,7 @@ backup 不改变派单暂停、提交闸门、任务状态或执行代次，不�
 
 恢复和核对只在临时副本打开备份数据库，源目录不再加锁，不创建 WAL/SHM，也不删除已有旁文件。归档只包含清单列出的载荷。恢复先核对数据库完整性、schema、全部 blob 及引用，失败指出对象且不替换当前库；通过后持有目标 controller 锁，在目标目录暂存修改并原子替换数据库。离线入口为 `agent-collab maintenance restore --data-dir D --from <目录或tar> [--identity carry-forward|keep|revoke-all] [--dry-run]`；旧 controller restore 使用同一规则，仍返回代次。
 
-当前库可读时默认拒绝优先结转授权：已撤销/删除客户端、已退役/删除节点及已消失/替换的凭据不复活，缩减的客户端权限不扩大；新增身份及新凭据逐项列为需要重新配对。当前库不可读或不存在时，必须显式 keep 或 revoke-all；keep 提示无法确认备份之后的撤销，revoke-all 撤销全部客户端与节点凭据。未用配对码与浏览器会话总是清除。目标目录已有 admin.token 保留；新目录下次启动生成新管理员令牌。
+当前库可读时默认按撤销优先的方式结转授权（carry-forward）：已撤销/删除客户端、已退役/删除节点及已消失/替换的凭据不复活，缩减的客户端权限不扩大；新增身份及新凭据逐项列为需要重新配对。当前库不可读或不存在时，必须显式 keep 或 revoke-all；keep 提示无法确认备份之后的撤销，revoke-all 撤销全部客户端与节点凭据。未用配对码与浏览器会话总是清除。目标目录已有 admin.token 保留；新目录下次启动生成新管理员令牌。
 
 generation 更新为 max(可读当前库,备份)+1，全部旧执行权撤销，旧活动任务变为 waiting_reconcile，取消中的保留 cancel_requested；派单暂停，普通提交闸门按备份原值。快照中未结束节点操作记为 timed_out，不重新下发，应用仍须对账。节点和本机项目文件写入不会被撤回。先核对工作区、副作用与未确认写回，再显式 retry 或应用恢复，最后解除派单暂停。授权策略、执行代次和未结束操作分别记录在恢复结果中；结果进入 `controller.restored` 事件、maintenance_op 及状态根 `restore-results/<op_id>.json`。
 

@@ -480,7 +480,9 @@ def render_services(config, directory, user_sid=None, desired=None):
                 raise ValueError('service directory cannot contain a newline')
             values = {'PREFIX': str(prefix), 'VERSION_DIR': str(directory).replace('%', '%%'),
                       'COMMAND': ' '.join(systemd_quote(s, command=True) for s in argv),
-                      'CONTROLLER_STATE': systemd_quote(state / 'controller')}
+                      'CONTROLLER_STATE': systemd_quote(state / 'controller'),
+                      # 维护 API 的在线备份写在数据目录旁的 backups（与升级前备份同一处）。
+                      'CONTROLLER_BACKUPS': systemd_quote(state / 'backups')}
             for key, value in values.items():
                 template = template.replace('@' + key + '@', value)
             rendered[name] = template.encode()
@@ -559,6 +561,9 @@ class Services:
         directory = Path(self.config['state_dir']) / 'controller'
         self.privileged(['chown', '-R', '-P', '-h', 'agent-collab:agent-collab', str(directory)])
         self.privileged(['chmod', '700', str(directory)])
+        # 服务单元把 backups 列为可写路径：它必须存在且归服务账户所有。
+        self.privileged(['install', '-d', '-m', '700', '-o', 'agent-collab', '-g', 'agent-collab',
+                         str(Path(self.config['state_dir']) / 'backups')])
 
     def destinations(self):
         for kind in components(self.config):
@@ -1461,6 +1466,26 @@ def save_source(prefix, version, source):
         atomic_write(prefix / 'trust/allowed_signers', source['trust'])
 
 
+def remember_trust(journal, source):
+    """信任变化要随更新一起提交：先在日志里记下原来的信任，失败回退时由 restore_trust 恢复。"""
+    if source['trust'] is not None and source['trust'] != source['previous_trust']:
+        previous = source['previous_trust']
+        journal.value.update(trust_changed=True, trust_before=None if previous is None else previous.decode('latin-1'))
+        journal.save()
+
+
+def restore_trust(prefix, journal):
+    if not journal.value.get('trust_changed'):
+        return
+    pinned, before = prefix / 'trust/allowed_signers', journal.value.get('trust_before')
+    if before is None:
+        pinned.unlink(missing_ok=True)
+    else:
+        atomic_write(pinned, before.encode('latin-1'))
+    journal.value['trust_changed'] = False
+    journal.save()
+
+
 def release_compatibility(config, manifest):
     from .client import APIError, Client, ConnectionFailure
     from .release_tools import evaluate_compat
@@ -1708,7 +1733,7 @@ def transaction(config, old, manifest, files, args):
             step['result'] = release_compatibility(config, manifest) if config['service'] else dict(
                 decision='degraded', unchecked=['离线安装；未核对在线兼容性'])
             if step['result']['decision'] == 'degraded':
-                print('Release compatibility: ' + json.dumps(step['result'], ensure_ascii=False))
+                print('Release compatibility: ' + json.dumps(step['result']))
         with journal.step('verify') as step:
             release_source = getattr(args, '_source', None)
             if release_source is None:
@@ -1718,6 +1743,7 @@ def transaction(config, old, manifest, files, args):
                 install_version(prefix, manifest, files)
             elif read_installed(directory) != manifest:
                 raise ValueError('installed release changed during verification')
+            remember_trust(journal, release_source)
             save_source(prefix, version, release_source)
         with journal.step('prepare'):
             if getattr(args, '_runtime_payload', None):
@@ -1758,6 +1784,7 @@ def transaction(config, old, manifest, files, args):
     except Exception:
         safe = True
         try:
+            restore_trust(prefix, journal)
             switched = switched or current_version(prefix, config['system']) != previous
             if switched and config['service']:
                 manager.stop()
@@ -1865,6 +1892,8 @@ def recover_update(config, old, args):
             raise ValueError('recovery manifest differs from journal')
         if not back and any(s['status'] != 'done' for s in value['steps'][:4]):
             raise ValueError('target pointer has incomplete preparation evidence')
+        if back:
+            restore_trust(prefix, journal)
         source = verify_source(prefix, args, version=version)
         if source['archive'] is not None and read_release(source['archive'])[0] != manifest:
             raise ValueError('saved signed archive differs from installed release')
@@ -2322,6 +2351,9 @@ def main(argv=None):
         if operation == 'install':
             if not args.release:
                 raise ValueError('--release must name a local tar.gz or zip; no downloads are performed')
+            # 压缩包不会比解包后的总量上限还大；先看文件大小，免得把超大的文件整个读进内存。
+            if Path(args.release).stat().st_size > MAX_RELEASE_BYTES:
+                raise ValueError('release exceeds size/file limit')
             archive = Path(args.release).read_bytes()
             args._source = verify_source(prefix, args, archive=archive)
             manifest, files = read_release(archive)
@@ -2385,7 +2417,7 @@ def main(argv=None):
               'Provider login must be completed locally by the user.')
         if args.dry_run:
             if manifest and config['service']:
-                print('Release compatibility: ' + json.dumps(release_compatibility(config, manifest), ensure_ascii=False))
+                print('Release compatibility: ' + json.dumps(release_compatibility(config, manifest)))
             if runtime_payload:
                 print('Runtime structure verified; Python version/import probe runs after staging on installation.')
             print('Dry run complete: no filesystem writes or API mutations were performed.')

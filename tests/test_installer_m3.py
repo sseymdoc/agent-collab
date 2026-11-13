@@ -234,6 +234,10 @@ class InstallerM3Tests(unittest.TestCase):
         self.assertEqual(ins.read_json(self.prefix / 'update-journal.json')['status'], 'pending')
         self.assertTrue((self.prefix / '.install-lock').exists())
 
+    def test_oversized_archive_is_refused_before_it_is_read(self):
+        with patch.object(ins, 'MAX_RELEASE_BYTES', self.v1.stat().st_size - 1),                 patch.object(Path, 'read_bytes', side_effect=AssertionError('archive read')):
+            self.assertIn('size/file limit', self.invoke('--release', str(self.v1), role='worker', status=1))
+
     def test_legacy_install_without_journal_upgrades_and_records_six_steps(self):
         self.invoke('--release', str(self.v1), role='worker')
         (self.prefix / 'update-journal.json').unlink()
@@ -284,6 +288,8 @@ class InstallerM3Tests(unittest.TestCase):
 
 
 class WritebackTests(unittest.TestCase):
+    setUpClass = classmethod(legacy.InstallerTests.setUpClass.__func__)
+    tearDownClass = classmethod(legacy.InstallerTests.tearDownClass.__func__)
     setUp = legacy.InstallerTests.setUp
 
     def test_all_unreported_writeback_states_refuse_without_exposing_paths(self):
@@ -390,6 +396,32 @@ class SignatureTests(unittest.TestCase):
         self.sign(self.other)
         self.invoke('--release', str(self.archive), '--signature', str(self.signature), '--allowed-signers', str(self.signers), '--replace-trust', role='worker')
         self.assertEqual((self.prefix / 'trust/allowed_signers').read_bytes(), self.signers.read_bytes())
+
+    def test_desktop_build_refuses_a_backend_signature_that_does_not_verify(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        build.verify_release_signature(self.archive, self.signature, self.signers)
+        self.sign(self.other)
+        with self.assertRaisesRegex(SystemExit, '核对不通过'):
+            build.verify_release_signature(self.archive, self.signature, self.signers)
+
+    def test_failed_upgrade_with_replaced_trust_restores_the_old_pin_and_rolls_back(self):
+        self.invoke('--release', str(self.archive), '--signature', str(self.signature), '--allowed-signers', str(self.signers), role='worker')
+        original = (self.prefix / 'trust/allowed_signers').read_bytes()
+        newer = self.temp / 'newer.tar.gz'
+        shutil.copyfile(self.v2, newer)
+        subprocess.run(['ssh-keygen', '-Y', 'sign', '-f', str(self.other), '-n', 'agent-collab-release', str(newer)],
+                       check=True, capture_output=True, **ins.NO_WINDOW)
+        replacement = self.temp / 'replacement_signers'
+        replacement.write_text('agent-collab-release ' + Path(str(self.other) + '.pub').read_text())
+        with patch.object(ins, 'activate_and_check', side_effect=RuntimeError('health check failed')):
+            output = self.invoke('--release', str(newer), '--signature', str(newer) + '.sig', '--allowed-signers', str(replacement),
+                                 '--replace-trust', role='worker', status=1)
+        self.assertIn('Restored previous version: 1.0.0', output)
+        self.assertEqual(ins.current_version(self.prefix), '1.0.0')
+        self.assertEqual((self.prefix / 'trust/allowed_signers').read_bytes(), original)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows 长路径写法')
     def test_windows_verbatim_paths_from_the_desktop_resource_dir_verify(self):

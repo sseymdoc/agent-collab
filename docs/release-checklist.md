@@ -1,6 +1,6 @@
 # 发布前清单
 
-每次对外发行（导出公开仓库、发行包、桌面安装包）之前逐项核对。本清单只列要求与核对方法；核对结果与证据记在发行记录里，不写进本文。
+每次对外发行（导出公开仓库、发行包、桌面安装包）之前逐项核对。本清单列要求、核对方法与已经定下的发行配置（长期密钥的指纹、托管与发布位置）；每次发行的核对结果与证据记在发行记录里，不写进本文。
 
 ## 1. 许可证
 
@@ -59,7 +59,7 @@
 
 首版采用人工触发的受控发行构建：Mac 构建机是 updater 签名与发行清单签名的唯一位置，Windows 构建机只持有自己的平台签名身份。每一步的产物在下一步之前冻结，签名之后不再重建或替换已嵌入的资源。
 
-1. **长期密钥（已生成，2026-11-13）。** 用 `scripts/release_keys.sh` 在 Mac 签名机上生成两把口令加密的密钥：updater 密钥（Tauri minisign）与发行签名密钥（OpenSSH ed25519，signer 与 namespace 都是 `agent-collab-release`）。公钥、`allowed_signers` 与指纹在仓库的 `release-keys/`：updater 公钥文件 SHA-256 `44245fda4a5a02d702f0488eaffe5b4c4c970b58cf733636f3358a2244fdc228`，发行签名公钥 `SHA256:LkClpWxIMI1GwvQkc4bG6nREDBw4DjGNGGkE9u3uY50`。
+1. **长期密钥（已生成）。** 用 `scripts/release_keys.sh` 在 Mac 签名机上生成两把口令加密的密钥：updater 密钥（Tauri minisign）与发行签名密钥（OpenSSH ed25519，signer 与 namespace 都是 `agent-collab-release`）。公钥、`allowed_signers` 与指纹在仓库的 `release-keys/`：updater 公钥文件 SHA-256 `44245fda4a5a02d702f0488eaffe5b4c4c970b58cf733636f3358a2244fdc228`，发行签名公钥 `SHA256:LkClpWxIMI1GwvQkc4bG6nREDBw4DjGNGGkE9u3uY50`。
    - 主托管：签名机当前账户下只有该账户可读写的目录；两份随机口令在该账户的系统钥匙串里，签名在已登录的图形会话里进行，口令不经过命令行输出或聊天。
    - 异机备份：另一台机器上只授权当前用户的目录，内容是加密私钥、公钥与指纹；两份口令另以该用户的系统级加密（Windows DPAPI）存在同一目录，所以恢复不依赖原签名机。可选再加一份离线副本。
    - 恢复办法：在备份所在机器上解出口令，经管道交给 `release_keys.sh check <备份目录>`；它用备份解开两把私钥，updater 密钥签小文件并核对密钥 ID，发行签名密钥签小文件并按 `allowed_signers` 验签。
@@ -67,8 +67,8 @@
 2. **平台签名身份（只需要引用，不经聊天传递证书、私钥或口令）。** 工具已安装不等于身份具备。Windows：Authenticode 证书在构建机证书存储或硬件令牌里（或既有的签名服务），构建环境给 `AGENT_COLLAB_SIGNTOOL`、`AGENT_COLLAB_SIGN_CERT_SHA1`（证书指纹）、`AGENT_COLLAB_TIMESTAMP_URL`；先用 `signtool sign /sha1 <指纹> /fd sha256 /tr <时间戳服务> /td sha256` 对样例程序签名、`signtool verify /pa` 通过。macOS：`security find-identity -v -p codesigning` 能看到 `Developer ID Application: … (<Team ID>)`，构建环境给 `AGENT_COLLAB_CODESIGN_IDENTITY`；公证凭据用 `xcrun notarytool store-credentials <名称>` 存进钥匙串（App Store Connect API 密钥，或 Apple ID 应用专用密码加 Team ID），构建环境给 `AGENT_COLLAB_NOTARY_PROFILE=<名称>`，先 `xcrun notarytool history --keychain-profile <名称>` 能列出记录。
 3. **固定发行。** 定下发行提交、版本号（不带预发布后缀）、身份 `formal`、应用标识 `org.agent-collab.desktop`、通道 `stable`、最低系统（Windows 10.0.19045、macOS 11.0）、正式 updater 公钥与指纹、发行 signer 与 namespace、发布地址。
 4. **构建。**
-   1. Mac：`scripts/build_release.py --version <版本>` 构建后台发行包，`ssh-keygen -Y sign -f release.key -n agent-collab-release` 签名（输入口令）。
-   2. Windows：`scripts/build_desktop.py build --kind formal --release … --release-signature … --allowed-signers … --update-base <通道根> --updater-pubkey updater.key.pub`（不带 `--updater-key`），构建环境带上 Authenticode 配置：随包二进制先签名再写载荷清单，安装包由 Tauri 签名。把 `dist/` 原样送到 Mac。
+   1. Mac：`scripts/build_release.py --version <版本>` 构建后台发行包，`ssh-keygen -Y sign -f release.key -n agent-collab-release <后台发行包>` 签名（输入口令）。
+   2. Windows：`scripts/build_desktop.py build --kind formal --release … --release-signature … --allowed-signers … --update-base <通道根> --updater-pubkey updater.key.pub`（不带 `--updater-key`），构建环境带上 Authenticode 配置：随包二进制先签名再写载荷清单，安装包由 Tauri 签名。把 `dist/` 原样送到 Mac：经两台机器之间认证的通道传送（例如 SSH），构建结束时在 Windows 上记下各产物的 SHA-256，Mac 补签前逐个对照，不一致就不签。`sign` 只核对产物与同一份 `dist/` 里的平台片段一致，片段本身不能证明来源；Windows 构建机持有 Authenticode 身份，本来就在信任范围内。
    3. Mac：`build --kind formal … --updater-key updater.key`（Developer ID、hardened runtime、公证与 stapling 之后才打更新归档，再生成更新签名）；把 Windows 的平台片段与产物放进同一个 `dist/`，`build_desktop.py sign --dist <dist> --updater-key updater.key` 给 Windows 更新包补签（字节与片段记录不符、或私钥与程序里的公钥不对应都拒绝）；`manifest --channel stable --base-url <通道根> --download-base <版本下载地址>`。
    4. Windows（有两个平台全部 crate 的 cargo 缓存）：`gate --require-platforms windows-x86_64,darwin-aarch64`。门禁会用 `cargo metadata` 核对第三方许可材料，Mac 上缺 Windows 专用的 crate 时无法离线解析依赖图。
 5. **验证。** 在两台干净虚拟机里从真实下载（带下载来源标记）安装：Windows 记录 `Get-AuthenticodeSignature` 结果与 SmartScreen 的实际表现；macOS 记录 `codesign --verify --deep --strict`、`spctl -a -t exec -vv`、`stapler validate` 与首次打开的表现。再做一次正式根下的更新：第一次正式发行没有上一正式版，就用同一正式根再构建一个只在隔离环境使用、不发布的下一个版本（例如 0.3.0 → 0.3.1）；测试身份不能带正式公钥，不能拿候选代替。不以生产部署作为升级目标。
@@ -110,8 +110,8 @@
 - [ ] 更新的失败路径：损坏的包、错误签名、缺目标平台、与当前 controller 不兼容、下载中断、宣布版本与清单不符、安装中断后修复，各自如实记录且旧版本可用。
 - [ ] 卸载：Windows 交互卸载时选“一并卸载本机后台”，服务、启动项与程序文件（`versions`、`runtime`）都移除，状态目录保留；没有完全清除时如实提示，可以取消这次卸载，再次运行卸载程序接着清除；静默卸载保留后台并在前缀里写 `desktop-uninstalled.txt`。macOS 删除应用包后本机后台照常运行、不引用应用包，之后要移除用前缀里的 `bin/agent-collab install --uninstall --purge-code`。
 - [ ] 后台发行包的来源验签用 OpenSSH 8.1 以上的 `ssh-keygen -Y verify`，核对固定的 signer `agent-collab-release`、namespace 与真实字节。安装器依次尝试系统自带的 OpenSSH 客户端（`%SystemRoot%\System32\OpenSSH`）、Microsoft Win32-OpenSSH 安装包的位置（`%ProgramFiles%\OpenSSH`）与 PATH；区分工具缺失、不支持 `-Y verify`、无法运行与签名不符，前三种换下一个工具或拒绝并说明办法，签名不符立即拒绝；都在改动安装、服务与信任之前。macOS 用 `/usr/bin/ssh-keygen`。
-- [ ] Windows 10 22H2（最低支持版本）的验签路径：在真实的 Windows 10 22H2 系统环境（虚拟机即可）上用 `C:\Windows\System32\OpenSSH\ssh.exe -V` 看系统自带客户端的版本；没有就按“可选功能 → OpenSSH 客户端”（或管理员 PowerShell `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`）安装；低于 8.1 时安装 Microsoft Win32-OpenSSH 的 MSI 客户端（`msiexec /i OpenSSH-Win64-<版本>.msi ADDLOCAL=Client`，装到 `%ProgramFiles%\OpenSSH`，不需要启用 sshd 或开放 22 端口）。然后装候选桌面端，用随包的安装器做一次真实验签与安装前检查，记录它输出的 `Release source verified … (OpenSSH, <所用的 ssh-keygen>)`。`ssh -V` 只作辅助诊断：PATH 上的 ssh 可能与安装器选中的不是同一个。2026-11-13 在 Windows 10 22H2（build 19045.2965）虚拟机上实测：系统默认带的客户端是 8.1p1，安装器选中 `C:\Windows\System32\OpenSSH\ssh-keygen.exe` 并通过验签，不需要 MSI。
-- [ ] 默认系统信任的公开 TLS 正例：在使用公开有效证书的独立候选 controller 上，两个平台的普通客户端不加自定义 CA、不关闭校验，完成配对、API、事件流（SSE 长连接）、本机助手与小工件读写。不用生产入口、静态下载页或测试 CA 代替；免账户的 Cloudflare Quick Tunnel 官方不支持 SSE，不能用。2026-11-13 的做法：用户域名下的测试子域名、Let's Encrypt DNS-01 证书、候选 controller 自己提供 TLS 并只监听局域网地址；验证后撤销测试客户端、删除测试证书与数据目录。
+- [ ] Windows 10 22H2（最低支持版本）的验签路径：在真实的 Windows 10 22H2 系统环境（虚拟机即可）上用 `C:\Windows\System32\OpenSSH\ssh.exe -V` 看系统自带客户端的版本；没有就按“可选功能 → OpenSSH 客户端”（或管理员 PowerShell `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`）安装；低于 8.1 时安装 Microsoft Win32-OpenSSH 的 MSI 客户端（`msiexec /i OpenSSH-Win64-<版本>.msi ADDLOCAL=Client`，装到 `%ProgramFiles%\OpenSSH`，不需要启用 sshd 或开放 22 端口）。然后装候选桌面端，用随包的安装器做一次真实验签与安装前检查，记录它输出的 `Release source verified … (OpenSSH, <所用的 ssh-keygen>)`。`ssh -V` 只作辅助诊断：PATH 上的 ssh 可能与安装器选中的不是同一个。Windows 10 22H2 默认带的 OpenSSH 客户端是 8.1p1，满足要求。
+- [ ] 默认系统信任的公开 TLS 正例：在使用公开有效证书的独立候选 controller 上，两个平台的普通客户端不加自定义 CA、不关闭校验，完成配对、API、事件流（SSE 长连接）、本机助手与小工件读写。不用生产入口、静态下载页或测试 CA 代替；免账户的 Cloudflare Quick Tunnel 官方不支持 SSE，不能用。可行的做法：自有域名下的测试子域名、Let's Encrypt DNS-01 证书、候选 controller 自己提供 TLS 并只监听局域网地址，验证后撤销测试客户端、删除测试证书与数据目录。
 - [ ] 真实睡眠/唤醒：Windows x64 与 macOS Apple Silicon 各验证一次（记录实际进入的电源状态、节点离线与恢复、任务与操作如何收敛、旧 attempt 迟到的结果如何处理）。用借来的非生产设备，或经批准的现有宿主维护窗口（窗口内暂停这台节点接单，候选 controller 放在不随被测宿主睡眠的另一台机器上）；虚拟机、暂停虚拟机、断网、锁屏、注销与重启都不能代替。
 
 ## 7. 隐私与环境信息

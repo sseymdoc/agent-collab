@@ -24,6 +24,15 @@ ask() {
   printf %s "$value"
 }
 
+# ssh-keygen 没有从环境或标准输入读口令的选项：经 SSH_ASKPASS（OpenSSH 8.4 起的 SSH_ASKPASS_REQUIRE）从环境变量取，
+# 不出现在进程参数里。tauri signer sign 从 TAURI_SIGNING_PRIVATE_KEY_PASSWORD 取。
+# tauri signer generate 只能用 -p 传口令（生成只在签名机上做一次）。
+askpass() {
+  export SSH_ASKPASS="$1/askpass" SSH_ASKPASS_REQUIRE=force AC_RELEASE_PASSPHRASE="$2"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$AC_RELEASE_PASSPHRASE"\n' > "$SSH_ASKPASS"
+  chmod 700 "$SSH_ASKPASS"
+}
+
 fingerprints() {
   echo "updater 公钥文件 SHA-256：$(shasum -a 256 < "$1/updater.key.pub" | cut -c1-64)"
   echo "发行签名公钥：$(ssh-keygen -l -f "$1/release.key.pub")"
@@ -45,8 +54,10 @@ case $cmd in
     mkdir -p "$dir" && chmod 700 "$dir"
     up=$(ask 'updater 私钥口令'); rp=$(ask '发行签名私钥口令')
     if [ -z "$up" ] || [ -z "$rp" ]; then echo '口令不能为空' >&2; exit 1; fi
+    t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
     $TAURI signer generate -w "$dir/updater.key" -p "$up" --ci > /dev/null
-    ssh-keygen -q -t ed25519 -C agent-collab-release -N "$rp" -f "$dir/release.key"
+    askpass "$t" "$rp"
+    ssh-keygen -q -t ed25519 -C agent-collab-release -f "$dir/release.key" < /dev/null
     echo "agent-collab-release namespaces=\"agent-collab-release\" $(cut -d' ' -f1-2 "$dir/release.key.pub")" > "$dir/allowed_signers"
     chmod 600 "$dir/updater.key" "$dir/release.key"
     fingerprints "$dir" | tee "$dir/FINGERPRINTS" ;;
@@ -56,14 +67,15 @@ case $cmd in
     up=$(ask 'updater 私钥口令'); rp=$(ask '发行签名私钥口令')
     t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
     echo check > "$t/updater-sample"
-    $TAURI signer sign -f "$dir/updater.key" -p "$up" "$t/updater-sample" > /dev/null
+    TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$up" $TAURI signer sign -f "$dir/updater.key" "$t/updater-sample" > /dev/null
+    askpass "$t" "$rp"
     same_key_id "$dir/updater.key.pub" "$t/updater-sample.sig" || { echo 'updater 私钥与公钥不对应' >&2; exit 1; }
-    [ "$(ssh-keygen -y -P "$rp" -f "$dir/release.key" | cut -d' ' -f1-2)" = "$(cut -d' ' -f1-2 "$dir/release.key.pub")" ] \
+    [ "$(ssh-keygen -y -f "$dir/release.key" < /dev/null | cut -d' ' -f1-2)" = "$(cut -d' ' -f1-2 "$dir/release.key.pub")" ] \
       || { echo '发行签名私钥与公钥不对应' >&2; exit 1; }
     # 用解开的临时副本对小文件真实签名，再按 allowed_signers 验签（signer 与 namespace 同正式流程）；副本随临时目录删除。
     echo check > "$t/release-sample"
     cp "$dir/release.key" "$t/release.key" && chmod 600 "$t/release.key"
-    ssh-keygen -q -p -P "$rp" -N '' -f "$t/release.key" > /dev/null
+    ssh-keygen -q -p -N '' -f "$t/release.key" < /dev/null > /dev/null
     ssh-keygen -q -Y sign -f "$t/release.key" -n agent-collab-release "$t/release-sample" 2> /dev/null
     ssh-keygen -Y verify -f "$dir/allowed_signers" -I agent-collab-release -n agent-collab-release -s "$t/release-sample.sig" \
       < "$t/release-sample" > /dev/null || { echo '发行签名验签失败（allowed_signers 与私钥不对应）' >&2; exit 1; }
@@ -71,10 +83,15 @@ case $cmd in
     fingerprints "$dir" ;;
   backup)
     dest=${3:?备份目录}
-    if [ -e "$dest/updater.key" ]; then echo "$dest 里已有备份，不覆盖" >&2; exit 1; fi
-    mkdir -p "$dest" && chmod 700 "$dest"
-    for f in $FILES; do cp -p "$dir/$f" "$dest/$f"; done
-    for f in $FILES; do [ "$(shasum -a 256 < "$dir/$f")" = "$(shasum -a 256 < "$dest/$f")" ] || { echo "$f 复制后不一致" >&2; exit 1; }; done
+    if [ -n "$(ls -A "$dest" 2> /dev/null)" ]; then echo "$dest 已存在且不为空，不覆盖" >&2; exit 1; fi
+    # 先复制进同一父目录下的临时目录并核对，再整体改名就位：中途失败不会留下让重跑被拒的半份备份。
+    mkdir -p "$(dirname "$dest")"
+    stage=$(mktemp -d "$(dirname "$dest")/.backup.XXXXXX"); trap 'rm -rf "$stage"' EXIT
+    chmod 700 "$stage"
+    for f in $FILES; do cp -p "$dir/$f" "$stage/$f"; done
+    for f in $FILES; do [ "$(shasum -a 256 < "$dir/$f")" = "$(shasum -a 256 < "$stage/$f")" ] || { echo "$f 复制后不一致" >&2; exit 1; }; done
+    rmdir "$dest" 2> /dev/null || true
+    mv "$stage" "$dest"
     echo "已备份到 $dest（只有加密私钥、公钥与指纹；口令另行保管）" ;;
   *)
     echo "未知命令：$cmd" >&2; exit 2 ;;

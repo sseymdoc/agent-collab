@@ -27,7 +27,9 @@ TASK_WARNING = '任务原始日志可能包含项目内容；已按相同规则�
 SECRET_KEY = re.compile(r'(?i)(?:^|[_-])(?:token|secret|password|code|key)(?:$|[_-])')
 CONTENT_KEYS = {'input', 'inputs', 'prompt', 'task_input', 'source', 'source_code',
                 'content', 'files', 'artifacts', 'stdout', 'stderr', 'stdout_tail', 'stderr_tail',
-                'instructions', 'messages', 'frozen_input', 'task_spec'}
+                'instructions', 'messages', 'frozen_input', 'task_spec',
+                # 任务契约（controller 事件里的 job 记录会带上）：目标、验收项与排除项是用户写的任务内容。
+                'contract', 'goal', 'acceptance', 'exclusions', 'harness_params'}
 
 
 def normalized_key(name):
@@ -89,7 +91,8 @@ class Redactor:
                        lambda m: self.mark('home', '~'), value)
         for identity, category, replacement in ((self.username, 'username', '<user>'), (self.hostname, 'hostname', '<host>')):
             if identity:
-                value = re.sub(re.escape(identity), lambda m: self.mark(category, replacement), value, flags=re.I)
+                value = re.sub(r'(?<![\w-])' + re.escape(identity) + r'(?![\w-])',
+                               lambda m: self.mark(category, replacement), value, flags=re.I)
         return value
 
     def value(self, value):
@@ -189,11 +192,6 @@ def configuration(args):
     config['state_dir'] = str(local_path(config['state_dir']))
     if config['role'] not in installer.ROLES:
         raise ValueError('无效的安装角色')
-    # discover 只读取这个固定 JSON；在调用前拒绝重定向及过大的文件。
-    try:
-        read_json(Path(config['state_dir']) / 'worker/agent.json')
-    except FileNotFoundError:
-        pass
     return config, old
 
 
@@ -280,6 +278,11 @@ def collect(args):
                  python=platform.python_version(), os=platform.system(), os_version=platform.release(),
                  architecture=platform.machine()))
     try:
+        # discover 只读取这个固定 JSON；在调用前拒绝重定向及过大的文件，坏文件让这一段不可用而不是中止导出。
+        try:
+            read_json(state / 'worker/agent.json')
+        except FileNotFoundError:
+            pass
         section('deployment', str(prefix / 'installation.json'), '安装器只读发现、服务状态/归属/期望与运行上下文',
                 installer.discover(config, old))
     except (OSError, ValueError, KeyError, TypeError) as exc:

@@ -387,7 +387,7 @@ class InstallerTests(unittest.TestCase):
         # systemd 双引号内反斜杠需转义；在 Windows 上运行本测试时路径含反斜杠。
         quoted = lambda path: str(path).replace('\\', '\\\\')
         self.assertNotIn(str(self.prefix / 'current'), controller)
-        self.assertIn('ReadWritePaths="' + quoted(self.state / 'controller') + '"', controller)
+        self.assertIn('ReadWritePaths="' + quoted(self.state / 'controller') + '" "' + quoted(self.state / 'backups') + '"', controller)
         # systemd 不解析 WorkingDirectory 的引号：必须是未加引号的绝对路径（ECS 实装回归）。
         for unit in linux.values():
             line = next(x for x in unit.decode().splitlines() if x.startswith('WorkingDirectory='))

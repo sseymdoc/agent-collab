@@ -586,7 +586,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - `POST /projects/{id}/applications/{application_id}/recover` `{"request_id", "action": "status|resume|rollback|abandon"}` → 201 op（`kind: project_recover`）。只用于远端写回、且记录仍为 `started`，否则 409。`status` 以外的动作在这次应用的 `project_apply` 或另一个非 status 的 `project_recover` 仍为 `requested` 或 `received` 时返回 409（`details.operation_id` 是那项操作）；受理后应用记录带 `recovery_operation_id`，此后只认这项操作的结果，超时后晚到的原应用结果不再结束记录。
   - 校验：任务属于该项目且有已发布检查点（409）；节点在册（404）、未退役（409 `node_retired`）、声明了该项目的绑定（409 `not_bound`）；项目未归档（写回，409 `project_archived`）。
   - 操作参数全部由 controller 按任务记录填写：`project_id`、`job_id`、`checkpoint_id` 与 `manifest_sha256`（已发布检查点）、`base_manifest_sha256`（任务的输入基线，可为 null）、`exclude`（契约的 `workspace.exclude`）；写回另有 `application_id`、`skip_conflicts`，恢复另有 `application_id`、`action`。通用的 `POST /nodes/{id}/operations` 不接受这三种操作（400）。远端写回的结果只由目标节点上报：经 `POST /projects/{id}/applications/{application_id}` 上报远端写回返回 403。
-- 已上报过结果的 `project_apply` 或 `project_recover` 又被下发（controller 没有它的结果，例如从备份恢复回到了领取之前）时，节点不重新执行，确认领取后按本机应用日志补报当时的结果。
+- 已上报过结果的 `project_apply` 或 `project_recover` 又被下发（controller 没有它的结果）时，节点不重新执行，确认领取后按本机应用日志补报当时的结果。
 - 节点执行：只在绑定目录上调用 `agent_collab/project.py` 的 plan、apply、recover（§13.4 的规则：三方比较、冲突缺省不写、`skip_conflicts` 时部分写入、逐文件备份与日志、中断后续写、回滚或按现状结束）；应用日志与备份在节点数据目录的 `projects/` 里。manifest 与成果内容用节点令牌经 `GET /blobs/<sha256>` 取得并核对哈希（节点令牌此前就可读 blob，没有新增权限）。节点同一时间只执行一项这类操作。
 - 结果：
   - `project_plan`：`result` 为计划（`changes`、`summary`、`base_manifest_sha256`、`manifest_sha256`、`root_name`），没有 `root`。过长时截断：冲突排在前面保留，带 `truncated` 与原条数 `counts`。
@@ -639,7 +639,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - 预览、列表、导出、inspect 都不调用 `backup()`，不处理请求到期、不写 controller 数据库。它们会在临时目录复制并核对备份；原始备份的文件、哈希及旁文件保持不变。
 - 离线恢复须在 controller 停止后、目标主机执行。当前库可读时，默认 `carry-forward`：备份之后撤销或删除的客户端、退役/删除的节点及消失或替换的凭据按拒绝优先结转；缩减过的客户端 scopes 不会扩大。即使给 `keep`，也不能覆盖已知撤销。备份之后新增的客户端、节点及换过的凭据逐项列在 `identity.re_pair`。
 - 当前库不可读或不存在时，必须显式选择 `keep`（保留备份授权，结果警告无法确认备份之后撤销）或 `revoke-all`（撤销全部客户端/节点凭据，重新配对）。不选或选 carry-forward 返回 `identity_required`。所有恢复清除旧浏览器会话及未用配对码；管理令牌仍按目标主机现有文件处理，不随备份迁移。
-- generation 更新为 `max(可读当前库,备份)+1`，执行权全部撤销、派单暂停，提交闸门取备份原值；这是执行 fencing，与授权撤销分别记录。快照中的未结束节点操作记为 timed_out，不重新下发；应用记录保留，先对账再显式恢复应用。
+- generation 更新为 `max(可读当前库,备份)+1`，执行权全部撤销、派单暂停，提交闸门取备份原值；这是执行 fencing，与授权撤销分别记录。快照中未结束的节点操作（通用操作与项目写回、恢复操作都包括在内）记为 timed_out（`error.code: restore_requires_reconcile`），不重新下发：备份之后节点可能已经执行过它们。项目写回与恢复的应用记录保留为待确认，节点之后上报的结果按 §13.10 的对账规则更新应用；也可以先对账再显式发起 recover。
 - 核对失败返回如 `backup_object_missing`（具体对象）、`backup_database_hash`、`backup_database_corrupt`、`backup_blob_hash`、`backup_references_invalid`、`backup_schema_incompatible`，不替换当前数据库。恢复结果写 `controller.restored` 事件、maintenance_op 记录以及 `<data_dir 的父目录>/restore-results/<op_id>.json`。
 
 公共 CLI：
