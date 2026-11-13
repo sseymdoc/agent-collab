@@ -336,6 +336,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn('pw1', redactor.text('proxy https://svc:pw1@proxy.example/x failed'))
         self.assertNotIn('pw2', json.dumps(redactor.value({'proxy': 'http://svc:pw2@proxy.example'})))
         self.assertIn('proxy.example', redactor.text('https://svc:pw1@proxy.example'))
+        self.assertNotIn('ss@', redactor.text('https://user:p@ss@host.example/path'))
 
     def test_bare_basic_and_bearer_credentials_are_redacted(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')

@@ -344,26 +344,27 @@ export function useAutoUpdate(notify: (title: string, body: string) => void) {
       if (e.payload?.phase !== 'auto_check' || busy) return
       busy = true
       try {
-        let st: any, r: any, features: string[] | null = null
+        let st: any, r: any
+        // 每一步都用当前连接的 features：期间换了 controller，外壳会发现与检查时不同而要求重新检查，不会沿用旧连接的结论。
+        const features = () => { const who = session(); return who ? (who.controller?.features ?? []) : null }
         try {
           st = await invoke('update_status')
           if (!st.identity?.configured || !st.settings?.auto_check) return
           const who = session()
-          features = who ? (who.controller?.features ?? []) : null
-          r = await invoke('update_check', { features })
+          r = await invoke('update_check', { features: features() })
         } catch { return }
         if (!r.available) return
         notify('桌面端有新版本 ' + r.version, r.compat?.verdict === 'reject' ? '与当前 controller 不兼容，先升级 controller；详见“维护”页' : '在“维护”页查看并安装')
         if (r.compat?.verdict === 'reject' || !st.settings.auto_download) return
         try {
-          await invoke('update_download', { features })
+          await invoke('update_download', { features: features() })
           // 下载期间用户可能改了设置；有扫描、写回或本机部署在进行时等它们结束（每分钟再看一次）。
           for (;;) {
             const now = await invoke('update_status')
             if (stopped || !now.settings?.auto_install || now.downloaded?.version !== r.version) return
             if (!now.blockers?.length) {
               // 读状态之后又有操作开始时，安装会以 busy 拒绝：当作阻塞，继续等。
-              try { await invoke('update_install', { features }); return } catch (err: any) { if (err?.code !== 'busy') throw err }
+              try { await invoke('update_install', { features: features() }); return } catch (err: any) { if (err?.code !== 'busy') throw err }
             }
             await new Promise(done => { retry = window.setTimeout(done, 60000) })
           }

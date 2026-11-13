@@ -223,9 +223,13 @@ struct Exporting<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl<'a> Exporting<'a> {
     fn start(shell: &'a Shell) -> Result<Self> {
-        shell.exports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let guard = Self(&shell.exports);
-        if shell.installing.load(std::sync::atomic::Ordering::SeqCst) {
+        Self::admit(&shell.exports, &shell.installing)
+    }
+
+    fn admit(exports: &'a std::sync::atomic::AtomicUsize, installing: &std::sync::atomic::AtomicBool) -> Result<Self> {
+        exports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = Self(exports);
+        if installing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(err("busy", "桌面端更新正在安装，稍后再导出备份"));
         }
         Ok(guard)
@@ -243,8 +247,12 @@ pub(crate) struct Installing<'a>(&'a std::sync::atomic::AtomicBool);
 
 impl<'a> Installing<'a> {
     pub(crate) fn start(shell: &'a Shell) -> Self {
-        shell.installing.store(true, std::sync::atomic::Ordering::SeqCst);
-        Self(&shell.installing)
+        Self::close(&shell.installing)
+    }
+
+    fn close(installing: &'a std::sync::atomic::AtomicBool) -> Self {
+        installing.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(installing)
     }
 }
 
@@ -1191,6 +1199,25 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_exports_and_update_installs_exclude_each_other() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (exports, installing) = (AtomicUsize::new(0), AtomicBool::new(false));
+        {
+            let _export = Exporting::admit(&exports, &installing).unwrap();
+            // 安装看得到进行中的导出（blockers 据此返回 busy）。
+            assert_eq!(exports.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(exports.load(Ordering::SeqCst), 0);
+        {
+            let _install = Installing::close(&installing);
+            assert!(Exporting::admit(&exports, &installing).is_err());
+            assert_eq!(exports.load(Ordering::SeqCst), 0, "a refused export leaves no count behind");
+        }
+        // 安装没有进行下去（守卫离开作用域）后重新接受导出。
+        assert!(Exporting::admit(&exports, &installing).is_ok());
+    }
 
     fn active() -> Arc<Active> {
         Arc::new(Active {

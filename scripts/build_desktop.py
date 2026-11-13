@@ -294,7 +294,10 @@ def build(args):
         _, described = capture(['codesign', '-dv', str(app)])
         notarized = stapled = False
         profile = os.environ.get('AGENT_COLLAB_NOTARY_PROFILE')
-        dmg_src = next((bundle_dir / 'dmg').glob('*.dmg'))
+        # 与应用包一样按本次的产品名与版本取，共用 target 目录时不会拿到别的身份或旧版本的安装镜像。
+        dmg_src = next((bundle_dir / 'dmg').glob('%s_%s_*.dmg' % (identity['product'], version)), None)
+        if dmg_src is None:
+            raise SystemExit('没有找到本次构建的安装镜像：%s_%s_*.dmg' % (identity['product'], version))
         if identity_name and profile:
             run(['xcrun', 'notarytool', 'submit', str(dmg_src), '--keychain-profile', profile, '--wait'])
             run(['xcrun', 'stapler', 'staple', str(app)])

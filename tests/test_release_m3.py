@@ -123,6 +123,25 @@ class UpdaterKeyPairTests(unittest.TestCase):
 
 
 class DesktopCopyTests(unittest.TestCase):
+    def test_fragments_must_carry_the_same_backend(self):
+        import importlib.util, tempfile
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        base = dict(kind='candidate', identifier='x', desktop_version='1.0.0-dev.1', commit='c',
+                    backend=dict(file='b.tar.gz', sha256='a' * 64, signed=True, manifest=dict(version='1.0.0.dev1')))
+        with tempfile.TemporaryDirectory() as folder:
+            dist = Path(folder)
+            for target in ('windows-x86_64', 'darwin-aarch64'):
+                (dist / ('platform-%s.json' % target)).write_text(json.dumps(dict(base, target=target)), encoding='utf-8')
+            self.assertEqual(len(build.fragments(dist)), 2)
+            for change in ({'sha256': 'b' * 64}, {'manifest': dict(version='1.0.0.dev2')}):
+                other = dict(base, target='darwin-aarch64', backend=dict(base['backend'], **change))
+                (dist / 'platform-darwin-aarch64.json').write_text(json.dumps(other), encoding='utf-8')
+                with self.subTest(change=change), self.assertRaises(SystemExit):
+                    build.fragments(dist)
+
     def test_copy_skips_generated_payload_and_local_secrets(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')
