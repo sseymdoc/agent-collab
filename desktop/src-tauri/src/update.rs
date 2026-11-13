@@ -467,6 +467,10 @@ async fn manifest(base: &str, channel: &str, version: &str, pubkey: &str, identi
     if value["release_id"].as_str() != Some(version) {
         return Err(format!("产品发行清单的版本（{}）与宣布的版本（{version}）不一致", value["release_id"]));
     }
+    // 同一身份的各通道用同一把公钥：清单里签进去的通道也要是正在检查的这个。
+    if value["channel"].as_str() != Some(channel) {
+        return Err(format!("产品发行清单属于 {} 通道，不是现在检查的 {channel}", value["channel"]));
+    }
     if value["identity"]["kind"].as_str() != Some(KIND) || value["identity"]["identifier"].as_str() != Some(identifier) {
         return Err("产品发行清单的构建身份与这个应用不一致".into());
     }

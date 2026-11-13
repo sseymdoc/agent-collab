@@ -1916,6 +1916,8 @@ def recover_update(config, old, args):
             raise ValueError('saved signed archive differs from installed release')
         compatible_schema(active_config, manifest, directory)
         refuse_active_worker(active_config, args.allow_active)
+        # 恢复时用 --replace-trust 换了信任也登记进 journal：之后若要回退，restore_trust 能还原。
+        remember_trust(prefix, journal, source)
         save_source(prefix, version, source)
         manager = Services(active_config, directory)
         manager.desired = desired

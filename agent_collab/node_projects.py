@@ -74,7 +74,9 @@ def unbind(directory, project_id):
 
 def listing(directory):
     """本机看的绑定（含路径）。"""
-    return {'bindings': [dict(b, path=_bindings(directory)[b['project_id']]['path']) for b in public(directory)],
+    saved = _bindings(directory)
+    return {'bindings': [dict(b, path=saved[b['project_id']]['path'], bound_at=saved[b['project_id']].get('bound_at'))
+                         for b in public(directory)],
             'file': str(Path(directory) / BINDINGS)}
 
 

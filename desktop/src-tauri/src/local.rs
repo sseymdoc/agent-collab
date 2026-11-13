@@ -467,6 +467,8 @@ async fn controller_info(shell: &Shell, epoch: u64) -> Result<Value> {
                     Err(e) => json!({ "error": e.message }),
                 }
             }
+            // 连接已切换或关闭：不把旧连接的信息当作这次诊断的内容。
+            Err(e) if e.code == "stale_connection" => return Err(e),
             Err(e) => json!({ "error": e.message }),
         };
         info.insert(key.to_string(), value);
@@ -520,6 +522,10 @@ pub async fn diagnostics_export(app: AppHandle, shell: State<'_, Shell>, epoch: 
     let captured = captured?;
     let preview = json_output(&captured.stdout).filter(|_| captured.code == Some(0) && out.is_file());
     let preview = preview.ok_or_else(|| io(format!("诊断导出失败：{}", helper::tail_chars(&captured.tail, 600))))?;
+    // 助手运行期间换了连接：这份包里是旧连接的 controller 信息，不作为当前连接的结果返回（暂存包留着，可以重新导出）。
+    if let Some(epoch) = epoch {
+        shell.lock().current(epoch)?;
+    }
     Ok(json!({ "id": id, "preview": preview }))
 }
 

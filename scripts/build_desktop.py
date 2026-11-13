@@ -274,7 +274,10 @@ def build(args):
     bundle_dir = Path(env['CARGO_TARGET_DIR']) / 'release' / 'bundle'
     artifacts, signing = [], {}
     if target.startswith('windows'):
-        setup = next((bundle_dir / 'nsis').glob('*_%s_x64-setup.exe' % version))
+        # 按本次的产品名取：同一个 target 目录里可能还有同版本、别的身份的安装包。
+        setup = bundle_dir / 'nsis' / ('%s_%s_x64-setup.exe' % (identity['product'], version))
+        if not setup.is_file():
+            raise SystemExit('没有找到本次构建的安装包：%s' % setup)
         final = dist / file_label(kind, version, target, '-setup.exe')
         shutil.copy2(str(setup), str(final))
         # 安装包与主程序的 Authenticode 签名由 Tauri 在打包时完成（有证书时）；这里只核对最终文件，之后才生成更新签名。

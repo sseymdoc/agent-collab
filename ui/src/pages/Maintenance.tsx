@@ -62,7 +62,8 @@ function DesktopUpdate() {
   // 换通道时上一个通道的检查结果作废（外壳同时清掉已检查的版本与下载）。
   const save = (patch: any) => run('保存中…', async () => { await invoke('update_settings', { ...settings, ...patch }); if (patch.channel !== undefined) setCheck(null) })
   const features: string[] = session()?.controller?.features ?? []
-  const offer = check?.available ? check : st.offer ? { available: true, ...st.offer } : null
+  const shared = st.offer ? { available: true, ...st.offer } : null
+  const offer = check?.available && (!shared || shared.version === check.version) ? check : shared
   const verdict = offer?.compat?.verdict
   return <Section title="桌面端更新" extra={<span className="muted">只更新这台机器上的桌面端与随包组件，不升级远端 controller 或节点</span>}>
     <dl className="kv">
@@ -177,7 +178,7 @@ function Backups({ tick }: { tick: number }) {
   const pol = policy.data?.settings ?? {}
   return <Section title="备份与恢复" extra={<span className="muted">备份含任务、项目与设置等敏感数据；不会进入诊断导出</span>}>
     {list.error && <p className="err">{list.error}</p>}
-    <p className="muted">“立即备份”写到 controller 管理的备份位置（与数据库同一实例内）；要得到实例外的备份，在列表里“导出到这台机器”。
+    <p className="muted">“立即备份”写到 controller 管理的备份位置（与数据库同一实例内）；要留一份副本，在列表里“导出到这台机器”（与 controller 同机时还要复制到别的存储，才算实例外的备份）。
       恢复在 controller 停止后于 controller 所在机器上进行（见下方说明），这里只提供恢复前的影响预览。</p>
     <div className="actions">
       <input placeholder="备注（可选）" value={label} onChange={e => setLabel(e.target.value)} maxLength={80} />
@@ -207,7 +208,7 @@ function Backups({ tick }: { tick: number }) {
           }}>恢复预览</button>
           {isDesktop && <Action label="导出到这台机器" scope="maintain" run={async () => {
             const r = await bridge('backup_save', { backup_id: b.id })
-            if (!r.cancelled) setSaved(`已导出到 ${r.path}（${bytes(r.bytes)}，SHA-256 ${String(r.sha256).slice(0, 12)}…）：这份是实例外的备份，请存放在只有你能访问的位置`)
+            if (!r.cancelled) setSaved(`已导出到 ${r.path}（${bytes(r.bytes)}，SHA-256 ${String(r.sha256).slice(0, 12)}…）：这是一份副本，是否在实例之外取决于保存位置（与 controller 在同一台机器时请再复制到别的存储），请存放在只有你能访问的位置`)
           }} />}
         </td>
       </tr>)}
@@ -297,6 +298,9 @@ function Diagnostics() {
     setBusy(label); setErr(null)
     try { await f() } catch (e) { setErr(errText(e)) } finally { setBusy(null) }
   }
+  // 读取结果只写回仍是当前这份诊断包的预览：换了新包，旧包迟到的文本作废。
+  const latest = useRef<string | null>(null)
+  latest.current = res?.id ?? null
   const files: any[] = res?.preview?.files ?? []
   const summary = res?.preview?.diagnostics ?? res?.preview?.summary ?? null
   return <Section title="诊断导出" extra={<span className="muted">只生成在这台机器上，不会自动上传或发送</span>}>
@@ -317,7 +321,7 @@ function Diagnostics() {
       <h3>预览（还没有保存）</h3>
       <table className="grid"><thead><tr><th>文件</th><th>大小</th><th>截断</th><th></th></tr></thead><tbody>
         {files.map(f => <tr key={f.name}><td><code>{f.name}</code></td><td>{bytes(f.bytes ?? f.size)}</td><td>{f.truncated ? '是（原始 ' + bytes(f.original_bytes) + '）' : '否'}</td>
-          <td><button onClick={() => void run('读取中…', async () => { const r = await invoke('diagnostics_preview', { id: res.id, name: f.name }); setFile({ name: f.name, text: r.text }) })}>查看</button></td></tr>)}
+          <td><button disabled={!!busy} onClick={() => void run('读取中…', async () => { const id = res.id; const r = await invoke('diagnostics_preview', { id, name: f.name }); setFile(cur => latest.current === id ? { name: f.name, text: r.text } : cur) })}>查看</button></td></tr>)}
       </tbody></table>
       {res.preview?.redactions && <p className="muted"><small>脱敏：{Object.entries<any>(res.preview.redactions).map(([k, v]) => k + ' ' + v + ' 处').join('；')}</small></p>}
       {file && <><p className="muted">{file.name}</p><pre className="json">{file.text}</pre></>}
