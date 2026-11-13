@@ -424,6 +424,21 @@ class SignatureTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, '核对不通过'):
             build.verify_release_signature(self.archive, self.signature, self.signers)
 
+    def test_trust_replaced_twice_in_one_transaction_keeps_the_original(self):
+        class Journal:
+            value = {}
+            def save(self):
+                pass
+        journal, pinned = Journal(), self.prefix / 'trust/allowed_signers'
+        pinned.parent.mkdir(parents=True, exist_ok=True)
+        pinned.write_bytes(b'K0')
+        ins.remember_trust(self.prefix, journal, dict(previous_trust=b'K0', trust=b'K1'))
+        pinned.write_bytes(b'K1')  # 升级时换成 K1，恢复时又换成 K2
+        ins.remember_trust(self.prefix, journal, dict(previous_trust=b'K1', trust=b'K2'))
+        pinned.write_bytes(b'K2')
+        ins.restore_trust(self.prefix, journal)
+        self.assertEqual(pinned.read_bytes(), b'K0')
+
     def test_failed_upgrade_with_replaced_trust_restores_the_old_pin_and_rolls_back(self):
         self.invoke('--release', str(self.archive), '--signature', str(self.signature), '--allowed-signers', str(self.signers), role='worker')
         original = (self.prefix / 'trust/allowed_signers').read_bytes()

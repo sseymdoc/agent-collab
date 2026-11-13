@@ -177,15 +177,17 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn('TASK-OUTPUT', output)
         self.output = self.root / 'tasks.zip'
         self.write(self.attempt / 'checks/0/stderr.log', 'error password=synthetic-check')
-        self.write(self.attempt / 'step-1/stdout.jsonl', '{"token":"synthetic-step"}')
+        self.write(self.attempt / 'step-1/stdout.jsonl', '{"token":"synthetic-step"}\n'
+                   '{"level":"ERROR","argv":["codex","--api-key","synthetic-argv-key","--password","p@55!"]}')
         status, output, error = self.run_cli('--include-task-logs')
         self.assertEqual(status, 0)
         self.assertIn(d.TASK_WARNING, error)
         with zipfile.ZipFile(self.output) as archive:
             data = b'\n'.join(archive.read(name) for name in archive.namelist()).decode()
         self.assertIn('TASK-OUTPUT', data)
-        for secret in ('fake-task-password', 'fake-lease-short', 'synthetic-check', 'synthetic-step'):
+        for secret in ('fake-task-password', 'fake-lease-short', 'synthetic-check', 'synthetic-step', 'synthetic-argv-key', 'p@55!'):
             self.assertNotIn(secret, data)
+            self.assertNotIn(secret, json.dumps(self.report()))
         self.assertEqual(len(self.report()['logs']), 4)
 
     def test_controller_info_is_sanitized_without_network_or_profile(self):

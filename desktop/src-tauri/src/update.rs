@@ -541,10 +541,9 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
         }
         same_channel(&app, offer)?;
         same_controller(offer, &features)?;
-        (offer.update.clone(), offer.channel.clone(), offer.manifest.clone())
+        (offer.update.clone(), offer.channel.clone(), offer.manifest.clone(), updates.generation.load(std::sync::atomic::Ordering::SeqCst))
     };
-    let (update, channel, offer_manifest) = update;
-    let generation = updates.generation.load(std::sync::atomic::Ordering::SeqCst);
+    let (update, channel, offer_manifest, generation) = update;
     let mut journal = Journal::new(&current_version(&app), &update.version, &load_settings(&app).channel);
     journal.mark("compat", "done", None);
     journal.mark("download", "running", None);
@@ -616,9 +615,9 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
         }
         same_channel(&app, offer)?;
         same_controller(offer, &features)?;
-        (offer.update.clone(), offer.channel.clone())
+        (offer.update.clone(), offer.channel.clone(), updates.generation.load(std::sync::atomic::Ordering::SeqCst))
     };
-    let (update, channel) = update;
+    let (update, channel, generation) = update;
     // 缓存的字节必须来自同一个通道的同一个版本。
     let bytes = lock(&updates.bytes).take().filter(|(version, from, _)| *version == update.version && *from == channel).map(|(_, _, bytes)| bytes);
     let Some(bytes) = bytes else {
@@ -659,7 +658,11 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
         Ok((Ok(app), _)) => app.restart(),
         Ok((Err(e), bytes)) => {
             // 没有安装（等助手超时，或安装程序没能接管）：已下载并验签的更新留着，稍后可以直接再安装。
-            *lock(&updates.bytes) = Some((version, channel, bytes));
+            // 等待期间换过通道（包括来回切换）就不放回：缓存只属于当时的那个通道代次。
+            let mut slot = lock(&updates.bytes);
+            if updates.generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
+                *slot = Some((version, channel, bytes));
+            }
             Err(e)
         }
         Err(e) => {
