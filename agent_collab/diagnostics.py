@@ -73,7 +73,7 @@ class Redactor:
                                value, flags=re.I)
         value = re.sub(r'(?im)\b(?:authorization|proxy-authorization|x-coordinator-token)["\x27]?\s*[:=]\s*[^\r\n]+',
                        lambda m: self.mark('authorization'), value)
-        value = re.sub(r'(?i)\bBearer\s+[^\s,;"\x27]+', lambda m: self.mark('authorization'), value)
+        value = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[^\s,;"\x27]+', lambda m: self.mark('authorization'), value)
         value = re.sub(r'\b(?:(?i:(?:[\w-]*[_-])?(?:token|secret|password|code|key))|'
                        r'[\w-]+(?:Token|Secret|Password|Code|Key))(?:[_-][\w-]+|[A-Z][\w-]*)?["\x27]?\s*[:=]\s*'
                        r'(?:"(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27|[^\s,;{}\[\]]+)',
@@ -171,14 +171,18 @@ def read_json(path):
 
 
 def configuration(args):
+    """返回 (config, old, broken)：安装记录损坏时 broken 是那个异常，按没有记录处理以便照常收集其他部分。"""
     name = 'agent-collab' + ('-' + args.instance if args.instance else '')
     prefix = local_path(args.prefix or Path.home() / '.local/share' / name)
+    broken = None
     try:
         old, _ = read_json(prefix / 'installation.json')
+        if old:
+            local_path(old['config']['state_dir'])
     except FileNotFoundError:
         old = None
-    if old:
-        local_path(old['config']['state_dir'])
+    except (ValueError, KeyError, TypeError) as exc:
+        old, broken = None, exc
     options = ['--prefix', str(prefix)]
     if args.state_dir:
         options += ['--state-dir', str(local_path(args.state_dir))]
@@ -192,7 +196,7 @@ def configuration(args):
     config['state_dir'] = str(local_path(config['state_dir']))
     if config['role'] not in installer.ROLES:
         raise ValueError('无效的安装角色')
-    return config, old
+    return config, old, broken
 
 
 def attempt_directories(state):
@@ -226,7 +230,7 @@ def task_logs(folder):
 
 
 def collect(args):
-    config, old = configuration(args)
+    config, old, broken = configuration(args)
     prefix, state = Path(config['prefix']), Path(config['state_dir'])
     projects, secrets = [], []
     notes = []
@@ -279,6 +283,8 @@ def collect(args):
                  architecture=platform.machine()))
     try:
         # discover 只读取这个固定 JSON；在调用前拒绝重定向及过大的文件，坏文件让这一段不可用而不是中止导出。
+        if broken is not None:
+            raise broken
         try:
             read_json(state / 'worker/agent.json')
         except FileNotFoundError:

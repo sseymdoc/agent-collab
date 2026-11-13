@@ -195,7 +195,8 @@ export const api = {
   backupPolicy: () => call('GET', '/settings/backups'),
   saveBackupPolicy: (revision: number, keep: number) => call('PUT', '/settings/backups', { request_id: uuid(), expected_revision: revision, keep }),
   // 明确弃置一个待发布的成果：只记录弃置，不删除任何东西；之后切换屏障不再因它阻断。
-  dismiss: (id: string, v: number, reason: string) => call('POST', '/jobs/' + id + '/dismiss', { request_id: uuid(), expected_version: v, reason }),
+  dismiss: (id: string, wp: string, v: number, reason: string, cp: string) =>
+    call('POST', '/jobs/' + id + '/dismiss', { request_id: uuid(), expected_version: v, reason, checkpoint_id: cp }, coordHeader(wp)),
 }
 
 // 管理操作是异步记录：轮询到结果确定（succeeded / failed / timed_out）。alive() 为 false 时（页面已离开）停止。

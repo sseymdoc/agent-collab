@@ -257,7 +257,7 @@ function Barrier({ tick }: { tick: number }) {
         <td><a href={'#/jobs/' + j.job_id}>{j.title ?? j.job_id}</a></td><td>{j.acceptance?.status ? <Badge v={j.acceptance.status} /> : null} <small>{j.delivery_checkpoint_id ? '已发布的不是最新检查点' : '未发布'}</small></td>
         <td><small><code>{String(j.checkpoint_id).slice(0, 8)}</code></small></td>
         <td><Action label="弃置" danger scope="tasks" confirm="弃置只记录“这份成果不采用”，不删除任何东西；弃置后这个检查点不能再发布。确定？"
-          run={async () => { const reason = window.prompt('弃置原因') ?? ''; if (!reason.trim()) throw new Error('需要填写原因'); const job = await api.job(j.job_id); await api.dismiss(j.job_id, job.version, reason.trim()); await preview.reload() }} /></td>
+          run={async () => { const reason = window.prompt('弃置原因') ?? ''; if (!reason.trim()) throw new Error('需要填写原因'); const job = await api.job(j.job_id); await api.dismiss(j.job_id, job.work_package_id, job.version, reason.trim(), j.checkpoint_id); await preview.reload() }} /></td>
       </tr>)}
     </tbody></table>}
   </Section>
@@ -319,7 +319,7 @@ export function useAutoUpdate(notify: (title: string, body: string) => void) {
   useEffect(() => {
     if (!isDesktop) return
     const tauri = (window as any).__TAURI__
-    let busy = false
+    let busy = false, stopped = false, retry = 0
     const off = tauri.event.listen('ac-update', async (e: any) => {
       if (e.payload?.phase !== 'auto_check' || busy) return
       busy = true
@@ -336,11 +336,16 @@ export function useAutoUpdate(notify: (title: string, body: string) => void) {
         if (r.compat?.verdict === 'reject' || !st.settings.auto_download) return
         try {
           await invoke('update_download')
-          const now = await invoke('update_status')
-          if (st.settings.auto_install && !now.blockers?.length) await invoke('update_install')
+          // 下载期间用户可能改了设置；有扫描、写回或本机部署在进行时等它们结束（每分钟再看一次）。
+          for (;;) {
+            const now = await invoke('update_status')
+            if (stopped || !now.settings?.auto_install || now.downloaded?.version !== r.version) return
+            if (!now.blockers?.length) { await invoke('update_install'); return }
+            await new Promise(done => { retry = window.setTimeout(done, 60000) })
+          }
         } catch (err) { notify('桌面端更新 ' + r.version + ' 没有完成', errText(err) + '；在“维护”页查看') }
       } finally { busy = false }
     })
-    return () => { void off.then((f: () => void) => f()) }
+    return () => { stopped = true; window.clearTimeout(retry); void off.then((f: () => void) => f()) }
   }, []) // eslint-disable-line
 }

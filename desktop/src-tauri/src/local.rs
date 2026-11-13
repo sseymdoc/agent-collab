@@ -238,8 +238,15 @@ fn deployment(home: &Path) -> Deployment<'_> {
 
 /// 运行助手的一个部署子命令并收集输出。
 async fn run(app: &AppHandle, helper: Helper, command: Vec<OsString>, timeout: Duration) -> Result<Captured> {
+    run_up_to(app, helper, command, timeout, 1024 * 1024).await
+}
+
+/// 诊断导出与预览的输出：摘要上限 2 MiB，按缩进 JSON 打印后会更大。
+const DIAGNOSTICS_OUTPUT: usize = 8 * 1024 * 1024;
+
+async fn run_up_to(app: &AppHandle, helper: Helper, command: Vec<OsString>, timeout: Duration, limit: usize) -> Result<Captured> {
     let cwd = data_dir(app)?;
-    tauri::async_runtime::spawn_blocking(move || helper::capture(helper.command(&cwd, &command), timeout))
+    tauri::async_runtime::spawn_blocking(move || helper::capture_up_to(helper.command(&cwd, &command), timeout, limit))
         .await
         .map_err(|_| err("helper_unavailable", "本机助手异常结束"))?
 }
@@ -490,7 +497,7 @@ pub async fn diagnostics_export(app: AppHandle, shell: State<'_, Shell>, epoch: 
     if include_task_logs {
         command.push("--include-task-logs".into());
     }
-    let captured = run(&app, helper, command, SETUP_TIMEOUT).await;
+    let captured = run_up_to(&app, helper, command, SETUP_TIMEOUT, DIAGNOSTICS_OUTPUT).await;
     if let Some(path) = info_file {
         let _ = std::fs::remove_file(path); // 原始应答只给助手读一次
     }
@@ -510,7 +517,7 @@ pub async fn diagnostics_preview(app: AppHandle, id: String, name: String) -> Re
     }
     let mut command = args(["diagnostics", "preview"]);
     command.extend([file.into(), "--show".into(), OsString::from(name)]);
-    let captured = run(&app, helper, command, DISCOVER_TIMEOUT).await?;
+    let captured = run_up_to(&app, helper, command, DISCOVER_TIMEOUT, DIAGNOSTICS_OUTPUT).await?;
     Ok(json!({ "ok": captured.code == Some(0), "text": helper::tail_chars(&captured.stdout, 256 * 1024) }))
 }
 

@@ -304,7 +304,9 @@ class MaintenanceTests(ClientCase):
             barrier(self.temp / 'data', uid(), 'cutover', self.clock)
         self.assertEqual(caught.exception.details['pending_results'][0]['job_id'], job['job_id'])
         self.reopen()
-        body = dict(request_id=uid(), expected_version=self.current(job)['version'], reason='不要这个成果')
+        stale = dict(request_id=uid(), expected_version=self.current(job)['version'], reason='不要这个成果', checkpoint_id=uid())
+        self.assertEqual(self.call('POST', '/jobs/' + job['job_id'] + '/dismiss', stale, status=409)['error']['code'], 'conflict')
+        body = dict(request_id=uid(), expected_version=self.current(job)['version'], reason='不要这个成果', checkpoint_id=cp['checkpoint_id'])
         result = self.call('POST', '/jobs/' + job['job_id'] + '/dismiss', body)
         self.assertEqual(result, self.call('POST', '/jobs/' + job['job_id'] + '/dismiss', body))
         self.assertEqual(self.current(job)['dismissed_checkpoint_id'], cp['checkpoint_id'])
@@ -522,7 +524,10 @@ class MaintenanceTests(ClientCase):
         external = self.temp / 'external'
         external.write_bytes(b'content')
         blob.unlink()
-        blob.symlink_to(external)
+        try:
+            blob.symlink_to(external)
+        except OSError:
+            self.skipTest('symlink unavailable')
         with self.assertRaises(BackupError) as caught:
             inspect_backup(source, self.temp)
         self.assertEqual(caught.exception.code, 'backup_unsafe_path')

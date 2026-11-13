@@ -120,6 +120,16 @@ def tauri_signature(tauri, key, version, path):
     return signature.read_text(encoding='utf-8').strip()
 
 
+def key_id(text):
+    """minisign 公钥或签名（Tauri 存成 base64 包着的文本）里的 8 字节密钥 ID。"""
+    return base64.b64decode(base64.b64decode(text).decode('utf-8').splitlines()[1])[2:10]
+
+
+def check_key_pair(pubkey, signature, label):
+    if key_id(pubkey) != key_id(signature):
+        raise SystemExit('%s：更新签名私钥与编进程序的 updater 公钥不是一对，客户端会拒收这个更新' % label)
+
+
 def trusted_comment(signature):
     """签名里受保护的注释（不做验签：验签由 updater 与外壳完成，门禁只核对它绑定的版本与文件名）。"""
     lines = base64.b64decode(signature).decode('utf-8').splitlines()
@@ -282,6 +292,7 @@ def build(args):
         artifacts += [dict(name=dmg.name, role='installer'), dict(name=updater.name, role='updater')]
     signature = tauri_signature(tauri, args.updater_key, version, updater) if args.updater_key else None
     if signature:
+        check_key_pair(pubkey, signature, updater.name)
         artifacts.append(dict(name=updater.name + '.sig', role='updater-signature'))
     for item in artifacts:
         path = dist / item['name']
@@ -325,6 +336,7 @@ def sign(args):
         if f['updater']['pubkey_sha256'] != pubkey:
             raise SystemExit('%s：签名私钥与这个构建编进程序的 updater 公钥不对应' % path.name)
         f['updater']['signature'] = tauri_signature(tauri, args.updater_key, f['desktop_version'], updater)
+        check_key_pair(Path(args.updater_key + '.pub').read_text(encoding='utf-8').strip(), f['updater']['signature'], updater.name)
         signature = Path(str(updater) + '.sig')
         f['artifacts'].append(dict(name=signature.name, role='updater-signature', sha256=sha256(signature), bytes=signature.stat().st_size))
         path.write_text(json.dumps(f, ensure_ascii=False, indent=1), encoding='utf-8')

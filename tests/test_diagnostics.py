@@ -287,12 +287,27 @@ class DiagnosticsTests(unittest.TestCase):
         redactor = d.Redactor(home='/home/ann', username='ann', hostname='box')
         self.assertEqual(redactor.text('ann@box: channel annotate inbox box-2'), '<user>@<host>: channel annotate inbox box-2')
 
-    def test_malformed_agent_state_leaves_the_rest_of_the_export(self):
-        self.write(self.state / 'worker/agent.json', '{not json')
-        self.assertEqual(self.run_cli()[0], 0)
-        sections = self.report()['sections']
-        self.assertEqual(sections['deployment']['status'], 'unavailable')
-        self.assertIn('runtime', sections)
+    def test_malformed_agent_state_or_installation_record_leaves_the_rest_of_the_export(self):
+        for path in (self.state / 'worker/agent.json', self.prefix / 'installation.json'):
+            with self.subTest(path=path.name):
+                original = path.read_text(encoding='utf-8')
+                self.write(path, '{not json')
+                try:
+                    status, _, error = self.run_cli()
+                    self.assertEqual(status, 0, error)
+                    sections = self.report()['sections']
+                    self.assertEqual(sections['deployment']['status'], 'unavailable')
+                    self.assertIn('runtime', sections)
+                finally:
+                    self.write(path, original)
+                    self.output.unlink(missing_ok=True)
+
+    def test_bare_basic_and_bearer_credentials_are_redacted(self):
+        redactor = d.Redactor(home='/home/u', username='u', hostname='h')
+        clean = redactor.text('ERROR Basic dXNlcjpwYXNz then Bearer abc')
+        self.assertNotIn('dXNlcjpwYXNz', clean)
+        self.assertNotIn('abc', clean)
+        self.assertEqual(redactor.counts['authorization'], 2)
 
     def test_oversized_json_is_not_partially_parsed(self):
         info = self.root / 'huge.json'
@@ -385,7 +400,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(zipfile.is_zipfile(self.output))
 
     def test_windows_service_queries_use_installer_functions_and_no_window(self):
-        config, _ = d.configuration(type('Args', (), dict(prefix=self.prefix, state_dir=self.state, instance=None))())
+        config, _, _ = d.configuration(type('Args', (), dict(prefix=self.prefix, state_dir=self.state, instance=None))())
         config['system'] = 'Windows'
         manager = d.installer.Services(config, self.prefix / 'versions/1.2.3')
         flags = {'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)}
@@ -414,7 +429,7 @@ class DiagnosticsTests(unittest.TestCase):
 
     def test_instance_uses_desktop_layout_and_registered_cli(self):
         args = type('Args', (), dict(prefix=None, state_dir=None, instance='cand'))()
-        config, old = d.configuration(args)
+        config, old, _ = d.configuration(args)
         self.assertIsNone(old)
         self.assertEqual(Path(config['prefix']), self.home / '.local/share/agent-collab-cand')
         self.assertEqual(Path(config['state_dir']), self.home / '.local/state/agent-collab-cand')

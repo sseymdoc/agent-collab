@@ -234,6 +234,14 @@ class InstallerM3Tests(unittest.TestCase):
         self.assertEqual(ins.read_json(self.prefix / 'update-journal.json')['status'], 'pending')
         self.assertTrue((self.prefix / '.install-lock').exists())
 
+    def test_uninstall_keeps_the_recorded_service_mode(self):
+        self.invoke('--release', str(self.v1), role='worker')  # args() 带 --no-service
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output), patch.object(ins, 'run', side_effect=AssertionError('service commands')):
+            code = ins.main([a for a in self.args('worker') if a != '--no-service'] + ['--uninstall'])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIsNone(ins.current_version(self.prefix))
+
     def test_oversized_archive_is_refused_before_it_is_read(self):
         with patch.object(ins, 'MAX_RELEASE_BYTES', self.v1.stat().st_size - 1),                 patch.object(Path, 'read_bytes', side_effect=AssertionError('archive read')):
             self.assertIn('size/file limit', self.invoke('--release', str(self.v1), role='worker', status=1))

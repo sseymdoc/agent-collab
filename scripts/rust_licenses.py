@@ -35,13 +35,15 @@ def table(path=TABLE):
     return {'%s %s' % (name, version): declared.strip() for name, version, declared in rows if name != 'crate'}
 
 
-def graph(src):
+def graph(src, cargo_home=None):
     """{"name version": {"license": 声明, "targets": {目标: "linked" | "build-time"}}}。
     linked：从根只经 normal 依赖到达、且不是 proc-macro（编进程序）；build-time：只经构建依赖或 proc-macro 到达。"""
     found = {}
     for label, triple in TARGETS.items():
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--locked', '--offline', '--filter-platform', triple],
-                                         cwd=str(src), capture_output=True, check=True).stdout)
+                                         cwd=str(src), capture_output=True, check=True,
+                                         # 与读取许可证文本用同一份缓存：--offline 时 cargo 只在这里找依赖。
+                                         env=dict(os.environ, CARGO_HOME=str(cargo_home)) if cargo_home else None).stdout)
         packages = {p['id']: p for p in meta['packages']}
         nodes = {n['id']: n for n in meta['resolve']['nodes']}
         root = meta['resolve']['root']
@@ -144,7 +146,7 @@ def check_release(src=None, cargo_home=None):
     """发行构建用：返回问题清单（空表示许可材料完整且与仓库里的生成文件一致）。"""
     listed = table()
     try:
-        deps = graph(src or ROOT / 'desktop' / 'src-tauri')
+        deps = graph(src or ROOT / 'desktop' / 'src-tauri', cargo_home)
     except (OSError, subprocess.CalledProcessError, ValueError) as exc:
         return ['无法用 cargo metadata 解析依赖图：%s' % str(exc)[:200]]
     texts, absent = package_texts(listed, cargo_home or os.environ.get('CARGO_HOME') or Path.home() / '.cargo')
@@ -166,7 +168,7 @@ def main(argv=None):
         print('\n'.join(problems) or '许可材料完整')
         return 1 if problems else 0
     listed = table()
-    deps = graph(args.src)
+    deps = graph(args.src, args.cargo_home)
     texts, absent = package_texts(listed, args.cargo_home)
     extra, problems = supplement()
     problems = ['cargo 缓存里没有 %s' % c for c in absent] + problems + check(listed, deps, texts, extra)

@@ -2051,7 +2051,11 @@ def configuration(args, old, system):
         value = getattr(args, key, None)
         if value is not None:
             defaults[key] = value
-    defaults.update(system=system, service=not args.no_service)
+    service = not args.no_service
+    if old and getattr(args, 'uninstall', False):
+        # 卸载沿用安装时的服务模式：用 --no-service 安装的前缀不必再带这个参数（桌面端卸载也不知道它）。
+        service = service and saved.get('service', True)
+    defaults.update(system=system, service=service)
     for key in ('prefix', 'state_dir', 'python', 'admin_token_file', 'ca_file', 'workspace_root'):
         if defaults.get(key):
             value = defaults[key]

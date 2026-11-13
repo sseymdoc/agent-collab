@@ -498,12 +498,12 @@ pub struct Captured {
     pub tail: String,
 }
 
-/// 运行到结束并收集输出；超时即结束子进程并返回 `io` 错误。
-pub fn capture(command: Command, timeout: Duration) -> Result<Captured> {
+/// 运行到结束并收集输出，标准输出最多保留 `limit` 字节；超时即结束子进程并返回 `io` 错误。
+pub fn capture_up_to(command: Command, timeout: Duration, limit: usize) -> Result<Captured> {
     let (mut stdout, mut tail) = (String::new(), Tail::new(4000));
     let code = run(command, Some(timeout), &|| None, &mut |from_stderr, line| {
         tail.push(line);
-        if !from_stderr && stdout.len() + line.len() < 1024 * 1024 {
+        if !from_stderr && stdout.len() + line.len() < limit {
             stdout.push_str(line);
             stdout.push('\n');
         }
@@ -848,7 +848,7 @@ mod tests {
         lines.sort();
         assert_eq!(lines, [(false, "one".to_string()), (true, "two".to_string())]);
 
-        let captured = capture(script(&dir, &[(false, "1. step"), (false, r#"{"ok": true}"#), (true, "oops")], EXIT_0), Duration::from_secs(30)).unwrap();
+        let captured = capture_up_to(script(&dir, &[(false, "1. step"), (false, r#"{"ok": true}"#), (true, "oops")], EXIT_0), Duration::from_secs(30), 1024 * 1024).unwrap();
         assert_eq!(captured.code, Some(0));
         assert_eq!(last_json(&captured.stdout), Some(json!({"ok": true})));
         assert!(!captured.stdout.contains("oops"));

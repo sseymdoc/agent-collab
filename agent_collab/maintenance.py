@@ -155,7 +155,7 @@ def barrier_preview(store):
 
 def dismiss(app, job, data, identity):
     from .controller import APIError, response
-    if set(data) - {'request_id', 'expected_version', 'reason'}:
+    if set(data) - {'request_id', 'expected_version', 'reason', 'checkpoint_id'}:
         raise ValueError('unknown dismissal fields')
     app.version(data, job)
     reason = data.get('reason')
@@ -164,6 +164,9 @@ def dismiss(app, job, data, identity):
     target = next((r for r in pending_results(app.store) if r['job_id'] == job['job_id']), None)
     if target is None:
         raise APIError('conflict', 'no unpublished latest durable checkpoint to dismiss')
+    # 带上用户确认时看到的检查点：确认期间出现了更新的待发布检查点，就不能把确认挪到新的那个上。
+    if 'checkpoint_id' in data and data['checkpoint_id'] != target['checkpoint_id']:
+        raise APIError('conflict', 'the latest unpublished checkpoint changed; review it again before dismissing')
     record = dict(target, reason=reason.strip(), by=app.actor(identity), at=d.timestamp(app.clock()))
     app.store.put('dismissal', target['checkpoint_id'], record)
     changed = app.change('job', job, app.clock(), dismissed_checkpoint_id=target['checkpoint_id'], dismissal=record)

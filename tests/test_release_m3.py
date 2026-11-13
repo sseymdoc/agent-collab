@@ -100,6 +100,20 @@ class ProtocolCheckTests(unittest.TestCase):
                 legacy.builder.check_protocol(dict(good, **bad))
 
 
+class UpdaterKeyPairTests(unittest.TestCase):
+    def test_signature_must_come_from_the_embedded_public_key(self):
+        import base64, importlib.util
+        spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        wrap = lambda lines: base64.b64encode('\n'.join(lines).encode()).decode()
+        blob = lambda key_id, size: base64.b64encode(b'Ed' + key_id + bytes(size)).decode()
+        pubkey = wrap(['untrusted comment: public key', blob(b'AAAAAAAA', 32)])
+        build.check_key_pair(pubkey, wrap(['untrusted comment: signature', blob(b'AAAAAAAA', 64), 'trusted comment: x', 'sig']), 'ok')
+        with self.assertRaises(SystemExit):
+            build.check_key_pair(pubkey, wrap(['untrusted comment: signature', blob(b'BBBBBBBB', 64), 'trusted comment: x', 'sig']), 'other')
+
+
 class ReleaseArchiveTests(unittest.TestCase):
     setUpClass = classmethod(legacy.InstallerTests.setUpClass.__func__)
     tearDownClass = classmethod(legacy.InstallerTests.tearDownClass.__func__)

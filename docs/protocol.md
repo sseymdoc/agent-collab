@@ -662,7 +662,7 @@ agent-collab maintenance restore --data-dir D --from <目录或tar> [--identity 
 
 `GET /maintenance/barrier-preview` 返回 `{"ready", "pending_results", "dispatch_paused", "intake"}`。pending_results 是最新 attempt 成功、有 durable/verified 检查点、最新 durable 检查点尚未发布且未明确弃置的任务；每项包含 job_id、title、attempt_id、checkpoint_id、acceptance、delivery_checkpoint_id、reason。只检查当前成果，不要求历史检查点全部发布。
 
-`POST /jobs/{id}/dismiss`（tasks）接受 `{"request_id", "expected_version", "reason"}`；reason 非空、至多 1000 字符，沿用 job CAS、幂等及协调租约门禁。只记录最新待发布检查点的弃置，不删除成果；job 及详情增加 `dismissed_checkpoint_id`、`dismissal`，写 `job.dismissed`。该检查点后续发布返回 409 `checkpoint_dismissed`。新的 attempt/checkpoint 仍需单独处理。
+`POST /jobs/{id}/dismiss`（tasks）接受 `{"request_id", "expected_version", "reason", "checkpoint_id"?}`；reason 非空、至多 1000 字符，沿用 job CAS、幂等及协调租约门禁。只记录最新待发布检查点的弃置；带 `checkpoint_id` 时它必须就是这个检查点，否则 409 `conflict`（确认之后又出现了新的待发布检查点），不删除成果；job 及详情增加 `dismissed_checkpoint_id`、`dismissal`，写 `job.dismissed`。该检查点后续发布返回 409 `checkpoint_dismissed`。新的 attempt/checkpoint 仍需单独处理。
 
 离线 `barrier()` 在持有 controller 锁后，于同一个 `BEGIN IMMEDIATE` 事务里重新检查暂停、提交闸门、pending_results 与代次推进。有未处理成果即拒绝，错误 `barrier_pending_results` 带任务清单；预览不能代替这次权威核对。先发布或明确弃置，之后才可执行屏障。普通更新不调用屏障。
 
