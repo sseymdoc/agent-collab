@@ -74,6 +74,9 @@ class Redactor:
         value = re.sub(r'(?im)\b(?:authorization|proxy-authorization|x-coordinator-token|set-cookie|cookie)["\x27]?\s*[:=]\s*[^\r\n]+',
                        lambda m: self.mark('authorization'), value)
         value = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[^\s,;"\x27]+', lambda m: self.mark('authorization'), value)
+        # 命令参数里的口令：--password VALUE、--password=VALUE 已由字段规则处理，这里补上空格分隔与 argv 列表的写法。
+        value = re.sub(r'(?i)(--?[\w-]*(?:password|passwd|secret|token)["\x27]?(?:\s*,\s*["\x27]|\s+))([^\s"\x27,\]]+)',
+                       lambda m: m.group(1) + self.mark('argument'), value)
         # URL 里的 userinfo（https://user:password@host）同样是凭据。
         value = re.sub(r'(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@"\x27]+@', lambda m: m.group(1) + self.mark('url_userinfo') + '@', value)
         value = re.sub(r'\b(?:(?i:(?:[\w-]*[_-])?(?:token|secret|password|code|key))|'
@@ -248,8 +251,8 @@ def collect(args):
         notes.append('项目绑定缺失或不可读；只使用通用路径规则')
     try:
         attempts, attempts_truncated = attempt_directories(state)
-    except OSError:
-        # attempt 目录坏了（例如成了普通文件）只影响依赖它的部分。
+    except (OSError, ValueError):
+        # attempt 目录坏了（例如成了普通文件或链接）只影响依赖它的部分。
         attempts, attempts_truncated = [], False
         notes.append('attempt 目录不可读；没有收集 attempt 相关的令牌与任务日志')
     # 仅这些本产品令牌用于内存中的精确替换；不导出、不打印，不读客户端或官方 CLI 凭据。

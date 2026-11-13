@@ -922,13 +922,18 @@ struct BlobSink {
 }
 
 impl BlobSink {
-    fn create(dir: &Path) -> Result<Self> {
+    /// `private`：只有当前用户可读写（Unix；备份导出用），普通工件下载沿用默认权限。
+    fn create(dir: &Path, private: bool) -> Result<Self> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let path = dir.join(format!(".agent-collab-{}-{nanos:08x}.part", std::process::id()));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        if private {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
         let file = options
             .open(&path)
             .map_err(|e| io(format!("无法在目标目录创建临时文件：{e}")))?;
@@ -986,7 +991,7 @@ async fn blob_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, s
         status => return Err(err("network", format!("下载失败（HTTP {}）", status.as_u16()))),
     }
     let dir = dest.parent().ok_or_else(|| io("所选路径没有上级目录"))?;
-    let mut sink = BlobSink::create(dir)?;
+    let mut sink = BlobSink::create(dir, false)?;
     loop {
         let chunk = response.chunk().await;
         shell.lock().current(epoch)?;
@@ -1028,7 +1033,7 @@ async fn backup_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64,
         .map(str::to_owned)
         .ok_or_else(|| bad_response("备份导出"))?;
     let dir = dest.parent().ok_or_else(|| io("所选路径没有上级目录"))?;
-    let mut sink = BlobSink::create(dir)?;
+    let mut sink = BlobSink::create(dir, true)?;
     loop {
         let chunk = response.chunk().await;
         shell.lock().current(epoch)?;
@@ -1464,7 +1469,7 @@ mod tests {
         let dest = dir.join("hello.txt");
         std::fs::write(&dest, b"old contents").unwrap(); // 用户已在对话框里确认覆盖
 
-        let mut sink = BlobSink::create(&dir).unwrap();
+        let mut sink = BlobSink::create(&dir, false).unwrap();
         sink.write(b"he").unwrap();
         sink.write(b"llo").unwrap();
         assert_eq!(sink.finish(HELLO_SHA256, &dest), Ok(5));
@@ -1478,12 +1483,12 @@ mod tests {
         let dir = scratch_dir("mismatch");
         let dest = dir.join("out.bin");
 
-        let mut sink = BlobSink::create(&dir).unwrap();
+        let mut sink = BlobSink::create(&dir, false).unwrap();
         sink.write(b"tampered").unwrap();
         assert_eq!(code(sink.finish(HELLO_SHA256, &dest)), "io");
         assert!(entries(&dir).is_empty());
 
-        let mut sink = BlobSink::create(&dir).unwrap();
+        let mut sink = BlobSink::create(&dir, false).unwrap();
         sink.write(b"partial").unwrap();
         assert_eq!(entries(&dir).len(), 1);
         drop(sink); // 下载中途出错或代次变化

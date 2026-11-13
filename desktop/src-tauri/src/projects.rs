@@ -834,7 +834,7 @@ impl<'a> Ctx<'a> {
             StatusCode::NOT_FOUND => return Err(err("not_found", "controller 上没有清单里的这份内容")),
             status => return Err(http_error("下载失败", status, &[])),
         }
-        let mut sink = BlobSink::create(&dir)?;
+        let mut sink = BlobSink::create(&dir, false)?;
         loop {
             let chunk = response.chunk().await;
             self.check()?;

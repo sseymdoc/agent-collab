@@ -557,6 +557,8 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
             save_journal(&app, &journal)?;
             let size = bytes.len();
             if load_settings(&app).channel != channel {
+                journal.finish("failed", Some("下载期间更新通道已经改变，本次下载作废".into()));
+                save_journal(&app, &journal)?;
                 return Err(invalid("下载期间更新通道已经改变，这次下载不再使用；先重新检查更新"));
             }
             *lock(&updates.bytes) = Some((update.version.clone(), bytes));

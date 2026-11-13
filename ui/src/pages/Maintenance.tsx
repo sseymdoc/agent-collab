@@ -40,6 +40,12 @@ function DesktopUpdate() {
   const [busy, setBusy] = useState<string | null>(null)
   const [progress, setProgress] = useState<{ done: number; total?: number } | null>(null)
   const load = () => invoke('update_status').then(setSt, e => setErr(errText(e)))
+  // 有阻塞（扫描、写回、本机部署）时每 5 秒重读一次，结束后安装按钮随之可用。
+  useEffect(() => {
+    if (!st?.blockers?.length) return
+    const timer = window.setInterval(() => { void load() }, 5000)
+    return () => window.clearInterval(timer)
+  }, [st?.blockers?.length]) // eslint-disable-line
   useEffect(() => {
     void load()
     const tauri = (window as any).__TAURI__
@@ -205,7 +211,8 @@ function Backups({ tick }: { tick: number }) {
           }} />}
         </td>
       </tr>)}
-      {!items.length && <tr><td colSpan={7} className="muted">还没有备份</td></tr>}
+      {!list.data && !list.error && <tr><td colSpan={7} className="muted">读取中…</td></tr>}
+      {list.data && !items.length && <tr><td colSpan={7} className="muted">还没有备份</td></tr>}
     </tbody></table>
     {saved && <p className="ok">{saved}</p>}
     {preview && <RestorePreview p={preview} />}

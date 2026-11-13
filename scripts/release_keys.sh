@@ -71,7 +71,8 @@ case $cmd in
     askpass "$t" "$rp"
     same_key_id "$dir/updater.key.pub" "$t/updater-sample.sig" || { echo 'updater 私钥与公钥不对应' >&2; exit 1; }
     # 密钥 ID 不能证明公钥内容完好（tauri CLI 没有验签命令）：再核对公钥文件与生成时记下的指纹一致。
-    grep -q "$(shasum -a 256 < "$dir/updater.key.pub" | cut -c1-64)" "$dir/FINGERPRINTS" || { echo 'updater 公钥与 FINGERPRINTS 记录的指纹不一致' >&2; exit 1; }
+    h=$(shasum -a 256 < "$dir/updater.key.pub" | cut -c1-64)
+    { [ ${#h} -eq 64 ] && grep -q "$h" "$dir/FINGERPRINTS"; } || { echo 'updater 公钥与 FINGERPRINTS 记录的指纹不一致' >&2; exit 1; }
     [ "$(ssh-keygen -y -f "$dir/release.key" < /dev/null | cut -d' ' -f1-2)" = "$(cut -d' ' -f1-2 "$dir/release.key.pub")" ] \
       || { echo '发行签名私钥与公钥不对应' >&2; exit 1; }
     # 用解开的临时副本对小文件真实签名，再按 allowed_signers 验签（signer 与 namespace 同正式流程）；副本随临时目录删除。

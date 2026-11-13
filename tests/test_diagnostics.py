@@ -326,6 +326,11 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(status, 0, error)
         self.assertIn('runtime', self.report()['sections'])
 
+    def test_password_arguments_are_redacted(self):
+        redactor = d.Redactor(home='/home/u', username='u', hostname='h')
+        for line in ("ERROR argv=['tool', '--password', 'p@55!']", 'tool --password p@55! --verbose'):
+            self.assertNotIn('p@55!', redactor.text(line))
+
     def test_url_userinfo_is_redacted_in_text_and_json(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')
         self.assertNotIn('pw1', redactor.text('proxy https://svc:pw1@proxy.example/x failed'))

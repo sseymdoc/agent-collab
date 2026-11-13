@@ -133,8 +133,8 @@
 | `update_status` | 无 | `{"identity", "current", "settings", "last_check", "offer", "downloaded", "blockers", "history"}` | `identity` 是构建身份与允许的通道；`blockers` 是现在不能安装的原因（进行中的项目操作、本机部署操作）；`history` 是最近的更新记录 |
 | `update_settings` | `{"channel", "auto_check", "auto_download", "auto_install"}` | 设置 | 通道只能是本身份允许的（正式版 `stable`、`preview`，缺省 `stable`）。保存在应用配置目录的 `update-settings.json` |
 | `update_check` | `{"features"?}` | `{"available", "version"?, "notes"?, "summary"?, "compat"?, ...}` | 取 `<更新地址>/<通道>/latest.json`；有新版本时再取同目录的 `product-manifest.json` 与 `.sig`，用同一把公钥核对签名，核对发行 ID 与构建身份。`features` 是当前连接的 controller 的 features，`compat.verdict` 为 `accept`、`degraded`、`reject` 或 `unknown`（没有连接）。只提供更高的版本 |
-| `update_download` | 无 | `{"version", "bytes", "op_id"}` | 下载并验签（进度经事件 `ac-update`）；兼容结论为 reject 时拒绝（`incompatible`） |
-| `update_install` | 无 | 不返回（重启） | 安全空闲条件：没有进行中的项目操作与本机部署操作，否则 `busy`。Windows 上启动安装程序后退出、安装完成后重新打开；macOS 就地替换应用包后重启。兼容结论为 reject 时拒绝 |
+| `update_download` | `{"features"}` | `{"version", "bytes", "op_id"}` | 下载并验签（进度经事件 `ac-update`）；兼容结论为 reject 时拒绝（`incompatible`）；`features` 与检查时相同（当前连接的 controller 的 features，没有连接时为 null），连接换了会要求先重新检查 |
+| `update_install` | `{"features"}` | 不返回（重启） | 安全空闲条件：没有进行中的项目操作与本机部署操作，否则 `busy`。Windows 上启动安装程序后退出、安装完成后重新打开；macOS 就地替换应用包后重启。兼容结论为 reject 时拒绝 |
 | `backup_save` | `{"epoch", "backup_id"}` | `{"path", "bytes", "sha256"}` 或 `{"cancelled": true}` | 把 controller 上的一份备份（`GET /maintenance/backups/{id}/archive`）经“另存为”保存到这台机器，按响应头 `X-Content-SHA256` 核对后落盘；之后它才算实例外的备份 |
 | `diagnostics_export` | `{"epoch"?, "include_task_logs"}` | `{"id", "preview"}` | 用本机助手生成诊断包（`agent-collab diagnostics export`），暂存在应用本机数据目录的 `diagnostics/`。`epoch` 给出时外壳用当前连接取 `GET /client`、`/doctor`、`/nodes` 与最近事件交给助手（助手不访问网络、拿不到凭据），用完即删 |
 | `diagnostics_preview` | `{"id", "name"}` | `{"ok", "text"}` | 导出之后查看包内某个文件的文本 |
