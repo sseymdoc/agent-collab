@@ -146,6 +146,15 @@ class DesktopCopyTests(unittest.TestCase):
                 with self.subTest(change=change), self.assertRaises(SystemExit):
                     build.fragments(dist)
 
+    def test_windows_tauri_command_keeps_backslashes_and_drops_outer_quotes(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        with patch.object(build.os, 'name', 'nt'):
+            self.assertEqual(build.split_tauri('"C:\\Program Files\\node\\node.exe" tauri.js'),
+                             ['C:\\Program Files\\node\\node.exe', 'tauri.js'])
+
     def test_copy_skips_generated_payload_and_local_secrets(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')

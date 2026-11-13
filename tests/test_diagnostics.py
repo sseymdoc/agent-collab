@@ -473,6 +473,17 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertEqual(SERVICE_OWNERSHIP(manager), {'worker': 'this_prefix'})
         self.assertEqual(child.call_count, 3)
 
+    def test_passwd_field_and_text_are_redacted_in_the_export(self):
+        self.write(self.state / 'worker/agent.log', '{"level":"ERROR","passwd":"p@55!"}\nERROR login passwd=hunter-22x failed')
+        status, output, _ = self.run_cli()
+        self.assertEqual(status, 0)
+        with zipfile.ZipFile(self.output) as archive:
+            data = ''.join(archive.read(name).decode('utf-8') for name in archive.namelist())
+        self.assertEqual(len(self.report()['recent_errors']), 2)
+        for secret in ('p@55!', 'hunter-22x'):
+            self.assertNotIn(secret, data)
+            self.assertNotIn(secret, output)
+
     def test_recent_errors_are_bounded(self):
         self.write(self.state / 'worker/agent.log', '\n'.join('error %d' % i for i in range(100)))
         self.assertEqual(self.run_cli()[0], 0)

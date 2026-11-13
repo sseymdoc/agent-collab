@@ -24,7 +24,7 @@ TOTAL_LIMIT = 4 * JSON_LIMIT
 MAX_FILES = 128
 ERROR_LIMIT = 50
 TASK_WARNING = '任务原始日志可能包含项目内容；已按相同规则脱敏，请在分享前检查预览。'
-SECRET_KEY = re.compile(r'(?i)(?:^|[_-])(?:token|secret|password|code|key)(?:$|[_-])')
+SECRET_KEY = re.compile(r'(?i)(?:^|[_-])(?:token|secret|password|passwd|code|key)(?:$|[_-])')
 CONTENT_KEYS = {'input', 'inputs', 'prompt', 'task_input', 'source', 'source_code',
                 'content', 'files', 'artifacts', 'stdout', 'stderr', 'stdout_tail', 'stderr_tail',
                 'instructions', 'messages', 'frozen_input', 'task_spec',
@@ -79,8 +79,8 @@ class Redactor:
                        lambda m: m.group(1) + self.mark('argument'), value)
         # URL 里的 userinfo（https://user:password@host）同样是凭据。
         value = re.sub(r'(?i)\b([a-z][a-z0-9+.-]*://)[^\s/"\x27]+@', lambda m: m.group(1) + self.mark('url_userinfo') + '@', value)
-        value = re.sub(r'\b(?:(?i:(?:[\w-]*[_-])?(?:token|secret|password|code|key))|'
-                       r'[\w-]+(?:Token|Secret|Password|Code|Key))(?:[_-][\w-]+|[A-Z][\w-]*)?["\x27]?\s*[:=]\s*'
+        value = re.sub(r'\b(?:(?i:(?:[\w-]*[_-])?(?:token|secret|password|passwd|code|key))|'
+                       r'[\w-]+(?:Token|Secret|Password|Passwd|Code|Key))(?:[_-][\w-]+|[A-Z][\w-]*)?["\x27]?\s*[:=]\s*'
                        r'(?:"(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27|[^\s,;{}\[\]]+)',
                        lambda m: self.mark('field'), value)
         value = re.sub(r'(?<![\w-])[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{8,}(?![\w-])',

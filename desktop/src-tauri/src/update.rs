@@ -96,13 +96,18 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf> {
 }
 
 fn load_settings(app: &AppHandle) -> Settings {
+    read_settings(app).0
+}
+
+/// 第二项为真：设置文件存在却读不出或损坏，用的是关闭自动更新的缺省值，通道也未必是用户选的。
+fn read_settings(app: &AppHandle) -> (Settings, bool) {
     let Ok(path) = settings_path(app) else {
-        return Settings::cautious();
+        return (Settings::cautious(), true);
     };
     match std::fs::read(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::defaults(),
-        Ok(bytes) => serde_json::from_slice::<Settings>(&bytes).map_or_else(|_| Settings::cautious(), Settings::sanitized),
-        Err(_) => Settings::cautious(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::defaults(), false),
+        Ok(bytes) => serde_json::from_slice::<Settings>(&bytes).map_or_else(|_| (Settings::cautious(), true), |s| (s.sanitized(), false)),
+        Err(_) => (Settings::cautious(), true),
     }
 }
 
@@ -401,6 +406,7 @@ fn blockers(shell: &Shell) -> Vec<String> {
 
 #[tauri::command]
 pub fn update_status(app: AppHandle, shell: State<'_, Shell>, updates: State<'_, Updates>) -> Result<Value> {
+    let (settings, settings_broken) = read_settings(&app);
     let offer = lock(&updates.offer).as_ref().map(|offer| {
         json!({ "version": offer.update.version, "summary": summary(&offer.manifest), "compat": offer.compat,
                 "notes": offer.update.body, "channel": offer.channel })
@@ -409,7 +415,8 @@ pub fn update_status(app: AppHandle, shell: State<'_, Shell>, updates: State<'_,
     Ok(json!({
         "identity": identity(&app),
         "current": current_version(&app),
-        "settings": load_settings(&app),
+        "settings": settings,
+        "settings_broken": settings_broken,
         "last_check": *lock(&updates.last_check),
         "offer": offer,
         "downloaded": downloaded,
@@ -497,17 +504,19 @@ pub async fn update_check(app: AppHandle, updates: State<'_, Updates>, features:
     if !configured(&key) {
         return Err(err("not_configured", "这个构建没有配置更新通道"));
     }
-    let settings = load_settings(&app);
+    // 先取通道代次再读设置：update_settings 先写设置再加代次，检查期间换过通道，发布结果时就能看出来。
+    let generation = updates.generation.load(std::sync::atomic::Ordering::SeqCst);
+    let (settings, broken) = read_settings(&app);
+    if broken {
+        return Err(invalid("更新设置文件读不出或已损坏，不知道该检查哪个通道：请在维护页重新保存更新设置"));
+    }
     let base = UPDATE_BASE.unwrap_or_default();
     let endpoint = channel_url(base, &settings.channel, "latest.json").map_err(invalid)?;
     let updater = app.updater_builder().endpoints(vec![endpoint]).map_err(update_error)?.timeout(CHECK_TIMEOUT).build().map_err(update_error)?;
     let checked_at = now_iso();
     let found = updater.check().await.map_err(update_error)?;
-    let result = match found {
-        None => {
-            *lock(&updates.offer) = None;
-            json!({ "available": false, "current": current_version(&app), "channel": settings.channel, "checked_at": checked_at })
-        }
+    let (result, offer) = match found {
+        None => (json!({ "available": false, "current": current_version(&app), "channel": settings.channel, "checked_at": checked_at }), None),
         Some(update) => {
             let manifest = manifest(base, &settings.channel, &update.version, &key, &app.config().identifier).await.map_err(|e| err("invalid", e))?;
             let verdict = compat(&manifest, features.as_deref());
@@ -522,10 +531,15 @@ pub async fn update_check(app: AppHandle, updates: State<'_, Updates>, features:
                 "summary": summary(&manifest),
                 "compat": verdict,
             });
-            *lock(&updates.offer) = Some(Offer { update, manifest, compat: verdict, channel: settings.channel.clone(), features });
-            result
+            (result, Some(Offer { update, manifest, compat: verdict, channel: settings.channel.clone(), features }))
         }
     };
+    // 与 update_settings 用同一把锁核对代次，再一起发布 offer 与 last_check：旧通道的检查结果不覆盖新通道的。
+    let _bytes = lock(&updates.bytes);
+    if updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        return Err(invalid("检查期间切换了更新通道，这次结果已作废，请重新检查"));
+    }
+    *lock(&updates.offer) = offer;
     *lock(&updates.last_check) = Some(result.clone());
     Ok(result)
 }

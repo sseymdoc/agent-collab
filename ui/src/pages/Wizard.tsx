@@ -166,7 +166,9 @@ export function NodeBindings() {
   const [busy, setBusy] = useState(false)
   const [pick, setPick] = useState('')
   const [projects, setProjects] = useState<any[]>([])
-  const load = () => invoke('node_bindings').then(r => setB(r.bindings ?? []), e => setErr(errText(e)))
+  // 读取中不授权：否则迟到的旧列表会覆盖授权后的列表。读取失败可以重读。
+  const [loading, setLoading] = useState(true)
+  const load = () => { setLoading(true); setErr(null); return invoke('node_bindings').then(r => setB(r.bindings ?? []), e => setErr(errText(e))).finally(() => setLoading(false)) }
   useEffect(() => {
     void load()
     // 已连接 controller 时列出它的项目供选择；节点所属的 controller 可能不是当前连接的那个，所以也可以直接填项目 ID。
@@ -194,8 +196,8 @@ export function NodeBindings() {
       {projects.length > 0 && <select value={projects.some(p => p.project_id === pick) ? pick : ''} onChange={e => setPick(e.target.value)}>
         <option value="">选择项目…</option>{projects.map(p => <option key={p.project_id} value={p.project_id}>{p.name}</option>)}</select>}
       <input placeholder="或填写项目 ID" value={pick} onChange={e => setPick(e.target.value.trim().toLowerCase())} size={38} />
-      {/* 首次读取完成之前不授权：否则迟到的旧列表会覆盖授权后的列表。 */}
-      <button disabled={busy || !valid || b === null} onClick={() => void act(() => invoke('node_bind', { project_id: pick }))}>选择文件夹并授权</button>
+      {b === null && !loading && <button disabled={busy} onClick={() => void load()}>重新读取</button>}
+      <button disabled={busy || !valid || loading} onClick={() => void act(() => invoke('node_bind', { project_id: pick }))}>选择文件夹并授权</button>
     </div>
     {err && <p className="err">{err}</p>}
   </div>
