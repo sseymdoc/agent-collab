@@ -91,10 +91,10 @@ function DesktopUpdate() {
           {offer.compat?.missing_optional?.length ? <><br />不可用的功能：{offer.compat.missing_optional.join('、')}</> : null}</dd>
       </dl>
       <div className="actions">
-        <button disabled={!!busy || verdict === 'reject' || (st.downloaded?.version === offer.version)} onClick={() => void run('下载中…', async () => { setProgress(null); await invoke('update_download') })}>下载并验签</button>
+        <button disabled={!!busy || verdict === 'reject' || (st.downloaded?.version === offer.version)} onClick={() => void run('下载中…', async () => { setProgress(null); await invoke('update_download', { features }) })}>下载并验签</button>
         {progress && <small className="muted">{bytes(progress.done)}{progress.total ? ' / ' + bytes(progress.total) : ''}</small>}
         <button className="primary" disabled={!!busy || st.downloaded?.version !== offer.version || st.blockers?.length > 0} onClick={() => {
-          if (window.confirm(`安装 ${offer.version}：桌面端会关闭并重新启动，本机后台服务不受影响。确定安装？`)) void run('准备安装：等正在运行的本机助手结束（最多一分钟，等不到就这次不安装）…', async () => { await invoke('update_install') })
+          if (window.confirm(`安装 ${offer.version}：桌面端会关闭并重新启动，本机后台服务不受影响。确定安装？`)) void run('准备安装：等正在运行的本机助手结束（最多一分钟，等不到就这次不安装）…', async () => { await invoke('update_install', { features }) })
         }}>安装并重启</button>
         {verdict === 'reject' && <small className="err">先在 controller 所在机器上升级它，再更新桌面端。</small>}
       </div>
@@ -150,6 +150,12 @@ function LocalBackend() {
 
 // ---------------------------------------------------------------- 备份与恢复
 
+// 维护操作失败（例如磁盘写满）时接口仍是 200，结果在 maintenance_op 里：按失败显示，不显示“已提交”。
+function opFailed(r: any, what: string) {
+  const op = r?.maintenance_op
+  if (op?.status === 'failed') throw new Error(what + '没有完成：' + (op.error?.message ?? op.error?.code ?? '未知原因'))
+}
+
 function Backups({ tick }: { tick: number }) {
   const list = useData(() => api.backups(), [tick])
   const policy = useData(() => api.backupPolicy(), [tick])
@@ -167,11 +173,9 @@ function Backups({ tick }: { tick: number }) {
     <div className="actions">
       <input placeholder="备注（可选）" value={label} onChange={e => setLabel(e.target.value)} maxLength={80} />
       <Action label="立即备份" scope="maintain" run={async () => {
-        // 维护操作失败（例如磁盘写满）时接口仍是 200，结果在 maintenance_op 里：按失败显示，不显示“已提交”。
         const r: any = await api.createBackup(label.trim())
         await list.reload()
-        const op = r?.maintenance_op
-        if (op?.status === 'failed') throw new Error('备份没有完成：' + (op.error?.message ?? op.error?.code ?? '未知原因'))
+        opFailed(r, '备份')
         setLabel('')
       }} />
     </div>
@@ -185,7 +189,7 @@ function Backups({ tick }: { tick: number }) {
           : <>{show(b.blob_count)} 个对象 · {bytes(b.blob_bytes)} · 代次 {show(b.authority_generation)} · 事件 {show(b.event_seq)}</>}</small></td>
         <td>{b.last_verification ? <><Badge v={b.last_verification.ok ? 'passed' : 'failed'} /> <small className="muted">{when(b.last_verification.at)}</small></> : <small className="muted">未核对</small>}</td>
         <td className="actions">
-          <Action label="核对" scope="maintain" run={async () => { await api.verifyBackup(b.id); await list.reload() }} />
+          <Action label="核对" scope="maintain" run={async () => { const r: any = await api.verifyBackup(b.id); await list.reload(); opFailed(r, '核对') }} />
           <button onClick={() => {
             const ticket = ++previewTicket.current
             setPreview({ id: b.id })
@@ -205,7 +209,7 @@ function Backups({ tick }: { tick: number }) {
     <details><summary>保留策略</summary>
       <p className="muted">只清理受管备份；不会删除唯一一份、也不会删除最新一份核对通过的备份。升级前的自动备份不在清理范围内。</p>
       <div className="actions"><label>保留份数 <input type="number" min={1} max={100} value={keep ?? pol.keep ?? 8} onChange={e => setKeep(Number(e.target.value))} /></label>
-        <Action label="保存" scope="maintain" disabled={keep === null} run={async () => { await api.saveBackupPolicy(pol.revision ?? 0, keep!); setKeep(null); await policy.reload() }} /></div>
+        <Action label="保存" scope="maintain" disabled={keep === null} run={async () => { const r: any = await api.saveBackupPolicy(pol.revision ?? 0, keep!); await policy.reload(); opFailed(r, '保存保留策略'); setKeep(null) }} /></div>
     </details>
     <details><summary>怎样恢复</summary>
       <p>恢复会把 controller 的数据换成备份时的样子：之后产生的任务、发布、写回记录、项目与设置修改、配对都会丢失；节点上已经写入项目目录的文件不会被撤回。
@@ -330,25 +334,26 @@ export function useAutoUpdate(notify: (title: string, body: string) => void) {
       if (e.payload?.phase !== 'auto_check' || busy) return
       busy = true
       try {
-        let st: any, r: any
+        let st: any, r: any, features: string[] | null = null
         try {
           st = await invoke('update_status')
           if (!st.identity?.configured || !st.settings?.auto_check) return
           const who = session()
-          r = await invoke('update_check', { features: who ? (who.controller?.features ?? []) : null })
+          features = who ? (who.controller?.features ?? []) : null
+          r = await invoke('update_check', { features })
         } catch { return }
         if (!r.available) return
         notify('桌面端有新版本 ' + r.version, r.compat?.verdict === 'reject' ? '与当前 controller 不兼容，先升级 controller；详见“维护”页' : '在“维护”页查看并安装')
         if (r.compat?.verdict === 'reject' || !st.settings.auto_download) return
         try {
-          await invoke('update_download')
+          await invoke('update_download', { features })
           // 下载期间用户可能改了设置；有扫描、写回或本机部署在进行时等它们结束（每分钟再看一次）。
           for (;;) {
             const now = await invoke('update_status')
             if (stopped || !now.settings?.auto_install || now.downloaded?.version !== r.version) return
             if (!now.blockers?.length) {
               // 读状态之后又有操作开始时，安装会以 busy 拒绝：当作阻塞，继续等。
-              try { await invoke('update_install'); return } catch (err: any) { if (err?.code !== 'busy') throw err }
+              try { await invoke('update_install', { features }); return } catch (err: any) { if (err?.code !== 'busy') throw err }
             }
             await new Promise(done => { retry = window.setTimeout(done, 60000) })
           }

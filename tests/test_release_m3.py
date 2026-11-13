@@ -88,7 +88,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(len(result['unchecked']), 2)
 
     def test_malformed_metadata_rejects(self):
-        for change in ({'version': 'nope'}, {'features': 'clients'}, {'protocol_version': True}, {'compat': 'invalid'}):
+        for change in ({'version': 'nope'}, {'features': 'clients'}, {'protocol_version': True}, {'compat': 'invalid'}, {'compat': []}, {'compat': False}):
             with self.subTest(change=change):
                 self.assertEqual(rt.evaluate_compat(self.release, dict(self.controller, **change))['decision'], 'reject')
 
@@ -172,6 +172,16 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertEqual(rt.main(['compat', '--release', str(self.v1), '--controller', 'https://example.invalid',
                                       '--profile', 'test']), 2)
         self.assertEqual(json.loads(output.getvalue())['decision'], 'reject')
+
+    def test_compat_online_unreachable_node_list_is_degraded(self):
+        manifest, _ = legacy.ins.read_release(self.v1)
+        info = dict(version='1.0.0', protocol_version=manifest['protocol_version'], features=manifest['features'], compat=manifest['compat'])
+        from agent_collab import cli
+        with patch('agent_collab.cli.Conn') as conn, redirect_stdout(io.StringIO()) as output:
+            conn.return_value.send.side_effect = [(200, {'controller': info}), cli.Unreachable('down')]
+            self.assertEqual(rt.main(['compat', '--release', str(self.v1), '--as', 'controller',
+                                      '--controller', 'https://example.invalid', '--profile', 'test']), 1)
+        self.assertEqual(json.loads(output.getvalue())['decision'], 'degraded')
 
     def test_compat_online_refusal_prints_a_reject_decision(self):
         for status in (401, 403, 404):

@@ -213,21 +213,44 @@ struct Shell {
     deploying: tokio::sync::Mutex<()>,
     /// 进行中的备份导出数：导出期间不安装桌面端更新（安装会重启应用，导出随之中断）。
     exports: std::sync::atomic::AtomicUsize,
+    /// 桌面端更新的安装已经开始：不再接受新的备份导出。
+    installing: std::sync::atomic::AtomicBool,
 }
 
-/// 备份导出期间计数，离开作用域即减一。
+/// 备份导出期间计数，离开作用域即减一。安装已开始时拒绝。
+/// 与 `Installing` 都先登记自己、再看对方（SeqCst），两边同时开始时至少一边会看到另一边。
 struct Exporting<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl<'a> Exporting<'a> {
-    fn new(count: &'a std::sync::atomic::AtomicUsize) -> Self {
-        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(count)
+    fn start(shell: &'a Shell) -> Result<Self> {
+        shell.exports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = Self(&shell.exports);
+        if shell.installing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(err("busy", "桌面端更新正在安装，稍后再导出备份"));
+        }
+        Ok(guard)
     }
 }
 
 impl Drop for Exporting<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 安装更新期间关闭备份导出的准入，离开作用域（安装没有进行下去）即重新打开。
+pub(crate) struct Installing<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> Installing<'a> {
+    pub(crate) fn start(shell: &'a Shell) -> Self {
+        shell.installing.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(&shell.installing)
+    }
+}
+
+impl Drop for Installing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -240,6 +263,7 @@ impl Shell {
             ops: projects::Ops::default(),
             deploying: tokio::sync::Mutex::new(()),
             exports: std::sync::atomic::AtomicUsize::new(0),
+            installing: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -987,7 +1011,7 @@ async fn backup_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64,
         return Ok(json!({ "cancelled": true }));
     };
     shell.lock().current(epoch)?;
-    let _exporting = Exporting::new(&shell.exports);
+    let _exporting = Exporting::start(&shell)?;
     let mut response = shell.send(epoch, &active, active.http.api.get(url)).await?;
     if !response.status().is_success() {
         let status = response.status();

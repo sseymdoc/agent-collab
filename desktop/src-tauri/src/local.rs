@@ -469,6 +469,15 @@ async fn controller_info(shell: &Shell, epoch: u64) -> Result<Value> {
         };
         info.insert(key.to_string(), value);
     }
+    // 事件只留元数据：负载里有任务记录（契约与正文），既不该进诊断，也会让整节超过助手的 1 MiB 上限而被丢弃。
+    if let Some(events) = info.get_mut("events").and_then(|v| v.get_mut("events")).and_then(Value::as_array_mut) {
+        for event in events.iter_mut().filter_map(Value::as_object_mut) {
+            event.remove("payload");
+        }
+    }
+    if serde_json::to_vec(&info).map_or(0, |v| v.len()) > 900 * 1024 {
+        info.insert("events".into(), json!({ "error": "省略：controller 信息超过诊断上限" }));
+    }
     Ok(Value::Object(info))
 }
 

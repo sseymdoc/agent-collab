@@ -297,6 +297,16 @@ struct Offer {
     compat: Value,
     /// 检查时的通道；之后改了通道，这次的结果与已下载的包都不再有效。
     channel: String,
+    /// 兼容结论所依据的 controller features（没有连接时为 None）；连接换了，结论就要重新得出。
+    features: Option<Vec<String>>,
+}
+
+/// 下载与安装前核对：兼容结论针对的仍是现在连接的 controller。
+fn same_controller(offer: &Offer, features: &Option<Vec<String>>) -> Result<()> {
+    if &offer.features != features {
+        return Err(invalid("连接的 controller 已经改变，先重新检查更新"));
+    }
+    Ok(())
 }
 
 /// 下载与安装前核对：这次检查的通道仍是当前设置的通道。
@@ -360,7 +370,10 @@ fn blockers(shell: &Shell) -> Vec<String> {
 
 #[tauri::command]
 pub fn update_status(app: AppHandle, shell: State<'_, Shell>, updates: State<'_, Updates>) -> Result<Value> {
-    let offer = lock(&updates.offer).as_ref().map(|offer| json!({ "version": offer.update.version, "summary": summary(&offer.manifest) }));
+    let offer = lock(&updates.offer).as_ref().map(|offer| {
+        json!({ "version": offer.update.version, "summary": summary(&offer.manifest), "compat": offer.compat,
+                "notes": offer.update.body, "channel": offer.channel })
+    });
     let downloaded = lock(&updates.bytes).as_ref().map(|(version, bytes)| json!({ "version": version, "bytes": bytes.len() }));
     Ok(json!({
         "identity": identity(&app),
@@ -469,7 +482,7 @@ pub async fn update_check(app: AppHandle, updates: State<'_, Updates>, features:
                 "summary": summary(&manifest),
                 "compat": verdict,
             });
-            *lock(&updates.offer) = Some(Offer { update, manifest, compat: verdict, channel: settings.channel.clone() });
+            *lock(&updates.offer) = Some(Offer { update, manifest, compat: verdict, channel: settings.channel.clone(), features });
             result
         }
     };
@@ -478,7 +491,7 @@ pub async fn update_check(app: AppHandle, updates: State<'_, Updates>, features:
 }
 
 #[tauri::command]
-pub async fn update_download(app: AppHandle, updates: State<'_, Updates>) -> Result<Value> {
+pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, features: Option<Vec<String>>) -> Result<Value> {
     let _running = updates.running.try_lock().map_err(|_| err("busy", "更新的下载或安装正在进行"))?;
     let update = {
         let offer = lock(&updates.offer);
@@ -487,6 +500,7 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>) -> Res
             return Err(e);
         }
         same_channel(&app, offer)?;
+        same_controller(offer, &features)?;
         offer.update.clone()
     };
     let mut journal = Journal::new(&current_version(&app), &update.version, &load_settings(&app).channel);
@@ -528,8 +542,10 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>) -> Res
 }
 
 #[tauri::command]
-pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: State<'_, Updates>) -> Result<Value> {
+pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: State<'_, Updates>, features: Option<Vec<String>>) -> Result<Value> {
     let _running = updates.running.try_lock().map_err(|_| err("busy", "更新的下载或安装正在进行"))?;
+    // 先关上备份导出的准入，再看空闲条件：之后开始的导出会被拒绝，已经开始的会让这次安装以 busy 结束。
+    let _installing = super::Installing::start(&shell);
     let blocked = blockers(&shell);
     if !blocked.is_empty() {
         return Err(err("busy", format!("现在不能安装：{}", blocked.join("；"))));
@@ -541,6 +557,7 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
             return Err(e);
         }
         same_channel(&app, offer)?;
+        same_controller(offer, &features)?;
         offer.update.clone()
     };
     let bytes = lock(&updates.bytes).take().filter(|(version, _)| *version == update.version).map(|(_, bytes)| bytes);

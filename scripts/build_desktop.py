@@ -353,6 +353,10 @@ def fragments(dist):
     kinds = {(f['kind'], f['identifier'], f['desktop_version'], f['commit']) for f in found}
     if len(kinds) != 1:
         raise SystemExit('各平台片段的身份、版本或源提交不一致：%s' % sorted(kinds))
+    # 产品清单把随包后台写成一个组件：各平台带的必须是同一个后台发行包。
+    backends = {json.dumps(f['backend'], sort_keys=True) for f in found}
+    if len(backends) != 1:
+        raise SystemExit('各平台片段随包的后台发行包不一致（版本、摘要、签名或兼容声明不同）')
     return found
 
 
@@ -492,9 +496,9 @@ def gate(args):
                 check(channel + '/latest.json 的 ' + f['target'] + ' 签名与平台片段一致', entry.get('signature') == f['updater']['signature'])
                 for item in f['artifacts']:
                     copy = dist / channel / item['name']
-                    if item['role'] in ('updater', 'installer+updater', 'updater-signature') and copy.is_file():
-                        check(channel + '/' + item['name'] + ' 与平台片段记录的摘要一致',
-                              copy.stat().st_size == item['bytes'] and sha256(copy) == item['sha256'])
+                    if item['role'] in ('updater', 'installer+updater', 'updater-signature'):
+                        check(channel + '/' + item['name'] + ' 存在且与平台片段记录的摘要一致',
+                              copy.is_file() and copy.stat().st_size == item['bytes'] and sha256(copy) == item['sha256'])
     report = dict(kind=kind, version=first['desktop_version'], commit=first['commit'], passed=all(c['ok'] for c in checks), checks=checks)
     (dist / 'gate-report.json').write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding='utf-8')
     for c in checks:

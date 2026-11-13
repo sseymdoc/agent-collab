@@ -45,7 +45,9 @@ def evaluate_compat(manifest, controller_info, role='worker', nodes=None):
         compat, remote_compat = manifest.get('compat'), controller.get('compat')
         if compat is None or remote_compat is None:
             unchecked.append('旧发行清单或 controller 未提供 compat，部分最低版本要求未核对')
-        compat, remote_compat = compat or {}, remote_compat or {}
+        # 只有缺失（None）按空声明处理；[]、false、"" 这类错误的值交给下面的类型检查拒绝。
+        compat = {} if compat is None else compat
+        remote_compat = {} if remote_compat is None else remote_compat
         if not isinstance(compat, dict) or not isinstance(remote_compat, dict):
             raise ValueError('invalid compat declaration')
         available = _features(controller.get('features', []))
@@ -145,14 +147,18 @@ def main(argv=None):
                     args.url = args.controller
                     try:
                         connection = cli.Conn(args)
-                    except SystemExit:
-                        # profile 没有凭据或地址与配对的不同：Conn 已经在 stderr 说明了原因，这里仍按约定输出 reject。
-                        raise ValueError('cannot open the controller connection for this profile')
+                    except SystemExit as exc:
+                        # profile 没有凭据或地址与配对的不同：Conn 用 SystemExit 带出原因，原样放进 reject 输出。
+                        raise ValueError('cannot open the controller connection: %s' % exc.code)
                     status, info = connection.send('GET', '/client')
                     if status != 200:
                         raise ValueError('GET /client returned HTTP %d' % status)
                     if args.role == 'controller':
-                        status, body = connection.send('GET', '/nodes')
+                        # 取不到节点列表（非 200 或不可达）时 nodes 保持为 None：记为未核对，结论是 degraded 而不是 reject。
+                        try:
+                            status, body = connection.send('GET', '/nodes')
+                        except cli.Unreachable:
+                            status = None
                         if status == 200:
                             nodes = body['nodes']
                 result = evaluate_compat(manifest, info, args.role, nodes)

@@ -101,7 +101,8 @@ class Redactor:
             for key, item in value.items():
                 name = str(key)
                 normalized = normalized_key(name)
-                if SECRET_KEY.search(normalized) or normalized in ('authorization', 'proxy-authorization', 'x-coordinator-token', 'cookie', 'set-cookie'):
+                if (SECRET_KEY.search(normalized) or re.search(r'(?:^|[_-])cookie(?:$|[_-])', normalized) or
+                        normalized in ('authorization', 'proxy-authorization', 'x-coordinator-token')):
                     item = self.mark('field')
                 elif normalized in CONTENT_KEYS:
                     item = self.mark('excluded_content')
