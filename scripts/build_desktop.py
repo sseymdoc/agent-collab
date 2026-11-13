@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import urllib.parse
 
 # ADR 0004 第 1 条。门禁按这张表核对，构建也只从这里取身份。
 KINDS = {
@@ -384,12 +385,21 @@ def fragments(dist):
     return found
 
 
+def https_url(url):
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme == 'https' and bool(parts.hostname)
+
+
 def manifest(args):
-    if args.download_base and not args.download_base.startswith('https://'):
-        raise SystemExit('--download-base 必须是 https 地址')
+    if args.download_base and not https_url(args.download_base):
+        raise SystemExit('--download-base 必须是带主机名的 https 地址')
     dist = Path(args.dist)
     found = fragments(dist)
     first = found[0]
+    # 更新包地址：缺省与通道文件放在一起；--download-base 指向版本化的下载位置。写任何文件之前先核对。
+    base = (args.download_base.rstrip('/') if args.download_base else args.base_url.rstrip('/') + '/' + args.channel) + '/'
+    if first['kind'] == 'formal' and not https_url(base):
+        raise SystemExit('正式版的更新包地址必须是带主机名的 https 地址：%s' % base)
     if args.channel not in first['channels']:
         raise SystemExit('%s 身份没有 %s 通道' % (first['kind'], args.channel))
     backend = first['backend']
@@ -431,9 +441,6 @@ def manifest(args):
     # 更新包地址：缺省与通道文件放在一起；--download-base 指向版本化的下载位置（例如 GitHub Release 附件，下载时会重定向，
     # updater 跟随重定向）。通道文件本身（latest.json、product-manifest.json 与签名）要放在不重定向的 https 地址上，
     # 桌面端取产品发行清单时不跟随重定向。
-    base = (args.download_base.rstrip('/') if args.download_base else args.base_url.rstrip('/') + '/' + args.channel) + '/'
-    if first['kind'] == 'formal' and not base.startswith('https://'):
-        raise SystemExit('正式版的更新包地址必须是 https：%s' % base)
     latest = dict(version=first['desktop_version'], notes=notes, pub_date=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
                   platforms={f['target']: dict(url=base + f['updater']['file'], signature=f['updater']['signature']) for f in found if f['updater']['signature']},
                   agent_collab=dict(manifest='product-manifest.json'))
@@ -527,7 +534,7 @@ def gate(args):
                 entry = value['platforms'].get(f['target'], {})
                 check(channel + '/latest.json 的 ' + f['target'] + ' 签名与平台片段一致', entry.get('signature') == f['updater']['signature'])
                 if kind == 'formal':
-                    check(channel + '/latest.json 的 ' + f['target'] + ' 下载地址是 https', str(entry.get('url', '')).startswith('https://'))
+                    check(channel + '/latest.json 的 ' + f['target'] + ' 下载地址是带主机名的 https', https_url(str(entry.get('url', ''))))
                 for item in f['artifacts']:
                     copy = dist / channel / item['name']
                     if item['role'] in ('updater', 'installer+updater', 'updater-signature'):

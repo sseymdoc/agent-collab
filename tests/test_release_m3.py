@@ -87,6 +87,10 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(result['decision'], 'degraded')
         self.assertEqual(len(result['unchecked']), 2)
 
+    def test_invalid_minimum_worker_version_rejects_even_without_nodes(self):
+        release = dict(self.release, compat=dict(self.release.get('compat') or {}, controller_min_worker=''))
+        self.assertEqual(rt.evaluate_compat(release, self.controller, 'controller', [])['decision'], 'reject')
+
     def test_malformed_metadata_rejects(self):
         for change in ({'version': 'nope'}, {'features': 'clients'}, {'protocol_version': True}, {'compat': 'invalid'}, {'compat': []}, {'compat': False}):
             with self.subTest(change=change):

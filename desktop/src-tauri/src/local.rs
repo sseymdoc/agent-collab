@@ -554,8 +554,18 @@ pub async fn diagnostics_save(window: tauri::WebviewWindow, app: AppHandle, id: 
         return Ok(json!({ "cancelled": true }));
     };
     // 先复制到目标目录里的临时文件，成功后再改名覆盖：复制中途出错不会损坏用户原有的同名文件。
-    let staging = dest.with_file_name(format!(".agent-collab-diagnostics-{}.part", &id[..8]));
-    let bytes = match std::fs::copy(&file, &staging).and_then(|n| std::fs::rename(&staging, &dest).map(|_| n)) {
+    // 临时文件名不可预测，并以 create_new 独占创建：不会覆盖已有文件，也不会跟随同名链接。
+    let staging = dest.with_file_name(format!(".agent-collab-diagnostics-{}.part", uuid::Uuid::new_v4()));
+    let copy = || -> std::io::Result<u64> {
+        let mut source = std::fs::File::open(&file)?;
+        let mut target = std::fs::OpenOptions::new().write(true).create_new(true).open(&staging)?;
+        let n = std::io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+        drop(target);
+        std::fs::rename(&staging, &dest)?;
+        Ok(n)
+    };
+    let bytes = match copy() {
         Ok(n) => n,
         Err(e) => {
             let _ = std::fs::remove_file(&staging);

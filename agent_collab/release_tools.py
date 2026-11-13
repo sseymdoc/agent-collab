@@ -70,6 +70,8 @@ def evaluate_compat(manifest, controller_info, role='worker', nodes=None):
             if isinstance(nodes, dict):
                 nodes = nodes['nodes']
             minimum = compat.get('controller_min_worker')
+            if minimum is not None:
+                parse_version(minimum)  # 声明本身无效时与有没有节点无关，都按元数据无效拒绝
             if nodes is None:
                 unchecked.append('未提供 nodes，未核对现有节点的最低版本与要求；先节点后 controller')
             elif not isinstance(nodes, list):
