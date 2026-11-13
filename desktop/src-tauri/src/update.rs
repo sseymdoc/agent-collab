@@ -347,7 +347,8 @@ fn refused(offer: &Offer) -> Option<BridgeError> {
 #[derive(Default)]
 pub struct Updates {
     offer: Mutex<Option<Offer>>,
-    bytes: Mutex<Option<(String, Vec<u8>)>>,
+    /// 已下载并验签的更新包：版本、所属通道与字节。
+    bytes: Mutex<Option<(String, String, Vec<u8>)>>,
     last_check: Mutex<Option<Value>>,
     /// 下载或安装进行中。
     running: tokio::sync::Mutex<()>,
@@ -395,7 +396,7 @@ pub fn update_status(app: AppHandle, shell: State<'_, Shell>, updates: State<'_,
         json!({ "version": offer.update.version, "summary": summary(&offer.manifest), "compat": offer.compat,
                 "notes": offer.update.body, "channel": offer.channel })
     });
-    let downloaded = lock(&updates.bytes).as_ref().map(|(version, bytes)| json!({ "version": version, "bytes": bytes.len() }));
+    let downloaded = lock(&updates.bytes).as_ref().map(|(version, _, bytes)| json!({ "version": version, "bytes": bytes.len() }));
     Ok(json!({
         "identity": identity(&app),
         "current": current_version(&app),
@@ -420,14 +421,18 @@ pub fn update_settings(
     if !channels().contains(&channel.as_str()) {
         return Err(invalid(format!("这个构建只有这些通道：{}", channels().join("、"))));
     }
-    if load_settings(&app).channel != channel {
+    let changed = load_settings(&app).channel != channel;
+    let settings = Settings { channel, auto_check, auto_download, auto_install };
+    // 先写入新通道再作废缓存，并在持有下载缓存的锁时写入：完成的下载在同一把锁下核对通道，
+    // 两边怎样交错都不会把旧通道的字节留在缓存里。
+    let mut bytes = lock(&updates.bytes);
+    write_json(&settings_path(&app)?, &settings)?;
+    if changed {
         // 换了通道：上一个通道检查到的版本与下载好的包都作废。
+        *bytes = None;
         *lock(&updates.offer) = None;
-        *lock(&updates.bytes) = None;
         *lock(&updates.last_check) = None;
     }
-    let settings = Settings { channel, auto_check, auto_download, auto_install };
-    write_json(&settings_path(&app)?, &settings)?;
     Ok(json!(settings))
 }
 
@@ -556,12 +561,14 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
             journal.finish("running", None);
             save_journal(&app, &journal)?;
             let size = bytes.len();
+            let mut slot = lock(&updates.bytes);
             if load_settings(&app).channel != channel {
+                drop(slot);
                 journal.finish("failed", Some("下载期间更新通道已经改变，本次下载作废".into()));
                 save_journal(&app, &journal)?;
                 return Err(invalid("下载期间更新通道已经改变，这次下载不再使用；先重新检查更新"));
             }
-            *lock(&updates.bytes) = Some((update.version.clone(), bytes));
+            *slot = Some((update.version.clone(), channel, bytes));
             Ok(json!({ "version": update.version, "bytes": size, "op_id": journal.op_id }))
         }
         Err(e) => {
@@ -594,9 +601,11 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
         }
         same_channel(&app, offer)?;
         same_controller(offer, &features)?;
-        offer.update.clone()
+        (offer.update.clone(), offer.channel.clone())
     };
-    let bytes = lock(&updates.bytes).take().filter(|(version, _)| *version == update.version).map(|(_, bytes)| bytes);
+    let (update, channel) = update;
+    // 缓存的字节必须来自同一个通道的同一个版本。
+    let bytes = lock(&updates.bytes).take().filter(|(version, from, _)| *version == update.version && *from == channel).map(|(_, _, bytes)| bytes);
     let Some(bytes) = bytes else {
         return Err(invalid("这个版本还没有下载"));
     };
@@ -635,7 +644,7 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
         Ok((Ok(app), _)) => app.restart(),
         Ok((Err(e), bytes)) => {
             // 没有安装（等助手超时，或安装程序没能接管）：已下载并验签的更新留着，稍后可以直接再安装。
-            *lock(&updates.bytes) = Some((version, bytes));
+            *lock(&updates.bytes) = Some((version, channel, bytes));
             Err(e)
         }
         Err(e) => {

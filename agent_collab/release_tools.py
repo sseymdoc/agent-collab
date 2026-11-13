@@ -59,10 +59,10 @@ def evaluate_compat(manifest, controller_info, role='worker', nodes=None):
             if result['missing_required']:
                 reasons.append('controller 缺必需 features')
             minimum = compat.get('worker_min_controller')
-            if minimum and compare_versions(controller['version'], minimum) < 0:
+            if minimum is not None and compare_versions(controller['version'], minimum) < 0:
                 reasons.append('controller 版本低于 worker_min_controller ' + minimum)
             minimum = remote_compat.get('controller_min_worker')
-            if minimum and compare_versions(version, minimum) < 0:
+            if minimum is not None and compare_versions(version, minimum) < 0:
                 reasons.append('节点版本低于 controller_min_worker ' + minimum)
         else:
             # GET /client alone cannot prove the fleet's versions; online callers also read GET /nodes.
@@ -84,7 +84,7 @@ def evaluate_compat(manifest, controller_info, role='worker', nodes=None):
                     label = str(node.get('node_id', 'unknown'))
                     if not node_version:
                         unchecked.append('节点 ' + label + ' 未报告版本')
-                    elif minimum and compare_versions(node_version, minimum) < 0:
+                    elif minimum is not None and compare_versions(node_version, minimum) < 0:
                         reasons.append('节点 ' + label + ' 低于 controller_min_worker ' + minimum)
                     node_compat = node.get('compat', identity.get('compat'))
                     if node_compat is None:
@@ -95,7 +95,7 @@ def evaluate_compat(manifest, controller_info, role='worker', nodes=None):
                     if required - target_features:
                         reasons.append('目标 controller 缺少节点 ' + label + ' 必需 features')
                     minimum_controller = node_compat.get('worker_min_controller')
-                    if minimum_controller and compare_versions(version, minimum_controller) < 0:
+                    if minimum_controller is not None and compare_versions(version, minimum_controller) < 0:
                         reasons.append('目标 controller 低于节点 ' + label + ' 的最低版本')
                     node_protocol = node.get('protocol_version', identity.get('protocol_version'))
                     if node_protocol is None:

@@ -328,8 +328,10 @@ class DiagnosticsTests(unittest.TestCase):
 
     def test_password_arguments_are_redacted(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')
-        for line in ("ERROR argv=['tool', '--password', 'p@55!']", 'tool --password p@55! --verbose'):
+        for line in ("ERROR argv=['tool', '--password', 'p@55!']", 'tool --password p@55! --verbose',
+                     "tool --password 'p@55! two words'", "argv=['tool', '--password', 'p@55! two words']"):
             self.assertNotIn('p@55!', redactor.text(line))
+            self.assertNotIn('two words', redactor.text(line))
 
     def test_url_userinfo_is_redacted_in_text_and_json(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')

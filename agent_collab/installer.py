@@ -1847,12 +1847,15 @@ def recover_update(config, old, args):
         raise ValueError('installer PID is live or cannot be checked; refusing recovery')
     guard = ExitStack()
     guard.enter_context(recovery_lock(prefix))
+    owned = False
     try:
         if read_json(path) != value:
             raise ValueError('journal changed concurrently; rerun discovery')
         current_owner = read_json(lock / 'owner.json') if (lock / 'owner.json').is_file() else {}
         if current_owner != owner or pid_alive(current_owner.get('pid', value.get('pid'))) is not False:
             raise ValueError('install lock owner changed; rerun discovery')
+        # 到这里 journal 与锁都确认没被别的进程动过：之后的失败才由本进程记为 pending。
+        owned = True
         pointer = current_version(prefix, config['system'])
         before, target = value.get('from'), value.get('to')
         saved = value.get('old')
@@ -1891,6 +1894,7 @@ def recover_update(config, old, args):
             if pointer is not None:
                 raise ValueError('first install has no previous release to roll back to')
             restore_drain(journal, target_config)
+            restore_trust(prefix, journal)
             journal.finish('failed', 'First install interrupted before switch; rerun installation')
             return
         version = before if back else target
@@ -1941,10 +1945,11 @@ def recover_update(config, old, args):
                 write_json(prefix / 'installation.json', expected)
             journal.finish('done', 'Interrupted update completed')
     except Exception as exc:
-        journal.finish('pending', 'Recovery unresolved: ' + str(exc))
+        if owned:
+            journal.finish('pending', 'Recovery unresolved: ' + str(exc))
         raise
     finally:
-        if value['status'] in ('done', 'failed') and lock.exists():
+        if owned and value['status'] in ('done', 'failed') and lock.exists():
             (lock / 'owner.json').unlink(missing_ok=True)
             lock.rmdir()
         guard.close()

@@ -429,6 +429,8 @@ def manifest(args):
     # updater 跟随重定向）。通道文件本身（latest.json、product-manifest.json 与签名）要放在不重定向的 https 地址上，
     # 桌面端取产品发行清单时不跟随重定向。
     base = (args.download_base.rstrip('/') if args.download_base else args.base_url.rstrip('/') + '/' + args.channel) + '/'
+    if first['kind'] == 'formal' and not base.startswith('https://'):
+        raise SystemExit('正式版的更新包地址必须是 https：%s' % base)
     latest = dict(version=first['desktop_version'], notes=notes, pub_date=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
                   platforms={f['target']: dict(url=base + f['updater']['file'], signature=f['updater']['signature']) for f in found if f['updater']['signature']},
                   agent_collab=dict(manifest='product-manifest.json'))
@@ -521,6 +523,8 @@ def gate(args):
             for f in found:
                 entry = value['platforms'].get(f['target'], {})
                 check(channel + '/latest.json 的 ' + f['target'] + ' 签名与平台片段一致', entry.get('signature') == f['updater']['signature'])
+                if kind == 'formal':
+                    check(channel + '/latest.json 的 ' + f['target'] + ' 下载地址是 https', str(entry.get('url', '')).startswith('https://'))
                 for item in f['artifacts']:
                     copy = dist / channel / item['name']
                     if item['role'] in ('updater', 'installer+updater', 'updater-signature'):

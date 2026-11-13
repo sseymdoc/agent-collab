@@ -547,7 +547,15 @@ pub async fn diagnostics_save(window: tauri::WebviewWindow, app: AppHandle, id: 
     let Some(dest) = super::dialog::save(&window, format!("agent-collab-diagnostics-{}.zip", &id[..8])).await? else {
         return Ok(json!({ "cancelled": true }));
     };
-    let bytes = std::fs::copy(&file, &dest).map_err(io)?;
+    // 先复制到目标目录里的临时文件，成功后再改名覆盖：复制中途出错不会损坏用户原有的同名文件。
+    let staging = dest.with_file_name(format!(".agent-collab-diagnostics-{}.part", &id[..8]));
+    let bytes = match std::fs::copy(&file, &staging).and_then(|n| std::fs::rename(&staging, &dest).map(|_| n)) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(io(e));
+        }
+    };
     let _ = std::fs::remove_file(&file);
     Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes }))
 }

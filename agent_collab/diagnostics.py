@@ -75,7 +75,7 @@ class Redactor:
                        lambda m: self.mark('authorization'), value)
         value = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[^\s,;"\x27]+', lambda m: self.mark('authorization'), value)
         # 命令参数里的口令：--password VALUE、--password=VALUE 已由字段规则处理，这里补上空格分隔与 argv 列表的写法。
-        value = re.sub(r'(?i)(--?[\w-]*(?:password|passwd|secret|token)["\x27]?(?:\s*,\s*["\x27]|\s+))([^\s"\x27,\]]+)',
+        value = re.sub(r'(?i)(--?[\w-]*(?:password|passwd|secret|token)["\x27]?(?:\s*,\s*|\s+))("[^"]*"|\x27[^\x27]*\x27|[^\s"\x27,\]]+)',
                        lambda m: m.group(1) + self.mark('argument'), value)
         # URL 里的 userinfo（https://user:password@host）同样是凭据。
         value = re.sub(r'(?i)\b([a-z][a-z0-9+.-]*://)[^\s/"\x27]+@', lambda m: m.group(1) + self.mark('url_userinfo') + '@', value)
