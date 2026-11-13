@@ -464,6 +464,22 @@ class MaintenanceTests(ClientCase):
         self.app.store.prune_events(1)
         self.assertEqual(self.call('GET', '/maintenance/restore-preview?backup_id=' + ident)['verdict'], 'needs_reconcile')
 
+    def test_download_of_a_published_job_registered_after_backup_needs_reconcile(self):
+        node = self.node()
+        job = self.job()
+        a = node.claim()
+        final = node.checkpoint(a, kind='final')
+        node.complete(a, checkpoint=final)
+        self.call('POST', '/jobs/' + job['job_id'] + '/publish', dict(request_id=uid(), attempt_id=a['attempt_id'],
+            checkpoint_id=final['checkpoint_id'], expected_base_version=0, expected_version=self.current(job)['version'], epoch=a['epoch']))
+        ident, source = self.create_backup()
+        self.assertEqual(m.restore_preview(self.app.store, source, activity={'disposable': True})['verdict'], 'safe')
+        self.call('POST', '/jobs/%s/downloads' % job['job_id'],
+                  dict(request_id=uid(), checkpoint_id=final['checkpoint_id'], files=1, bytes=1), status=201)
+        preview = m.restore_preview(self.app.store, source, activity={'disposable': True})
+        self.assertEqual(preview['verdict'], 'needs_reconcile')
+        self.assertEqual([c['kind'] for c in preview['changes']], ['download'])
+
     def test_download_registered_after_backup_needs_reconcile(self):
         job = self.job()
         ident, source = self.create_backup()

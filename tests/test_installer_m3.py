@@ -269,6 +269,23 @@ class InstallerM3Tests(unittest.TestCase):
         self.invoke('--rollback', role='worker')
         self.assertEqual(ins.read_json(self.prefix / 'update-journal.json')['operation'], 'rollback')
 
+    def test_install_lock_is_taken_only_after_rechecking_under_the_recovery_lock(self):
+        # 早先的检查之后、取安装锁之前出现了未完成的更新：在恢复锁内复核时拒绝，不留下安装锁。
+        seen = []
+        def interrupted(config, old):
+            seen.append(ins.read_json(self.prefix / 'installation.json') if (self.prefix / 'installation.json').exists() else None)
+            return {'status': 'interrupted'} if len(seen) > 1 else None
+        with patch.object(ins, 'interrupted_update', side_effect=interrupted):
+            output = self.invoke('--release', str(self.v1), role='worker', status=1)
+        self.assertIn('appeared concurrently', output)
+        self.assertFalse((self.prefix / '.install-lock').exists())
+        # 恢复进程持有恢复锁时，普通安装取不到安装锁。
+        with ins.recovery_lock(self.prefix):
+            output = self.invoke('--release', str(self.v1), role='worker', status=1)
+        self.assertIn('another recovery owns prefix', output)
+        self.assertFalse((self.prefix / '.install-lock').exists())
+        self.invoke('--release', str(self.v1), role='worker')  # 只留下恢复锁文件时首次安装照常进行
+
     def test_offline_doctor_imports_target_interpreter_without_start_or_listener(self):
         self.invoke('--release', str(self.v1))
         config = ins.read_json(self.prefix / 'installation.json')['config']
@@ -337,6 +354,9 @@ class WritebackTests(unittest.TestCase):
         self.assertIn('integrating=1', str(error.exception))
         ins.write_json(path, {'started': True, 'reported': True})
         ins.refuse_active_worker(config)
+        ins.write_json(path, {'started': False})
+        with self.assertRaises(ValueError):
+            ins.refuse_active_worker(config)
 
     def test_first_linux_install_without_admin_token_is_degraded(self):
         config = {'state_dir': str(self.state), 'role': 'controller', 'system': 'Linux', 'service': True, 'bind': '127.0.0.1:1'}

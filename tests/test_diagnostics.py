@@ -490,6 +490,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(status, 0)
         with zipfile.ZipFile(self.output) as archive:
             data = ''.join(archive.read(name).decode('utf-8') for name in archive.namelist())
+        self.assertEqual(len(self.report()['recent_errors']), 1)
         for secret in ('synthetic-short-acro', 'another-short'):
             self.assertNotIn(secret, data)
             self.assertNotIn(secret, output)

@@ -384,6 +384,29 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+type Cached = Option<(String, String, Vec<u8>)>;
+
+impl Updates {
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 换了通道（调用方持有 bytes 锁）：代次加一，上一个通道的检查结果与下载好的包都作废。
+    fn switch_channel(&self, bytes: &mut Cached) {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *bytes = None;
+        *lock(&self.offer) = None;
+        *lock(&self.last_check) = None;
+    }
+
+    /// 检查、下载、安装发布结果前的核对：取 bytes 锁（与 switch_channel 同一把），代次仍是开始时的才交出锁，
+    /// 调用方持锁发布或安装。换过通道（包括 A→B→A 来回切换）返回 None。
+    fn current(&self, generation: u64) -> Option<std::sync::MutexGuard<'_, Cached>> {
+        let guard = lock(&self.bytes);
+        (self.generation() == generation).then_some(guard)
+    }
+}
+
 fn pubkey(app: &AppHandle) -> String {
     app.config().plugins.0.get("updater").and_then(|c| c["pubkey"].as_str()).unwrap_or("").to_string()
 }
@@ -456,11 +479,7 @@ pub fn update_settings(
     let settings = Settings { channel, auto_check, auto_download, auto_install };
     write_json(&settings_path(&app)?, &settings)?;
     if changed {
-        // 换了通道：上一个通道检查到的版本与下载好的包都作废。
-        updates.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        *bytes = None;
-        *lock(&updates.offer) = None;
-        *lock(&updates.last_check) = None;
+        updates.switch_channel(&mut bytes);
     }
     Ok(json!(settings))
 }
@@ -517,7 +536,7 @@ pub async fn update_check(app: AppHandle, updates: State<'_, Updates>, features:
         return Err(err("not_configured", "这个构建没有配置更新通道"));
     }
     // 先取通道代次再读设置：update_settings 先写设置再加代次，检查期间换过通道，发布结果时就能看出来。
-    let generation = updates.generation.load(std::sync::atomic::Ordering::SeqCst);
+    let generation = updates.generation();
     let (settings, broken) = read_settings(&app);
     if broken {
         return Err(invalid("更新设置文件读不出或已损坏，不知道该检查哪个通道：请在维护页重新保存更新设置"));
@@ -547,10 +566,9 @@ pub async fn update_check(app: AppHandle, updates: State<'_, Updates>, features:
         }
     };
     // 与 update_settings 用同一把锁核对代次，再一起发布 offer 与 last_check：旧通道的检查结果不覆盖新通道的。
-    let _bytes = lock(&updates.bytes);
-    if updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+    let Some(_held) = updates.current(generation) else {
         return Err(invalid("检查期间切换了更新通道，这次结果已作废，请重新检查"));
-    }
+    };
     *lock(&updates.offer) = offer;
     *lock(&updates.last_check) = Some(result.clone());
     Ok(result)
@@ -567,7 +585,7 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
         }
         same_channel(&app, offer)?;
         same_controller(offer, &features)?;
-        (offer.update.clone(), offer.channel.clone(), offer.manifest.clone(), updates.generation.load(std::sync::atomic::Ordering::SeqCst))
+        (offer.update.clone(), offer.channel.clone(), offer.manifest.clone(), updates.generation())
     };
     let (update, channel, offer_manifest, generation) = update;
     let mut journal = Journal::new(&current_version(&app), &update.version, &load_settings(&app).channel);
@@ -601,13 +619,11 @@ pub async fn update_download(app: AppHandle, updates: State<'_, Updates>, featur
             journal.finish("running", None);
             save_journal(&app, &journal)?;
             let size = bytes.len();
-            let mut slot = lock(&updates.bytes);
-            if settings_channel(&app).ok().as_ref() != Some(&channel) || updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                drop(slot);
+            let Some(mut slot) = updates.current(generation).filter(|_| settings_channel(&app).ok().as_ref() == Some(&channel)) else {
                 journal.finish("failed", Some("下载期间更新通道已经改变，本次下载作废".into()));
                 save_journal(&app, &journal)?;
                 return Err(invalid("下载期间更新通道已经改变，这次下载不再使用；先重新检查更新"));
-            }
+            };
             *slot = Some((update.version.clone(), channel, bytes));
             Ok(json!({ "version": update.version, "bytes": size, "op_id": journal.op_id }))
         }
@@ -641,14 +657,18 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
         }
         same_channel(&app, offer)?;
         same_controller(offer, &features)?;
-        (offer.update.clone(), offer.channel.clone(), updates.generation.load(std::sync::atomic::Ordering::SeqCst))
+        (offer.update.clone(), offer.channel.clone(), offer.manifest.clone(), updates.generation())
     };
-    let (update, channel, generation) = update;
+    let (update, channel, manifest, generation) = update;
     // 缓存的字节必须来自同一个通道的同一个版本。
     let bytes = lock(&updates.bytes).take().filter(|(version, from, _)| *version == update.version && *from == channel).map(|(_, _, bytes)| bytes);
     let Some(bytes) = bytes else {
         return Err(invalid("这个版本还没有下载"));
     };
+    // 同一通道后来又检查过一次（同版本的发行清单可能已变）：按现在这次检查的清单核对缓存的字节，不符就作废。
+    if let Err(e) = matches_manifest(&manifest, &bytes) {
+        return Err(invalid(format!("已下载的包与当前的发行清单不一致，先重新下载：{e}")));
+    }
     // 安装程序要替换随包运行时，正在运行的本机助手占着它的文件（Windows 上写不进去）：关闸，等它们结束（最多 60 秒，
     // 等不到就这次不安装、不结束它们）；安装程序没能接管时重新开闸（helper::Gate::exclusive）。
     let version = update.version.clone();
@@ -662,10 +682,9 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
             }
             // 与 update_settings 同一把锁：核对通道代次后一直持有到安装程序接管，等待期间换过通道就不装旧通道的包。
             let updates = app.state::<Updates>();
-            let held = lock(&updates.bytes);
-            if updates.generation.load(std::sync::atomic::Ordering::SeqCst) != generation || settings_channel(&app).ok() != Some(expected) {
+            let Some(held) = updates.current(generation).filter(|_| settings_channel(&app).ok() == Some(expected)) else {
                 return Err(invalid("等待期间切换了更新通道或设置已损坏，这次不安装，请重新检查"));
-            }
+            };
             let mut journal = journals(&journal_dir(&app)?)
                 .into_iter()
                 .find(|journal| journal.status == "running" && journal.to == update.version)
@@ -693,8 +712,7 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
         Ok((Err(e), bytes)) => {
             // 没有安装（等助手超时，或安装程序没能接管）：已下载并验签的更新留着，稍后可以直接再安装。
             // 等待期间换过通道（包括来回切换）就不放回：缓存只属于当时的那个通道代次。
-            let mut slot = lock(&updates.bytes);
-            if updates.generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
+            if let Some(mut slot) = updates.current(generation) {
                 *slot = Some((version, channel, bytes));
             }
             Err(e)
@@ -771,6 +789,25 @@ pub fn pep440_key(version: &str) -> Option<(Vec<u64>, u8, u64, u8, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn results_from_before_a_channel_switch_are_never_published() {
+        let updates = Updates::default();
+        let started = updates.generation();
+        assert!(updates.current(started).is_some());
+        *lock(&updates.last_check) = Some(json!({ "available": true }));
+        // A→B：缓存、检查结果都清掉；B→A：回到原通道也不算“没换过”。
+        for _ in 0..2 {
+            let mut bytes = lock(&updates.bytes);
+            *bytes = Some(("1.0.0".into(), "stable".into(), vec![1]));
+            updates.switch_channel(&mut bytes);
+            assert!(bytes.is_none());
+        }
+        assert!(lock(&updates.last_check).is_none());
+        // 检查（结果有无更新都一样）、下载完成、安装前、安装失败后放回缓存都经 current 核对：旧代次一律拿不到锁。
+        assert!(updates.current(started).is_none());
+        assert!(updates.current(updates.generation()).is_some());
+    }
 
     #[test]
     fn broken_settings_never_stand_in_for_the_channel() {

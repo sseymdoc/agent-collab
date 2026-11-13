@@ -976,7 +976,8 @@ def refuse_active_worker(config, allow_active=False):
     for path in (Path(config['state_dir']) / 'worker/integrations').glob('*/*/progress.json'):
         try:
             progress = read_json(path)
-            busy = progress['started'] and not progress['reported']
+            started, reported = progress['started'], progress['reported']  # 两项都必须有，缺了按不可读处理
+            busy = started and not reported
         except (OSError, ValueError, KeyError, TypeError):
             raise ValueError('Worker integration record unreadable; cannot prove idle') from None
         if busy:
@@ -1840,6 +1841,27 @@ def transaction(config, old, manifest, files, args):
         raise
 
 
+def take_install_lock(prefix, config, old, busy):
+    """在恢复锁（OS 互斥锁）内复核没有未完成的更新，再建安装锁并写 owner.json。
+
+    恢复进程持有同一把恢复锁直到结束，所以普通安装不会在恢复复核之后、接管之前建出新锁，
+    恢复也不会把正在进行的普通安装的锁当成旧锁接管。"""
+    lock = prefix / '.install-lock'
+    with recovery_lock(prefix):
+        if interrupted_update(config, old):
+            raise ValueError('unfinished update or install lock appeared concurrently; use --discover, then --recover')
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            raise ValueError(busy) from None
+        try:
+            write_json(lock / 'owner.json', dict(pid=os.getpid()))
+        except BaseException:
+            shutil.rmtree(str(lock), ignore_errors=True)
+            raise
+    return lock
+
+
 def recover_update(config, old, args):
     prefix = Path(config['prefix'])
     path, lock = prefix / 'update-journal.json', prefix / '.install-lock'
@@ -2257,10 +2279,8 @@ def service_command(argv):
             success = all(value == 'active' for value in report['services'].values())
         else:
             reason = 'another installer or service command owns this prefix'
-            lock = prefix / '.install-lock'
-            lock.mkdir()
+            lock = take_install_lock(prefix, full_config, old, reason)
             try:
-                write_json(lock / 'owner.json', dict(pid=os.getpid()))
                 if read_json(prefix / 'installation.json') != old:
                     reason = 'installation changed concurrently; rerun service command'
                     raise ValueError(reason)
@@ -2404,7 +2424,8 @@ def main(argv=None):
                 raise ValueError('downgrade refused; use --rollback or --allow-downgrade (schema checks still apply)')
             if args.version and args.version != manifest['version']:
                 raise ValueError('--version does not match the release manifest')
-            if not old and prefix.exists() and any(prefix.iterdir()):
+            # 恢复锁文件由取安装锁时创建；首次安装中途被拒后只留下它，不算非空。
+            if not old and prefix.exists() and any(p.name != '.recover-lock' for p in prefix.iterdir()):
                 raise ValueError('prefix is not empty and is not a managed installation')
         elif args.release:
             raise ValueError('--release cannot be combined with this operation')
@@ -2478,14 +2499,9 @@ def main(argv=None):
         if manifest and 'controller' in components(config) and old and old.get('version'):
             compatible_schema(old['config'] if runtime_payload else config, manifest, prefix / 'versions' / old['version'])
         create_root(prefix, config)
-        lock = prefix / '.install-lock'
-        try:
-            lock.mkdir()
-        except FileExistsError:
-            raise ValueError('another install owns prefix; after a crash use --discover and --recover') from None
+        lock = take_install_lock(prefix, config, old, 'another install owns prefix; after a crash use --discover and --recover')
         completed = False
         try:
-            write_json(lock / 'owner.json', dict(pid=os.getpid()))
             # Guard a second installer finishing between our initial read and lock acquisition.
             latest = read_json(prefix / 'installation.json') if (prefix / 'installation.json').is_file() else None
             if latest != old:

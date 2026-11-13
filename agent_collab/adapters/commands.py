@@ -25,7 +25,9 @@ def which(name, system=None, runner=None):
             usable = False
         if not usable:
             # 跳过占位程序所在的 /usr/bin，接着找 PATH 里后面的目录（例如 Homebrew 装的真实工具）。
+            # 后台服务（LaunchAgent）的 PATH 不含 Homebrew 目录：与 resolve_commands 一样补上。
             rest = [d for d in os.environ.get('PATH', os.defpath).split(os.pathsep) if d and d.rstrip('/') != '/usr/bin']
+            rest += [d for d in ('/opt/homebrew/bin', '/usr/local/bin') if d not in rest]
             return shutil.which(name, path=os.pathsep.join(rest)) if rest else None
     return path
 

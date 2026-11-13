@@ -655,6 +655,9 @@ class XcodeShimTests(unittest.TestCase):
         with patch.object(commands.shutil, 'which', side_effect=found), \
                 patch.dict(commands.os.environ, {'PATH': os.pathsep.join(['/usr/bin', '/opt/homebrew/bin'])}):
             self.assertEqual(commands.which('git', system='Darwin', runner=missing), '/opt/homebrew/bin/git')
+        # 后台服务的 PATH 只有系统目录时也补上 Homebrew 目录。
+        with patch.object(commands.shutil, 'which', side_effect=found), patch.dict(commands.os.environ, {'PATH': '/usr/bin'}):
+            self.assertEqual(commands.which('git', system='Darwin', runner=missing), '/opt/homebrew/bin/git')
 
     def test_detect_and_git_scan_do_not_run_shims_on_a_clean_mac(self):
         import subprocess
