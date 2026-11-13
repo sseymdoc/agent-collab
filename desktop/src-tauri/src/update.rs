@@ -74,6 +74,10 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// 设置文件存在却读不出或损坏：不按缺省值自动检查、下载或安装（用户可能关掉过），等用户在维护页重新保存。
+    fn cautious() -> Self {
+        Self { auto_check: false, auto_download: false, auto_install: false, ..Self::defaults() }
+    }
     fn defaults() -> Self {
         Self { channel: channels().first().copied().unwrap_or("").to_string(), auto_check: true, auto_download: false, auto_install: false }
     }
@@ -92,11 +96,14 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf> {
 }
 
 fn load_settings(app: &AppHandle) -> Settings {
-    settings_path(app)
-        .ok()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
-        .map_or_else(Settings::defaults, Settings::sanitized)
+    let Ok(path) = settings_path(app) else {
+        return Settings::cautious();
+    };
+    match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::defaults(),
+        Ok(bytes) => serde_json::from_slice::<Settings>(&bytes).map_or_else(|_| Settings::cautious(), Settings::sanitized),
+        Err(_) => Settings::cautious(),
+    }
 }
 
 // ---------------------------------------------------------------- 持久记录

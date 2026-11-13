@@ -561,7 +561,11 @@ pub async fn diagnostics_save(window: tauri::WebviewWindow, app: AppHandle, id: 
     let staging = dest.with_file_name(format!(".agent-collab-diagnostics-{}.part", uuid::Uuid::new_v4()));
     let copy = || -> std::io::Result<u64> {
         let mut source = std::fs::File::open(&file)?;
-        let mut target = std::fs::OpenOptions::new().write(true).create_new(true).open(&staging)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600); // 诊断包只给当前用户读
+        let mut target = options.open(&staging)?;
         let n = std::io::copy(&mut source, &mut target)?;
         target.sync_all()?;
         drop(target);

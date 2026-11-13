@@ -76,14 +76,14 @@ def listing(directory):
     """本机看的绑定（含路径）。"""
     saved = _bindings(directory)
     return {'bindings': [dict(b, path=saved[b['project_id']]['path'], bound_at=saved[b['project_id']].get('bound_at'))
-                         for b in public(directory)],
+                         for b in public(directory, saved)],
             'file': str(Path(directory) / BINDINGS)}
 
 
-def public(directory):
+def public(directory, data=None):
     """报给 controller 的绑定：项目 ID 与目录名。手工改坏的条目跳过，不影响心跳。"""
     found = []
-    for project_id, entry in _bindings(directory).items():
+    for project_id, entry in (_bindings(directory) if data is None else data).items():
         try:
             p.check_uuid(project_id, 'project_id')
         except ValueError:

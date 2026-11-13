@@ -333,6 +333,12 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertNotIn('p@55!', redactor.text(line))
             self.assertNotIn('two words', redactor.text(line))
 
+    def test_unreadable_task_log_folder_leaves_the_rest_of_the_export(self):
+        with mock.patch.object(d, 'task_logs', side_effect=PermissionError('denied')):
+            status, _, error = self.run_cli('--include-task-logs')
+        self.assertEqual(status, 0, error)
+        self.assertIn('runtime', self.report()['sections'])
+
     def test_password_in_json_argv_arrays_is_redacted(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')
         line = json.dumps({'level': 'ERROR', 'argv': ['tool', '--password', 'p@55!', '--verbose']})

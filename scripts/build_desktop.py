@@ -178,6 +178,13 @@ def desktop_ignore(directory, names):
     return skip
 
 
+def split_tauri(text):
+    """把 --tauri 命令拆成参数列表。Windows 上保留路径里的反斜杠，并去掉包住单个参数的外层双引号。"""
+    if os.name != 'nt':
+        return shlex.split(text)
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] == '"' else t for t in shlex.split(text, posix=False)]
+
+
 def tar_app(app, destination):
     """macOS 更新归档：tar.gz 里是 <名称>.app 目录本身，保留链接与权限（Tauri updater 的格式）。"""
     with tarfile.open(str(destination), 'w:gz', format=tarfile.PAX_FORMAT) as archive:
@@ -190,7 +197,7 @@ def build(args):
     kind, version = args.kind, args.version
     identity = KINDS[kind]
     src, out = Path(args.src).resolve(), Path(args.out).resolve()
-    tauri = shlex.split(args.tauri, posix=os.name != 'nt') if isinstance(args.tauri, str) else args.tauri
+    tauri = split_tauri(args.tauri) if isinstance(args.tauri, str) else args.tauri
     commit = git(src, 'rev-parse', 'HEAD')
     # 已跟踪文件的改动按整个仓库算（ui/ 的源码会构建进页面产物）；未跟踪的文件只看会被复制进包的路径，被忽略的生成物不算。
     dirty = bool(git(src, 'status', '--porcelain', '--untracked-files=no')) or \
@@ -349,7 +356,7 @@ def sign(args):
     """在唯一的签名机上补更新签名。别的构建机不持有 updater 私钥：它完成平台签名后不带 --updater-key 构建，
     把冻结的 dist 送到签名机。这里只给还没有更新签名的平台片段签名；更新包的字节必须与片段记录的摘要相同
     （冻结之后不能再改），签名私钥必须对应这个构建编进程序的公钥。"""
-    dist, tauri = Path(args.dist), shlex.split(args.tauri, posix=os.name != 'nt')
+    dist, tauri = Path(args.dist), split_tauri(args.tauri)
     pubkey = hashlib.sha256(Path(args.updater_key + '.pub').read_text(encoding='utf-8').strip().encode()).hexdigest()
     for path in sorted(dist.glob('platform-*.json')):
         f = json.loads(path.read_text(encoding='utf-8'))
@@ -433,7 +440,7 @@ def manifest(args):
     channel_dir.mkdir(exist_ok=True)
     data = json.dumps(product, ensure_ascii=False, indent=1, sort_keys=True).encode('utf-8')
     (channel_dir / 'product-manifest.json').write_bytes(data)
-    tauri = shlex.split(args.tauri, posix=os.name != 'nt')
+    tauri = split_tauri(args.tauri)
     # 桌面端用编进程序的公钥核对产品清单：签清单的私钥必须对应每个平台片段记录的公钥。
     pubkey = Path(args.updater_key + '.pub').read_text(encoding='utf-8').strip()
     if any(f['updater']['pubkey_sha256'] != hashlib.sha256(pubkey.encode()).hexdigest() for f in found):

@@ -194,7 +194,8 @@ export function NodeBindings() {
       {projects.length > 0 && <select value={projects.some(p => p.project_id === pick) ? pick : ''} onChange={e => setPick(e.target.value)}>
         <option value="">选择项目…</option>{projects.map(p => <option key={p.project_id} value={p.project_id}>{p.name}</option>)}</select>}
       <input placeholder="或填写项目 ID" value={pick} onChange={e => setPick(e.target.value.trim().toLowerCase())} size={38} />
-      <button disabled={busy || !valid} onClick={() => void act(() => invoke('node_bind', { project_id: pick }))}>选择文件夹并授权</button>
+      {/* 首次读取完成之前不授权：否则迟到的旧列表会覆盖授权后的列表。 */}
+      <button disabled={busy || !valid || b === null} onClick={() => void act(() => invoke('node_bind', { project_id: pick }))}>选择文件夹并授权</button>
     </div>
     {err && <p className="err">{err}</p>}
   </div>

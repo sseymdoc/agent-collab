@@ -340,7 +340,11 @@ def collect(args):
     if args.include_task_logs:
         notes.append(TASK_WARNING)
         for folder in attempts:
-            candidates += task_logs(folder)
+            # 某个 attempt 目录不可读（或 checks 是链接）只影响它自己的日志。
+            try:
+                candidates += task_logs(folder)
+            except (OSError, ValueError):
+                notes.append('有 attempt 的任务日志不可读，已略过')
     logs, records, errors = {}, [], []
     error_count = 0
     remaining = args.max_bytes
