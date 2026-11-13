@@ -36,15 +36,18 @@ def check_protocol(protocol):
     own = names(features, 'FEATURES')
     if not isinstance(compat, dict):
         raise ValueError('COMPAT must be a dict')
+    # 兼容判断读的声明都必须在，缺了会让判断静默放行。
+    missing = {'worker_requires', 'worker_optional', 'controller_min_worker', 'client_requires', 'client_optional'} - set(compat)
+    if missing:
+        raise ValueError('COMPAT must declare: ' + ', '.join(sorted(missing)))
     for key, value in compat.items():
         if key.endswith(('_requires', '_optional')):
-            names(value, 'COMPAT.' + key)
+            if names(value, 'COMPAT.' + key) - own:
+                raise ValueError('COMPAT.' + key + ' must name features of this release')
         elif key.endswith(('_min_worker', '_min_controller')):
             parse_version(value)
         else:
             raise ValueError('unknown COMPAT key: ' + key)
-    if not names(compat.get('client_optional', ()), 'COMPAT.client_optional') | names(compat.get('client_requires', ()), 'COMPAT.client_requires') <= own:
-        raise ValueError('COMPAT client features must be features of this release')
 
 
 def build_release(source, output, version):

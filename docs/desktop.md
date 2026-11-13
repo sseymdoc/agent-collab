@@ -39,8 +39,8 @@
 | `io` | 本机文件读写失败 |
 | `not_bound` | 这个项目在这台机器上还没有选定目录 |
 | `busy` | 已有一项项目操作在进行（同一时间只运行一项）；或桌面端更新的下载、安装正在进行，或现在不满足安装更新的空闲条件 |
-| `incompatible` | 检查到的新版本与当前 controller 不兼容（缺少必需的 features），不下载也不安装 |
-| `not_configured` | 这个构建没有配置更新通道（没有 updater 公钥或更新地址） |
+| `incompatible` | 检查到的新版本与当前 controller 不兼容（缺少必需的 features，或 controller API 版本不同），不下载也不安装 |
+| `not_configured` | 这个构建没有配置更新通道（没有 updater 公钥、更新地址或通道，或是开发构建） |
 | `cancelled` | 操作被用户取消 |
 | `helper_unavailable` | 本机助手不可用（安装包不完整） |
 | 其他 | 本机助手返回的错误码原样透出：`not_a_directory`、`unstable`、`path_conflict`、`unicode_conflict`、`source_changed`、`unfinished_application`、`insufficient_space`、`blob_mismatch`、`target_not_empty`、`no_application`、`no_snapshot` |

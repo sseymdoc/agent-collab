@@ -243,7 +243,7 @@ class InstallerM3Tests(unittest.TestCase):
         self.assertIsNone(ins.current_version(self.prefix))
 
     def test_oversized_archive_is_refused_before_it_is_read(self):
-        with patch.object(ins, 'MAX_RELEASE_BYTES', self.v1.stat().st_size - 1),                 patch.object(Path, 'read_bytes', side_effect=AssertionError('archive read')):
+        with patch.object(ins, 'MAX_ARCHIVE_BYTES', self.v1.stat().st_size - 1),                 patch.object(Path, 'read_bytes', side_effect=AssertionError('archive read')):
             self.assertIn('size/file limit', self.invoke('--release', str(self.v1), role='worker', status=1))
 
     def test_legacy_install_without_journal_upgrades_and_records_six_steps(self):

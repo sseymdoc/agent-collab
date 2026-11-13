@@ -552,6 +552,11 @@ pub async fn update_install(app: AppHandle, shell: State<'_, Shell>, updates: St
     let version = update.version.clone();
     let installing = tauri::async_runtime::spawn_blocking(move || {
         let result = helper::GATE.exclusive(Duration::from_secs(60), || {
+            // 等助手的这段时间里可能开始了新的操作（例如备份导出）：关闸之后再核对一次空闲条件。
+            let blocked = blockers(&app.state::<Shell>());
+            if !blocked.is_empty() {
+                return Err(err("busy", format!("现在不能安装：{}", blocked.join("；"))));
+            }
             let mut journal = journals(&journal_dir(&app)?)
                 .into_iter()
                 .find(|journal| journal.status == "running" && journal.to == update.version)

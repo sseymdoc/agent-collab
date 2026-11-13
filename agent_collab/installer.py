@@ -28,6 +28,8 @@ import zipfile
 MANIFEST = 'release-manifest.json'
 ROLES = ('controller', 'worker', 'all-in-one')
 MAX_RELEASE_BYTES = 512 * 1024 * 1024
+# 发行包文件本身的上限：解包后总量的上限加上容器开销（接近上限且不可压缩的载荷也能通过）。
+MAX_ARCHIVE_BYTES = MAX_RELEASE_BYTES + 64 * 1024 * 1024
 
 
 def validate_version(value):
@@ -277,10 +279,18 @@ def package_command(config, directory, module, *args, controller_user=False, che
     return run(command, cwd=directory, check=check)
 
 
+_STREAM_TOKENS = {}
+
+
 def admin_token(config):
     supplied = config.get('admin_token_file')
     if supplied:
-        return Path(supplied).read_text(encoding='utf-8').strip()
+        if Path(supplied).is_file():
+            return Path(supplied).read_text(encoding='utf-8').strip()
+        # /dev/stdin、管道这类只能读一次：兼容检查与排空在同一次调用里都要用，读一次后复用（只在内存里）。
+        if supplied not in _STREAM_TOKENS:
+            _STREAM_TOKENS[supplied] = Path(supplied).read_text(encoding='utf-8').strip()
+        return _STREAM_TOKENS[supplied]
     path = Path(config['state_dir']) / 'controller' / 'admin.token'
     if config['system'] == 'Linux' and config['service'] and config['role'] != 'worker':
         return run(controller_identity() + ['cat', str(path)]).stdout.strip()
@@ -1466,8 +1476,11 @@ def save_source(prefix, version, source):
         atomic_write(prefix / 'trust/allowed_signers', source['trust'])
 
 
-def remember_trust(journal, source):
+def remember_trust(prefix, journal, source):
     """信任变化要随更新一起提交：先在日志里记下原来的信任，失败回退时由 restore_trust 恢复。"""
+    pinned = prefix / 'trust/allowed_signers'
+    if (pinned.read_bytes() if pinned.is_file() else None) != source['previous_trust']:
+        raise ValueError('pinned trust changed concurrently; rerun verification')
     if source['trust'] is not None and source['trust'] != source['previous_trust']:
         previous = source['previous_trust']
         journal.value.update(trust_changed=True, trust_before=None if previous is None else previous.decode('latin-1'))
@@ -1743,7 +1756,7 @@ def transaction(config, old, manifest, files, args):
                 install_version(prefix, manifest, files)
             elif read_installed(directory) != manifest:
                 raise ValueError('installed release changed during verification')
-            remember_trust(journal, release_source)
+            remember_trust(prefix, journal, release_source)
             save_source(prefix, version, release_source)
         with journal.step('prepare'):
             if getattr(args, '_runtime_payload', None):
@@ -2356,7 +2369,7 @@ def main(argv=None):
             if not args.release:
                 raise ValueError('--release must name a local tar.gz or zip; no downloads are performed')
             # 压缩包不会比解包后的总量上限还大；先看文件大小，免得把超大的文件整个读进内存。
-            if Path(args.release).stat().st_size > MAX_RELEASE_BYTES:
+            if Path(args.release).stat().st_size > MAX_ARCHIVE_BYTES:
                 raise ValueError('release exceeds size/file limit')
             archive = Path(args.release).read_bytes()
             args._source = verify_source(prefix, args, archive=archive)

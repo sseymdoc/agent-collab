@@ -71,7 +71,7 @@ class Redactor:
             for spelling in sorted({path, path.replace('\\', '/'), path.replace('\\', '\\\\')}, key=len, reverse=True):
                 value = re.sub(re.escape(spelling), lambda m: self.mark('project_path', ntpath.basename(path.rstrip('/\\'))),
                                value, flags=re.I)
-        value = re.sub(r'(?im)\b(?:authorization|proxy-authorization|x-coordinator-token)["\x27]?\s*[:=]\s*[^\r\n]+',
+        value = re.sub(r'(?im)\b(?:authorization|proxy-authorization|x-coordinator-token|set-cookie|cookie)["\x27]?\s*[:=]\s*[^\r\n]+',
                        lambda m: self.mark('authorization'), value)
         value = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[^\s,;"\x27]+', lambda m: self.mark('authorization'), value)
         value = re.sub(r'\b(?:(?i:(?:[\w-]*[_-])?(?:token|secret|password|code|key))|'
@@ -101,7 +101,7 @@ class Redactor:
             for key, item in value.items():
                 name = str(key)
                 normalized = normalized_key(name)
-                if SECRET_KEY.search(normalized) or normalized in ('authorization', 'proxy-authorization', 'x-coordinator-token'):
+                if SECRET_KEY.search(normalized) or normalized in ('authorization', 'proxy-authorization', 'x-coordinator-token', 'cookie', 'set-cookie'):
                     item = self.mark('field')
                 elif normalized in CONTENT_KEYS:
                     item = self.mark('excluded_content')

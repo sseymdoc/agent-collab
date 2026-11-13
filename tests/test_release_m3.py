@@ -70,7 +70,12 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(result['decision'], 'degraded')
         self.assertTrue(any('未报告兼容声明' in item for item in result['unchecked']))
         nodes[0]['compat'] = {}
+        self.assertEqual(rt.evaluate_compat(self.release, self.controller, 'controller', nodes)['decision'], 'degraded')
+        nodes[0]['protocol_version'] = self.release['protocol_version']
         self.assertEqual(rt.evaluate_compat(self.release, self.controller, 'controller', nodes)['decision'], 'accept')
+        nodes[0]['protocol_version'] = True
+        self.assertEqual(rt.evaluate_compat(self.release, self.controller, 'controller', nodes)['decision'], 'reject')
+        nodes[0]['protocol_version'] = self.release['protocol_version']
         nodes[0]['compat'] = {'worker_requires': ['missing']}
         self.assertEqual(rt.evaluate_compat(self.release, self.controller, 'controller', nodes)['decision'], 'reject')
 
@@ -95,7 +100,9 @@ class ProtocolCheckTests(unittest.TestCase):
         for bad in ({'PROTOCOL_VERSION': True}, {'PROTOCOL_VERSION': 0}, {'FEATURES': ('clients', 'clients')},
                     {'COMPAT': dict(protocol.COMPAT, controller_min_worker='nope')},
                     {'COMPAT': dict(protocol.COMPAT, worker_requires='clients')},
-                    {'COMPAT': dict(protocol.COMPAT, client_requires=('not-a-feature',))}):
+                    {'COMPAT': dict(protocol.COMPAT, client_requires=('not-a-feature',))},
+                    {'COMPAT': dict(protocol.COMPAT, worker_optional=('not-a-feature',))},
+                    {'COMPAT': {k: v for k, v in protocol.COMPAT.items() if k != 'worker_requires'}}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 legacy.builder.check_protocol(dict(good, **bad))
 
@@ -159,6 +166,12 @@ class ReleaseArchiveTests(unittest.TestCase):
                                       '--controller', 'https://example.invalid', '--profile', 'test']), 0)
         self.assertEqual(conn.call_args[0][0].url, 'https://example.invalid')
         self.assertEqual([c[0] for c in conn.return_value.send.call_args_list], [('GET', '/client'), ('GET', '/nodes')])
+
+    def test_compat_online_connection_setup_failure_prints_a_reject_decision(self):
+        with patch('agent_collab.cli.Conn', side_effect=SystemExit(3)), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(rt.main(['compat', '--release', str(self.v1), '--controller', 'https://example.invalid',
+                                      '--profile', 'test']), 2)
+        self.assertEqual(json.loads(output.getvalue())['decision'], 'reject')
 
     def test_compat_online_refusal_prints_a_reject_decision(self):
         for status in (401, 403, 404):

@@ -302,6 +302,13 @@ class DiagnosticsTests(unittest.TestCase):
                     self.write(path, original)
                     self.output.unlink(missing_ok=True)
 
+    def test_cookies_are_redacted_in_json_and_text(self):
+        redactor = d.Redactor(home='/home/u', username='u', hostname='h')
+        clean = redactor.value({'headers': {'Cookie': 'sid=short', 'Set-Cookie': 'sid=other'}})
+        self.assertNotIn('short', json.dumps(clean))
+        self.assertNotIn('other', json.dumps(clean))
+        self.assertNotIn('short', redactor.text('Cookie: sid=short'))
+
     def test_bare_basic_and_bearer_credentials_are_redacted(self):
         redactor = d.Redactor(home='/home/u', username='u', hostname='h')
         clean = redactor.text('ERROR Basic dXNlcjpwYXNz then Bearer abc')

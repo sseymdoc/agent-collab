@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { can, session } from '../session'
 import { bridge, currentEpoch, invoke, isDesktop } from '../transport'
@@ -55,7 +55,7 @@ function DesktopUpdate() {
   const settings = st.settings
   const save = (patch: any) => run('保存中…', async () => { await invoke('update_settings', { ...settings, ...patch }) })
   const features: string[] = session()?.controller?.features ?? []
-  const offer = check?.available ? check : null
+  const offer = check?.available ? check : st.offer ? { available: true, ...st.offer } : null
   const verdict = offer?.compat?.verdict
   return <Section title="桌面端更新" extra={<span className="muted">只更新这台机器上的桌面端与随包组件，不升级远端 controller 或节点</span>}>
     <dl className="kv">
@@ -65,9 +65,9 @@ function DesktopUpdate() {
           <option key={c} value={c}>{c === 'stable' ? 'stable（稳定版，缺省）' : c === 'preview' ? 'preview（预览版）' : c}</option>)}</select>
         : '这个构建没有配置更新通道'}</dd>
       {id.configured && <><dt>策略</dt><dd>
-        <label className="inline"><input type="checkbox" checked={settings.auto_check} onChange={e => void save({ auto_check: e.target.checked })} /> 自动检查（启动时与每天一次）</label>
-        <label className="inline"><input type="checkbox" checked={settings.auto_download} onChange={e => void save({ auto_download: e.target.checked })} /> 自动下载</label>
-        <label className="inline"><input type="checkbox" checked={settings.auto_install} onChange={e => void save({ auto_install: e.target.checked })} /> 下载后在空闲时自动安装</label>
+        <label className="inline"><input type="checkbox" checked={settings.auto_check} disabled={!!busy} onChange={e => void save({ auto_check: e.target.checked })} /> 自动检查（启动时与每天一次）</label>
+        <label className="inline"><input type="checkbox" checked={settings.auto_download} disabled={!!busy} onChange={e => void save({ auto_download: e.target.checked })} /> 自动下载</label>
+        <label className="inline"><input type="checkbox" checked={settings.auto_install} disabled={!!busy} onChange={e => void save({ auto_install: e.target.checked })} /> 下载后在空闲时自动安装</label>
         <br /><small className="muted">自动安装也要满足空闲条件：没有进行中的扫描、上传、下载、写回与本机部署操作。</small></dd></>}
     </dl>
     {st.blockers?.length > 0 && <p className="warn-text">现在不能安装：{st.blockers.join('；')}</p>}
@@ -155,6 +155,7 @@ function Backups({ tick }: { tick: number }) {
   const policy = useData(() => api.backupPolicy(), [tick])
   const [label, setLabel] = useState('')
   const [preview, setPreview] = useState<{ id: string; v?: any; err?: string } | null>(null)
+  const previewTicket = useRef(0)
   const [saved, setSaved] = useState<string | null>(null)
   const [keep, setKeep] = useState<number | null>(null)
   const items: any[] = list.data?.backups ?? []
@@ -185,7 +186,12 @@ function Backups({ tick }: { tick: number }) {
         <td>{b.last_verification ? <><Badge v={b.last_verification.ok ? 'passed' : 'failed'} /> <small className="muted">{when(b.last_verification.at)}</small></> : <small className="muted">未核对</small>}</td>
         <td className="actions">
           <Action label="核对" scope="maintain" run={async () => { await api.verifyBackup(b.id); await list.reload() }} />
-          <button onClick={() => { setPreview({ id: b.id }); api.restorePreview(b.id).then(v => setPreview({ id: b.id, v }), e => setPreview({ id: b.id, err: errText(e) })) }}>恢复预览</button>
+          <button onClick={() => {
+            const ticket = ++previewTicket.current
+            setPreview({ id: b.id })
+            const settle = (next: { id: string; v?: any; err?: string }) => { if (ticket === previewTicket.current) setPreview(next) }
+            api.restorePreview(b.id).then(v => settle({ id: b.id, v }), e => settle({ id: b.id, err: errText(e) }))
+          }}>恢复预览</button>
           {isDesktop && <Action label="导出到这台机器" scope="maintain" run={async () => {
             const r = await bridge('backup_save', { backup_id: b.id })
             if (!r.cancelled) setSaved(`已导出到 ${r.path}（${bytes(r.bytes)}，SHA-256 ${String(r.sha256).slice(0, 12)}…）：这份是实例外的备份，请存放在只有你能访问的位置`)

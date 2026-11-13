@@ -176,8 +176,9 @@ def build(args):
     src, out = Path(args.src).resolve(), Path(args.out).resolve()
     tauri = shlex.split(args.tauri, posix=os.name != 'nt') if isinstance(args.tauri, str) else args.tauri
     commit = git(src, 'rev-parse', 'HEAD')
-    # 复制进包的是 desktop/、agent_collab/ 与许可材料：这些路径下未跟踪的文件也算改动（被忽略的生成物不算）。
-    dirty = bool(git(src, 'status', '--porcelain', '--untracked-files=all', '--', 'desktop', 'agent_collab', *LICENSE_FILES.values()))
+    # 已跟踪文件的改动按整个仓库算（ui/ 的源码会构建进页面产物）；未跟踪的文件只看会被复制进包的路径，被忽略的生成物不算。
+    dirty = bool(git(src, 'status', '--porcelain', '--untracked-files=no')) or \
+        bool(git(src, 'ls-files', '--others', '--exclude-standard', '--', 'desktop', 'agent_collab', *LICENSE_FILES.values()))
     if dirty and not args.allow_dirty:
         raise SystemExit('源检出有未提交的改动；发行构建只从干净提交进行')
     if (kind == 'formal') == ('-' in version):
@@ -393,7 +394,12 @@ def manifest(args):
     data = json.dumps(product, ensure_ascii=False, indent=1, sort_keys=True).encode('utf-8')
     (channel_dir / 'product-manifest.json').write_bytes(data)
     tauri = shlex.split(args.tauri, posix=os.name != 'nt')
-    tauri_signature(tauri, args.updater_key, first['desktop_version'], channel_dir / 'product-manifest.json')
+    # 桌面端用编进程序的公钥核对产品清单：签清单的私钥必须对应每个平台片段记录的公钥。
+    pubkey = Path(args.updater_key + '.pub').read_text(encoding='utf-8').strip()
+    if any(f['updater']['pubkey_sha256'] != hashlib.sha256(pubkey.encode()).hexdigest() for f in found):
+        raise SystemExit('签产品清单的私钥与平台片段记录的 updater 公钥不对应')
+    signature = tauri_signature(tauri, args.updater_key, first['desktop_version'], channel_dir / 'product-manifest.json')
+    check_key_pair(pubkey, signature, 'product-manifest.json')
     # 更新包地址：缺省与通道文件放在一起；--download-base 指向版本化的下载位置（例如 GitHub Release 附件，下载时会重定向，
     # updater 跟随重定向）。通道文件本身（latest.json、product-manifest.json 与签名）要放在不重定向的 https 地址上，
     # 桌面端取产品发行清单时不跟随重定向。
@@ -480,6 +486,15 @@ def gate(args):
             check(channel + '/latest.json 版本一致且各平台完整', value['version'] == first['desktop_version'] and set(value['platforms']) == have,
                   str(sorted(value['platforms'])))
             check(channel + '/product-manifest.json 有签名', (dist / channel / 'product-manifest.json.sig').is_file())
+            # latest.json 里的签名与平台片段一致；更新包放在通道目录里分发时（没有 --download-base），那份副本的字节也要一致。
+            for f in found:
+                entry = value['platforms'].get(f['target'], {})
+                check(channel + '/latest.json 的 ' + f['target'] + ' 签名与平台片段一致', entry.get('signature') == f['updater']['signature'])
+                for item in f['artifacts']:
+                    copy = dist / channel / item['name']
+                    if item['role'] in ('updater', 'installer+updater', 'updater-signature') and copy.is_file():
+                        check(channel + '/' + item['name'] + ' 与平台片段记录的摘要一致',
+                              copy.stat().st_size == item['bytes'] and sha256(copy) == item['sha256'])
     report = dict(kind=kind, version=first['desktop_version'], commit=first['commit'], passed=all(c['ok'] for c in checks), checks=checks)
     (dist / 'gate-report.json').write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding='utf-8')
     for c in checks:

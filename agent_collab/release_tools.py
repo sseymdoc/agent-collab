@@ -96,7 +96,11 @@ def evaluate_compat(manifest, controller_info, role='worker', nodes=None):
                     if minimum_controller and compare_versions(version, minimum_controller) < 0:
                         reasons.append('目标 controller 低于节点 ' + label + ' 的最低版本')
                     node_protocol = node.get('protocol_version', identity.get('protocol_version'))
-                    if node_protocol is not None and target_protocol is not None and node_protocol != target_protocol:
+                    if node_protocol is None:
+                        unchecked.append('节点 ' + label + ' 未报告 protocol_version')
+                    elif type(node_protocol) is not int or node_protocol < 1:
+                        reasons.append('节点 ' + label + ' 的 protocol_version 无效')
+                    elif target_protocol is not None and node_protocol != target_protocol:
                         reasons.append('节点 ' + label + ' protocol_version 不同')
         result['affected_features'] = {name: FEATURE_EFFECTS.get(name, name)
                                        for name in result['missing_optional']}
@@ -139,7 +143,11 @@ def main(argv=None):
                     if args.url and args.url.rstrip('/') != args.controller.rstrip('/'):
                         raise ValueError('--url and --controller differ')
                     args.url = args.controller
-                    connection = cli.Conn(args)
+                    try:
+                        connection = cli.Conn(args)
+                    except SystemExit:
+                        # profile 没有凭据或地址与配对的不同：Conn 已经在 stderr 说明了原因，这里仍按约定输出 reject。
+                        raise ValueError('cannot open the controller connection for this profile')
                     status, info = connection.send('GET', '/client')
                     if status != 200:
                         raise ValueError('GET /client returned HTTP %d' % status)
