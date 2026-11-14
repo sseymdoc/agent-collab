@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -52,11 +53,9 @@ NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' el
 def version_fits(kind, version):
     """正式版是 X.Y.Z，或正式根下的发行候选 X.Y.Z-rc.N（只进 preview 通道）；候选与内部测试版必须带预发布后缀。"""
     if kind == 'formal':
-        core, _, pre = version.partition('-')
-        numbers = core.split('.')
-        rc = pre[3:] if pre.startswith('rc.') else None
-        return (len(numbers) == 3 and all(n.isdigit() for n in numbers)
-                and (not pre or (rc is not None and rc.isdigit())))
+        # 数字段按 SemVer：只用 ASCII 数字、不带前导零。
+        number = r'(?:0|[1-9][0-9]*)'
+        return re.fullmatch(r'{0}\.{0}\.{0}(?:-rc\.{0})?'.format(number), version, re.ASCII) is not None
     return '-' in version
 
 

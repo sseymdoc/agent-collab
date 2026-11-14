@@ -652,7 +652,11 @@ def job_outcome(job, coordinating=False):
     if coordinating:
         # 失败或待对账也可能触发协调回合；回合结束前它可能新建修复修订，不能先判为需人工处理。
         return 'awaiting_coordination'
+    # 验收与发布都要属于当前检查点：通过或发布之后再重试，旧记录仍留在任务上，但说的是上一次执行的成果。
+    current = job.get('durable_checkpoint_id')
     acceptance = job['acceptance']['status']
+    if job['acceptance'].get('checkpoint_id', current) != current:
+        acceptance = 'unverified'
     if job['status'] != 'completed' or acceptance in ('rework', 'blocked'):
         return 'needs_attention'
     publish = job['contract'].get('publish')
@@ -660,14 +664,15 @@ def job_outcome(job, coordinating=False):
         return 'unknown'
     if publish.get('requires_acceptance') and acceptance != 'passed':
         return 'awaiting_acceptance'
-    if not job['delivery_version']:
+    if not job['delivery_version'] or job.get('delivery_checkpoint_id', current) != current:
         # 执行结束不等于成果已发布：手动发布等调用方，自动发布等执行节点完成发布。
         return 'ready_to_publish' if publish.get('mode') == 'manual' else 'awaiting_publication'
     return 'done'
 
 
 def outcome_counts(jobs):
-    """总览的待办计数。每个根工作包只看最新一版修订（被取代的旧修订不再是待办）；协调回合本身不计，
+    """总览的待办计数。jobs 按写入顺序排列（Store.all 的顺序）：每个根工作包只看最后写入的一版修订
+    （被取代的旧修订不再是待办），不按 created_at 判断，时钟回拨或同一毫秒也不会选错；协调回合本身不计，
     它的进行与结论归到被协调的任务。"""
     coordinating = {job['contract']['coordinates']['job_id'] for job in jobs
                     if (job['contract'].get('coordinates') or {}).get('job_id') and job['status'] not in ENDED}
@@ -675,9 +680,7 @@ def outcome_counts(jobs):
     for job in jobs:
         if job['contract'].get('coordinates'):
             continue
-        current = latest.get(job['work_package_id'])
-        if current is None or (job['created_at'], job['job_id']) > (current['created_at'], current['job_id']):
-            latest[job['work_package_id']] = job
+        latest[job['work_package_id']] = job
     counts = dict.fromkeys(OUTCOMES, 0)
     for job in latest.values():
         counts[job_outcome(job, job['job_id'] in coordinating)] += 1

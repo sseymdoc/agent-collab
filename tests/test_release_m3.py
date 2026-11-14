@@ -153,7 +153,8 @@ class DesktopCopyTests(unittest.TestCase):
         spec.loader.exec_module(build)
         for version in ('0.3.0', '0.3.0-rc.1', '10.20.30-rc.12'):
             self.assertTrue(build.version_fits('formal', version), version)
-        for version in ('0.3.0-dev.22', '0.3.0-rc1', '0.3.0-rc.', '0.3.0-rc.1.2', '0.3', '0.3.0-beta.1', 'v0.3.0'):
+        for version in ('0.3.0-dev.22', '0.3.0-rc1', '0.3.0-rc.', '0.3.0-rc.1.2', '0.3', '0.3.0-beta.1', 'v0.3.0',
+                        '01.2.3', '0.03.0', '0.3.0-rc.01', '０.3.0', '0.3.0-rc.１', '0.3.0\n', '0.3.0-'):
             self.assertFalse(build.version_fits('formal', version), version)
         self.assertTrue(build.version_fits('candidate', '0.3.0-dev.22'))
         self.assertFalse(build.version_fits('candidate', '0.3.0'))

@@ -447,7 +447,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - `GET /events?before=<seq>&limit=<n>`（read）→ `{"events": [...], "min_seq"}`：序号小于 `before` 的最近 `limit` 条全局事件，按序号升序；`before=0` 表示从最新一条开始。用于从新到旧翻看活动。不带 `before` 时仍是 `after=<seq>` 的向后续读。
 - `GET /jobs/{id}/events?before=<seq>&limit=<n>`（read）→ `{"events": [...]}`：该 job 序号小于 `before` 的事件，按序号升序，最多 `limit` 条（1–1000，缺省 200）。
-- `GET /overview` 带 `outcomes`：每个根工作包最新一版修订（协调回合本身不计）的结论计数，键为 `running`、`awaiting_coordination`、`needs_attention`、`awaiting_acceptance`、`ready_to_publish`、`awaiting_publication`、`done`、`unknown`，判定与 CLI 摘要的 `outcome` 相同：运行状态 `completed` 只表示执行结束，契约要求验收而当前修订还没有“通过”的才计入 `awaiting_acceptance`；契约里没有发布规则的旧记录计入 `unknown`。`counts` 仍是按运行状态的计数，不变。
+- `GET /overview` 带 `outcomes`：每个根工作包最新一版修订（协调回合本身不计）的结论计数，键为 `running`、`awaiting_coordination`、`needs_attention`、`awaiting_acceptance`、`ready_to_publish`、`awaiting_publication`、`done`、`unknown`，判定与 CLI 摘要的 `outcome` 相同：运行状态 `completed` 只表示执行结束，契约要求验收而当前修订还没有“通过”的才计入 `awaiting_acceptance`；验收结论（`acceptance.checkpoint_id`）与已发布成果（`delivery_checkpoint_id`）只在属于当前 `durable_checkpoint_id` 时算数，通过或发布之后再重试的任务按新成果重新计入待验收或待发布；契约里没有发布规则的旧记录计入 `unknown`。`counts` 仍是按运行状态的计数，不变。
 - `min_seq`（`GET /events` 的应答与事件流的 `snapshot_required`）是能完整重放的第一条序号：运维裁剪过冗余的节点快照之后，它不低于记录的重放水位加一，序号中间可能有空洞；游标小于 `min_seq - 1` 的客户端先重取快照，再从 `min_seq - 1` 之后续读。
 - `node.updated` 在节点记录有实际变化时写出（状态、认证、能力、注册信息等）。心跳只刷新 `last_seen_at` 时节点记录原地更新、`version` 不变，每个节点最多每 60 秒写一条；需要最新联系时间时读 `GET /nodes`。
 - `GET /nodes` 的每个节点带 `attempts`：该节点上有效（assigned、leased、running）的 attempt，`[{"attempt_id", "job_id", "title", "status", "epoch", "lease_expires_at", "harness", "model", "effort", "coordinates"}]`；`coordinates` 为 true 表示它是受管协调回合。
@@ -629,7 +629,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 | `GET /settings/backups` | 无 | `{"settings": {"revision", "keep", "updated_at", "updated_by"}}`；未设置时 revision=0、keep=8 |
 | `PUT /settings/backups` | `{"request_id", "expected_revision", "keep"}`；keep 为正整数 | 保存 revision+1 并执行清理，返回 retention 操作；result 含 settings、removed；版本不符为 409 version_mismatch |
 
-列表只做轻量核对：读清单，核对数据库与 blob 文件存在且大小一致，以只读不可变方式读 schema、代次与事件序号；不复制、不重算摘要、不跑 integrity_check，`valid` 只说明清单与文件齐全，内容是否完好看 `last_verification`（最近一次 verify 或创建时的完整核对）。controller 的每个请求都在同一把锁里处理：verify、恢复预览与归档导出对几百 MB 的备份要读完整份数据，期间其他请求与节点心跳排队等待，在没有执行中任务时进行。只有变更操作记录核对结果。保留清理仅作用于 managed 目录，按创建时间、事件序号排序，绝不删除最新的有效备份（它也是唯一有效备份时仍保护）；不清理 upgrade 或其他目录。keep 是目标数量，保护恢复点优先于份数。核对失败不把损坏目录计为有效恢复点。
+列表只做轻量核对：读清单，核对数据库与 blob 文件存在且大小一致，以只读不可变方式读 schema、代次与事件序号，并与清单里的代次、事件序号交叉核对（与完整核对相同）；列表不改动备份目录；不复制、不重算摘要、不跑 integrity_check，`valid` 只说明清单与文件齐全，内容是否完好看 `last_verification`（最近一次 verify 或创建时的完整核对）。controller 的每个请求都在同一把锁里处理：verify、恢复预览与归档导出对几百 MB 的备份要读完整份数据，期间其他请求与节点心跳排队等待，在没有执行中任务时进行。只有变更操作记录核对结果。保留清理仅作用于 managed 目录，按创建时间、事件序号排序，需要删除时先从最新往前完整核对，绝不删除第一份通过完整核对的备份（它也是唯一有效备份时仍保护），轻量列表报 valid 但内容损坏的较新备份不算；不清理 upgrade 或其他目录。keep 是目标数量，保护恢复点优先于份数。核对失败不把损坏目录计为有效恢复点。
 
 位置始终标为 `instance`；HTTP 导出成功不等于文件已保存到实例之外。客户端“另存为”或 CLI `export --to` 成功保存并核对哈希后，才能说明选定位置有副本；是否真正离开实例取决于实际保存位置。归档不含加密层。
 

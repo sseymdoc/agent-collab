@@ -281,9 +281,18 @@ def retention_settings(store):
 def prune(app):
     items = [item for item in backups(app) if item['kind'] == 'managed']
     items.sort(key=lambda item: (item['created_at'] or '', item['event_seq'] or 0, item['id']))
-    valid = [item for item in items if item['valid']]
-    protected = valid[-1]['id'] if valid else None
-    removed = []
+    protected, removed = None, []
+    if len(items) > retention_settings(app.store)['keep']:
+        # 列表只做轻量核对；要删别的备份之前，从最新往前完整核对，保护第一份真正可用的恢复点。
+        for item in reversed(items):
+            if not item['valid']:
+                continue
+            try:
+                inspect_backup(backup_path(app, item['id']), app.data_dir)
+            except BackupError:
+                continue
+            protected = item['id']
+            break
     for item in items:
         if len(items) - len(removed) <= retention_settings(app.store)['keep']:
             break

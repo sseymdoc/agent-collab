@@ -159,6 +159,39 @@ class MaintenanceTests(ClientCase):
         self.assertFalse(item['valid'])
         self.assertEqual(item['error']['code'], 'backup_object_missing')
 
+    def test_listing_cross_checks_the_manifest_and_creates_nothing(self):
+        self.node()
+        ident, path = self.create_backup()
+        blobs = path / 'blobs'
+        if blobs.is_dir() and not any(blobs.rglob('*')):
+            blobs.rmdir()
+        manifest_path = path / 'backup-manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if not manifest['blobs']:
+            self.call('GET', '/maintenance/backups')
+            self.assertFalse(blobs.exists())               # 列表不建 blobs/ 目录
+        for key, value in (('authority_generation', manifest['authority_generation'] + 1), ('event_seq', manifest.get('event_seq', 0) + 1)):
+            manifest_path.write_text(json.dumps(dict(manifest, **{key: value})), encoding='utf-8')
+            item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+            self.assertFalse(item['valid'], key)
+            self.assertEqual(item['error']['code'], 'backup_inventory_mismatch')
+        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        self.assertTrue(next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)['valid'])
+
+    def test_retention_protects_a_deep_checked_backup_not_a_same_size_corrupt_newer_one(self):
+        self.node()
+        older, older_path = self.create_backup()
+        self.clock.advance(1)
+        newer, newer_path = self.create_backup()
+        database = next(newer_path.glob('controller*.db'))
+        data = bytearray(database.read_bytes())
+        data[-1] ^= 0xFF
+        database.write_bytes(bytes(data))       # 大小不变：轻量列表仍报 valid
+        self.app.store.put('settings', 'backups', dict(revision=1, keep=1, updated_at=None, updated_by=None))
+        self.assertEqual(m.prune(self.app), [newer])
+        self.assertTrue(older_path.is_dir())
+        self.assertFalse(newer_path.exists())
+
     def test_high_water_keeps_restored_generation_above_every_online_generation(self):
         # 备份在代次 1；之后线上已经用过 3（例如一次恢复、一次屏障），当前库又丢了：不带下限只会得到 2，复用线上出现过的代次。
         self.node()

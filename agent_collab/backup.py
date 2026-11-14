@@ -191,10 +191,10 @@ def describe_backup(source):
         database = source / manifest['database']
         if database.is_symlink() or not database.is_file():
             raise BackupError('backup_object_missing', 'missing backup database', object=database.name)
-        blobs = BlobStore(source)
-        for entry in manifest['blobs']:
+        for entry in manifest['blobs']:   # 不构造 BlobStore：它会建 blobs/ 目录，列表不能改动备份
             digest = p.check_sha256(entry['sha256'])
-            if not blobs.exists(digest, entry['size']):
+            blob = source / 'blobs' / digest[:2] / digest[2:4] / digest
+            if blob.is_symlink() or not blob.is_file() or blob.stat().st_size != entry['size']:
                 raise BackupError('backup_object_missing', 'missing or resized backup blob: ' + digest, sha256=digest)
         db = sqlite3.connect(database.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)
         try:
@@ -203,6 +203,11 @@ def describe_backup(source):
             event_seq = db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]
         finally:
             db.close()
+        # 与完整核对同样的清单交叉检查：只用已读到的值，不增加读取量。
+        if meta['authority_generation'] != manifest['authority_generation']:
+            raise BackupError('backup_inventory_mismatch', 'backup authority generation mismatch')
+        if 'event_seq' in manifest and manifest['event_seq'] != event_seq:
+            raise BackupError('backup_inventory_mismatch', 'backup event sequence mismatch')
     except BackupError:
         raise
     except (OSError, ValueError, KeyError, TypeError, IndexError, sqlite3.DatabaseError) as exc:

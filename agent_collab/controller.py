@@ -140,7 +140,9 @@ class App:
         self.blobs = BlobStore(self.data_dir, self.config['max_blob_bytes'])
         self.store = Store(self.data_dir)
         self.request = (('admin', None), '', '')  # 当前请求的 (identity, method, route)，供请求来源记录使用
-        self.node_events = {}  # node_id → 最近一次因心跳写 node.updated 的时间（进程内；重启后第一次心跳照常写）
+        # node_id → (最近一次因心跳写 node.updated 的时间, 写出后的 version)。进程内；重启后第一次心跳照常写。
+        # 带上 version：那次请求若被回滚，库里的 version 对不上，下一次心跳不受节流、照常写。
+        self.node_events = {}
         token_file = self.data_dir / 'admin.token'
         try:
             fd = os.open(str(token_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1884,15 +1886,16 @@ class App:
             raise ValueError('invalid heartbeat')
         reconcile = data['authority_generation'] != self.meta()['authority_generation']
         health = merge_health(node['auth_health'], data.get('auth_health', {}))
-        if node['status'] == 'online' and node['auth_health'] == health and \
-                now - self.node_events.get(node_id, float('-inf')) < NODE_EVENT_INTERVAL_S:
+        written_at, written_version = self.node_events.get(node_id, (float('-inf'), None))
+        if node['status'] == 'online' and node['auth_health'] == health and node['version'] == written_version and \
+                now - written_at < NODE_EVENT_INTERVAL_S:
             # 只是又一次心跳：原地刷新最近联系时间，不推进 version、不写事件。在线判断、租约与超时照常按 last_seen_at。
             # 每次心跳一条完整节点快照（含模型目录）会让事件表与备份持续膨胀；状态与认证的变化走下面的分支立即写。
             node = dict(node, last_seen_at=d.timestamp(now))
             self.store.put('node', node_id, node)
         else:
             node = self.change('node', node, now, status='online', last_seen_at=d.timestamp(now), auth_health=health)
-            self.node_events[node_id] = now
+            self.node_events[node_id] = (now, node['version'])
         renewed, revoked, cancel = [], [], []
         seen = set()
         for entry in data['attempts']:

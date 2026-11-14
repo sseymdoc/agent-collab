@@ -48,6 +48,18 @@ class HeartbeatEventTests(ControllerCase):
         self.assertEqual(self.node_events()[-1]['payload']['status'], 'online')
         self.assertEqual(len(self.node_events()), count + 3)
 
+    def test_a_rejected_heartbeat_does_not_use_up_the_event_interval(self):
+        node = self.node('a')
+        self.clock.advance(5)
+        count = len(self.node_events())
+        bad = {'authority_generation': node.generation, 'auth_health': {'codex': 'expired'},
+               'attempts': [{'attempt_id': 'not-a-uuid', 'epoch': 1, 'state': 'running'}]}
+        self.call('POST', '/nodes/a/heartbeat', bad, token=node.token, status=400)   # 事件已写出再被整体回滚
+        self.assertEqual(len(self.node_events()), count)
+        self.clock.advance(5)
+        node.heartbeat()                                                              # 间隔之内，但上一次没有生效
+        self.assertEqual(len(self.node_events()), count + 1)
+
     def test_leases_and_offline_detection_still_follow_every_heartbeat(self):
         node = self.node('a')
         job = self.job()
@@ -170,6 +182,28 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(set(counts), set(d.OUTCOMES))
         self.assertEqual(counts, {'done': 3, 'ready_to_publish': 1, 'awaiting_acceptance': 1, 'awaiting_coordination': 1,
                                   'awaiting_publication': 1, 'needs_attention': 1, 'running': 1, 'unknown': 1})
+
+    def test_acceptance_and_delivery_count_only_for_the_current_checkpoint(self):
+        # 通过验收并发布之后又重试：新检查点既没验收也没发布，旧记录不能让它算作可发布或已完成。
+        retried = job('x', requires_acceptance=True, acceptance='passed', delivery=1)
+        retried.update(durable_checkpoint_id='cp-2', delivery_checkpoint_id='cp-1')
+        retried['acceptance']['checkpoint_id'] = 'cp-1'
+        self.assertEqual(d.job_outcome(retried), 'awaiting_acceptance')
+        retried['acceptance']['checkpoint_id'] = 'cp-2'
+        self.assertEqual(d.job_outcome(retried), 'ready_to_publish')
+        retried['delivery_checkpoint_id'] = 'cp-2'
+        self.assertEqual(d.job_outcome(retried), 'done')
+        reworked = job('y', requires_acceptance=True, acceptance='rework')
+        reworked.update(durable_checkpoint_id='cp-2')
+        reworked['acceptance']['checkpoint_id'] = 'cp-1'
+        self.assertEqual(d.job_outcome(reworked), 'awaiting_acceptance')   # 上一版的返工结论不压住新成果
+
+    def test_latest_revision_is_the_last_written_not_the_largest_timestamp_or_id(self):
+        # 同一毫秒或时钟回拨：按写入顺序取最后一版，不按 created_at 与随机 job_id 比较。
+        jobs = [job('ffff-old', status='cancelled', root='pkg', created='2026-11-14T00:00:01.000Z'),
+                job('0000-new', status='running', root='pkg', created='2026-11-14T00:00:00.000Z')]
+        counts = d.outcome_counts(jobs)
+        self.assertEqual((counts['running'], counts['needs_attention']), (1, 0))
 
     def test_outcome_matches_the_rules_clients_already_use(self):
         self.assertEqual(d.job_outcome(job('x', status='waiting_reconcile')), 'needs_attention')
