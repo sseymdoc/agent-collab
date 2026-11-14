@@ -194,8 +194,10 @@ def describe_backup(source):
         for entry in manifest['blobs']:   # 不构造 BlobStore：它会建 blobs/ 目录，列表不能改动备份
             digest = p.check_sha256(entry['sha256'])
             blob = source / 'blobs' / digest[:2] / digest[2:4] / digest
-            if blob.is_symlink() or not blob.is_file() or blob.stat().st_size != entry['size']:
-                raise BackupError('backup_object_missing', 'missing or resized backup blob: ' + digest, sha256=digest)
+            if blob.is_symlink() or not blob.is_file():
+                raise BackupError('backup_object_missing', 'missing backup blob: ' + digest, sha256=digest)
+            if blob.stat().st_size != entry['size']:   # 与完整核对同一个错误码
+                raise BackupError('backup_blob_hash', 'backup blob hash/size mismatch: ' + digest, sha256=digest)
         db = sqlite3.connect(database.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)
         try:
             schema = schema_info(db)

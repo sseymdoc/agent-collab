@@ -177,6 +177,26 @@ class MaintenanceTests(ClientCase):
             self.assertEqual(item['error']['code'], 'backup_inventory_mismatch')
         manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
         self.assertTrue(next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)['valid'])
+        # 尺寸不符的 blob 与完整核对报同一个错误码。
+        resized = dict(manifest, blobs=manifest['blobs'] + [{'sha256': 'a' * 64, 'size': 3}])
+        target = path / 'blobs' / 'aa' / 'aa' / ('a' * 64)
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'xx')
+        manifest_path.write_text(json.dumps(resized), encoding='utf-8')
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertEqual(item['error']['code'], 'backup_blob_hash')
+        # 数据库里的 controller 元数据缺字段：这一份记为无效，列表照常返回。
+        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        database = next(path.glob('controller*.db'))
+        db = sqlite3.connect(str(database), isolation_level=None)
+        try:
+            db.execute('PRAGMA journal_mode=DELETE')
+            db.execute("UPDATE records SET data=json_remove(data, '$.authority_generation') WHERE kind='meta' AND id='controller'")
+        finally:
+            db.close()
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertFalse(item['valid'])
+        self.assertEqual(item['error']['code'], 'backup_payload_invalid')
 
     def test_retention_protects_a_deep_checked_backup_not_a_same_size_corrupt_newer_one(self):
         self.node()
@@ -191,6 +211,16 @@ class MaintenanceTests(ClientCase):
         self.assertEqual(m.prune(self.app), [newer])
         self.assertTrue(older_path.is_dir())
         self.assertFalse(newer_path.exists())
+
+    def test_retention_deletes_nothing_when_no_backup_passes_the_full_check(self):
+        self.node()
+        _, first = self.create_backup()
+        self.clock.advance(1)
+        _, second = self.create_backup()
+        self.app.store.put('settings', 'backups', dict(revision=1, keep=1, updated_at=None, updated_by=None))
+        with mock.patch.object(m, 'inspect_backup', side_effect=BackupError('backup_payload_invalid', 'no space to copy')):
+            self.assertEqual(m.prune(self.app), [])
+        self.assertTrue(first.is_dir() and second.is_dir())
 
     def test_high_water_keeps_restored_generation_above_every_online_generation(self):
         # 备份在代次 1；之后线上已经用过 3（例如一次恢复、一次屏障），当前库又丢了：不带下限只会得到 2，复用线上出现过的代次。

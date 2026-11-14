@@ -293,6 +293,8 @@ def prune(app):
                 continue
             protected = item['id']
             break
+        if protected is None:
+            return removed   # 没有一份通过完整核对（例如空间不足无法复制核对）：一份都不删，保住现有恢复点
     for item in items:
         if len(items) - len(removed) <= retention_settings(app.store)['keep']:
             break
