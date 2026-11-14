@@ -68,7 +68,7 @@ function DesktopUpdate() {
   return <Section title="桌面端更新" extra={<span className="muted">只更新这台机器上的桌面端与随包组件，不升级远端 controller 或节点</span>}>
     {st.settings_broken && <p className="err">更新设置文件读不出或已损坏，自动检查、下载与安装已关闭。<button disabled={!!busy} onClick={() => void save({})}>重新保存设置</button></p>}
     <dl className="kv">
-      <dt>当前版本</dt><dd>{st.current} · 构建身份 {id.kind}{id.kind === 'formal' ? '（正式版）' : id.kind === 'candidate' ? '（开发候选版）' : id.kind === 'internal-test' ? '（内部测试版）' : '（开发构建，不检查更新）'}</dd>
+      <dt>当前版本</dt><dd>{st.current} · 构建身份 {id.kind}{id.kind === 'formal' ? (String(st.current).includes('-') ? '（正式身份的发行候选版，预发布）' : '（正式版）') : id.kind === 'candidate' ? '（开发候选版）' : id.kind === 'internal-test' ? '（内部测试版）' : '（开发构建，不检查更新）'}</dd>
       <dt>更新通道</dt><dd>{id.configured
         ? <select value={settings.channel} disabled={!!busy} onChange={e => void save({ channel: e.target.value })}>{id.channels.map((c: string) =>
           <option key={c} value={c}>{c === 'stable' ? 'stable（稳定版，缺省）' : c === 'preview' ? 'preview（预览版）' : c}</option>)}</select>

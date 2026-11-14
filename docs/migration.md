@@ -74,9 +74,9 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 2. **停止普通提交。** 旧版本 controller 没有提交闸门：停掉旧入口本身（旧 launcher 及其自启动项、提交包装、使用管理令牌的定时脚本），并核对 `GET /overview` 与 `GET /jobs` 不再有新任务出现。
 3. **排空并暂停。** 让在途任务完成，或有序取消；确认没有活动 attempt、没有未结束的任务（预检的 `no_active_attempts`、`no_non_terminal_jobs`），旧 launcher 没有运行中或状态不明的任务（`legacy_tasks_idle`）。然后暂停派单（`POST /dispatch`，`paused: true`）。
 4. **一致备份。** 在暂停状态下做一次备份并复制到 controller 主机之外；记下备份清单里的 `event_seq`（旧版本写出的清单没有这一项时，记下此刻 `GET /events` 的最大序号）。回退边界从这一点算起。
-5. **升级并静态核对。** 停止旧版本的 worker 服务，升级各节点（节点兼容旧 controller：不上报模型目录、接受旧的协调决策 schema），在旧 controller 上确认心跳与认证探测正常。停止 controller，升级，启动。首次启动写入模型设置迁移值；不迁移活进程、内存中的会话或未确认的状态。核对 controller 身份与恢复代次未变、派单仍然暂停、仍参与运行的节点（未排空、未退役）全部在线并上报模型目录、设置为迁移值。
+5. **升级并静态核对。** 顺序按 `release compat` 对实际组合的结论决定，不固定先后。目标节点版本对旧 controller 为 accept 时，先停旧 worker、升级各节点（节点兼容旧 controller：不上报模型目录、接受旧的协调决策 schema），在旧 controller 上确认心跳与认证探测正常，再停止 controller、升级、启动。目标节点对旧 controller 为 reject（例如 0.3.0 节点要求 controller 具备 `clients`、`model_settings`、`node_models`，0.1.0rc 系列没有）时做一次协同升级：各节点 `service stop` 停稳 → controller 离线升级并启动（派单保持暂停） → 用受管安装器升级停用状态的节点（保持 stopped）→ `service start`；期间没有旧新混合组合在运行。首次启动写入模型设置迁移值；不迁移活进程、内存中的会话或未确认的状态。核对 controller 身份与恢复代次未变、派单仍然暂停、仍参与运行的节点（未排空、未退役）全部在线并上报模型目录、设置为迁移值。
 6. **只开放验收提交，受控恢复派单。** 把提交闸门设为 `acceptance`（`POST /intake`，带原因），再恢复派单。此时 controller 只接受验收运行：由具备 `maintain` 权限的主体提交、带 `acceptance_run` 标记、不属于任何项目、没有回写目标、不声明外部副作用；其余提交一律以 `intake_closed` 被拒绝，包括用管理令牌的。验收运行的输入用专门准备的小型测试内容，工作区是节点上隔离的 attempt 目录。
-7. **验收。** 验收运行经 `agent-collab submit <任务文件>` 提交，任务文件里带 `"acceptance_run": true`（桌面端与浏览器页面的提交入口不发送这个标记，这一阶段会被 `intake_closed` 拒绝）。各节点在服务进程上下文里完成一次真实的执行与协调；自动化经 `agent-collab` 入口提交并取回结果；桌面端连接后查看这些任务的执行、检查与成果并另存。这些任务都带 `acceptance_run` 标记（`GET /jobs?acceptance_run=1`）。桌面端自己的“提交 → 执行 → 检查 → 成果”闭环在第 8 步开放普通提交之后做。
+7. **验收。** 验收运行不能属于项目、不能有回写目标，所以成果应用到项目目录的闭环放在第 8 步开放之后，用专门的测试项目与测试目录做。验收运行经 `agent-collab submit <任务文件>` 提交，任务文件里带 `"acceptance_run": true`（桌面端与浏览器页面的提交入口不发送这个标记，这一阶段会被 `intake_closed` 拒绝）。各节点在服务进程上下文里完成一次真实的执行与协调；自动化经 `agent-collab` 入口提交并取回结果；桌面端连接后查看这些任务的执行、检查与成果并另存。这些任务都带 `acceptance_run` 标记（`GET /jobs?acceptance_run=1`）。桌面端自己的“提交 → 执行 → 检查 → 成果”闭环在第 8 步开放普通提交之后做。
 8. **开放普通提交。** 确认 `GET /activity?after=<第 4 步的 event_seq>` 的 `ordinary_jobs` 为 0、`disposable` 为 true（切换以来只有验收状态），把提交闸门设回 `open`，通知使用者改用桌面端与 `agent-collab` 入口。
 9. **退役旧的日常入口。** 关闭浏览器控制台（`web_console: false`），更新引用旧 launcher、旧提交包装的说明。保留的旧安装包与备份只作被动恢复材料。
 
@@ -86,7 +86,7 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 降级须使用记录的 `install --rollback` 或明确 `--allow-downgrade`，仍受当前数据库 schema 范围约束，不自动恢复旧数据库。
 升级前可用 `agent-collab release compat --release <包> --as worker|controller --controller-info <GET-client.json>` 核对；
 在线模式用 `--controller <URL>` 与现有 CLI 连接参数。accept/degraded/reject 退出码为 0/1/2，缺可选功能和未核对事项明确列出。
-先升级节点再升级 controller；协议不匹配、缺必需功能或达不到最低版本时拒绝。旧 controller 缺兼容字段时不能把 degraded 当成完整验收。
+升级顺序按实际组合的兼容结论决定（见“切换顺序”第 5 步）；协议不匹配、缺必需功能或达不到最低版本时拒绝。旧 controller 缺兼容字段（例如没有 `GET /client`）时安装器记“未核对在线兼容性”并继续，不能把这当成完整验收：先用 `release compat --controller-info` 对实际节点列表离线核对。
 
 独立发行包的 OpenSSH 命名空间与身份固定为 `agent-collab-release`。首次 `--allowed-signers` 固定信任，
 升级与回退重新验签；换信任需 `--replace-trust`，固定后无签名需显式 `--allow-unsigned`。
@@ -127,9 +127,14 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 使用 `agent-collab maintenance restore-preview <id>` 比较第 4 步备份与当前状态。预览核对载荷、任务/attempt/检查点/验收/发布、已写与待确认应用、项目及模型/协调设置 revision、客户端和节点配对/撤销/退役/凭据变化，逐项列出恢复影响。
 
 - verdict=safe：只有可丢弃的验收状态、没有需要对账的其他事实。暂停派单并停止 controller 与 worker 后恢复；验收状态随之丢弃，执行代次推进。
+- 恢复后的代次取当前库、备份与 `--high-water <N>` 三者的最大值加一。切换期间在数据库之外记下已在线使用过的最高代次（屏障与每次恢复都会推进它），恢复时传入；当前库丢失或不可读时，不带它只能得到“备份代次 + 1”，可能复用已在线出现过的执行权代次。
 - verdict=needs_reconcile：先关闭普通提交，备份当前状态，按 changes、unresolved_applications、identity 逐项对账，优先向前修复。节点文件写入不会被数据库回退撤回；信息不足也属于此类。
 - verdict=blocked：备份损坏或不兼容，按具体对象/错误码修复恢复材料，不能继续恢复。
 - disposable 继续展示，但只统计任务与写回，不覆盖项目、设置与配对，true 不能替代综合 verdict。验收窗口新项目会丢失，新客户端/节点要重新配对，备份之后已撤销授权按拒绝优先结转。恢复时当前库不可读必须显式 keep 或 revoke-all，不允许静默保留旧授权。
+
+程序回退的范围按组件之间的兼容结论定，不按数据库能否打开定：schema 指纹相同、旧程序能读新库只是存储层的证据。节点升级到要求 controller 新能力的版本之后（例如 0.3.0 节点对 0.1.0rc 系列 controller 为 reject），“保留新节点与桌面端、只把 controller 回退”不受支持；整套回到旧栈要连同节点一起回退、恢复旧入口，并对账切换后的配对、退役、设置与验收记录。优先向前修复，或在同一兼容组合内 `install --rollback`。
+
+数据库备份只含 controller 数据库与被引用的 blob。节点令牌、管理令牌、客户端凭据在系统凭据存储里的副本、钥匙串、官方 CLI 登录与用户项目文件都不在其中，它不是整机恢复镜像。恢复到原数据目录时沿用那里的管理令牌；恢复到新目录时首次启动生成新的管理令牌。节点令牌丢失时，用 `POST /nodes/codes`（`replace: true`）签发配对码并在节点上重新配对（`docs/operations.md`“节点配对”）；客户端凭据丢失或被 `revoke-all` 撤销时重新 `client pair` 或在桌面端重新配对。
 
 离线恢复在目标主机使用 `agent-collab maintenance restore`；原始备份目录/导出 tar 保持不变，结果写数据库事件及 `restore-results/<op_id>.json`。另行核对 config.json、运行账户、TLS 配置、本机绑定和应用 journal；这些不在数据库备份的载荷中。
 
@@ -153,7 +158,7 @@ agent-collab migrate rehearse --backup <备份集目录> --work <空目录> --co
 - controller 主机之外的备份副本若已过期，先更新再切换。
 - 已排空且不可达的旧节点记录：升级后用节点退役（`docs/protocol.md` §13.5）处理，保留历史引用；它们不计入“节点都上报模型目录”的条件。
 - 正式身份的发行（ADR 0004）已签名、公证并经门禁：生产机器上只装正式身份的桌面端；候选与内部测试身份（`cand`、`itest`）不用于生产。正式版的实例为空，与命令行安装的生产节点是同一前缀：桌面端发现它时只报告，接管走切换步骤，不经向导替换。
-- 升级顺序与兼容：先节点、后 controller；每次升级前用 `agent-collab release compat --release <发行包> --as worker|controller` 核对目标 controller（或现有节点），结论为 reject 时不升级。
+- 升级顺序与兼容：每次升级前用 `agent-collab release compat --release <发行包> --as worker|controller` 核对目标 controller（或现有节点）；节点对旧 controller 为 reject 时按第 5 步协同升级。已排空且不可达、低于目标 `controller_min_worker` 的旧节点记录会让 controller 的结论为 reject：旧版本没有退役接口，确认它们没有进程后在 controller 升级之后、节点重启与开放提交之前退役。
 - 每个节点升级前 `GET /nodes` 的 `pending_writebacks` 为 0、节点本机没有 claimed/queued/running/finished 的写回操作、也没有已开始未上报的契约自动回写（安装器会拒绝）；有待确认的写回先在项目页处理。
 - 生产节点的发行包带 OpenSSH 来源签名，第一次经新安装器升级时固定 `allowed_signers`（正式发行密钥，不是测试密钥）。
 - 当天的实例外备份用 `agent-collab maintenance backup` 创建、`export` 导出到 controller 主机之外并核对哈希；恢复预览的 verdict 与身份结转计划随切换记录保存。

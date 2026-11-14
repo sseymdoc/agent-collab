@@ -49,6 +49,17 @@ LICENSE_FILES = {'LICENSE': 'LICENSE', 'THIRD_PARTY.md': 'THIRD_PARTY.md', 'THIR
 NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
 
 
+def version_fits(kind, version):
+    """正式版是 X.Y.Z，或正式根下的发行候选 X.Y.Z-rc.N（只进 preview 通道）；候选与内部测试版必须带预发布后缀。"""
+    if kind == 'formal':
+        core, _, pre = version.partition('-')
+        numbers = core.split('.')
+        rc = pre[3:] if pre.startswith('rc.') else None
+        return (len(numbers) == 3 and all(n.isdigit() for n in numbers)
+                and (not pre or (rc is not None and rc.isdigit())))
+    return '-' in version
+
+
 def sha256(path):
     digest = hashlib.sha256()
     with open(str(path), 'rb') as handle:
@@ -204,8 +215,8 @@ def build(args):
         bool(git(src, 'ls-files', '--others', '--exclude-standard', '--', 'desktop', 'agent_collab', *LICENSE_FILES.values()))
     if dirty and not args.allow_dirty:
         raise SystemExit('源检出有未提交的改动；发行构建只从干净提交进行')
-    if (kind == 'formal') == ('-' in version):
-        raise SystemExit('正式版的版本号不带预发布后缀，候选与内部测试版必须带')
+    if not version_fits(kind, version):
+        raise SystemExit('正式版的版本号是 X.Y.Z 或发行候选 X.Y.Z-rc.N，候选与内部测试版必须带预发布后缀')
     if args.fixture_module and kind == 'formal':
         raise SystemExit('正式版不能带测试夹具模块')
     target = target_name()
@@ -412,6 +423,8 @@ def manifest(args):
         raise SystemExit('正式版的更新包地址必须是带主机名的 https 地址：%s' % base)
     if args.channel not in first['channels']:
         raise SystemExit('%s 身份没有 %s 通道' % (first['kind'], args.channel))
+    if first['kind'] == 'formal' and '-' in first['desktop_version'] and args.channel == 'stable':
+        raise SystemExit('正式身份的发行候选只进 preview 通道，不进 stable')
     backend = first['backend']
     compat = backend['manifest'].get('compat') or {}
     notes = Path(args.notes).read_text(encoding='utf-8') if args.notes else ''
@@ -486,7 +499,9 @@ def gate(args):
     identity = identity or {}
     check('应用标识、实例与通道和身份一致', first['identifier'] == identity.get('identifier') and first['instance'] == identity.get('instance')
           and first['channels'] == identity.get('channels'), '%s / %s / %s' % (first['identifier'], first['instance'], first['channels']))
-    check('版本号与身份相符（正式版不带预发布后缀）', (kind == 'formal') != ('-' in first['desktop_version']), first['desktop_version'])
+    check('版本号与身份相符（正式版为 X.Y.Z 或发行候选 X.Y.Z-rc.N）', version_fits(kind, first['desktop_version']), first['desktop_version'])
+    if kind == 'formal' and '-' in first['desktop_version']:
+        check('正式身份的发行候选不进 stable 通道', not (dist / 'stable' / 'latest.json').is_file())
     for f in found:
         label = f['target']
         check(label + '：automation 只在内部测试版', ('automation' in f['features']) == (kind == 'internal-test'), str(f['features']))

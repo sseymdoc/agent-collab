@@ -447,6 +447,9 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 - `GET /events?before=<seq>&limit=<n>`（read）→ `{"events": [...], "min_seq"}`：序号小于 `before` 的最近 `limit` 条全局事件，按序号升序；`before=0` 表示从最新一条开始。用于从新到旧翻看活动。不带 `before` 时仍是 `after=<seq>` 的向后续读。
 - `GET /jobs/{id}/events?before=<seq>&limit=<n>`（read）→ `{"events": [...]}`：该 job 序号小于 `before` 的事件，按序号升序，最多 `limit` 条（1–1000，缺省 200）。
+- `GET /overview` 带 `outcomes`：每个根工作包最新一版修订（协调回合本身不计）的结论计数，键为 `running`、`awaiting_coordination`、`needs_attention`、`awaiting_acceptance`、`ready_to_publish`、`awaiting_publication`、`done`、`unknown`，判定与 CLI 摘要的 `outcome` 相同：运行状态 `completed` 只表示执行结束，契约要求验收而当前修订还没有“通过”的才计入 `awaiting_acceptance`；契约里没有发布规则的旧记录计入 `unknown`。`counts` 仍是按运行状态的计数，不变。
+- `min_seq`（`GET /events` 的应答与事件流的 `snapshot_required`）是能完整重放的第一条序号：运维裁剪过冗余的节点快照之后，它不低于记录的重放水位加一，序号中间可能有空洞；游标小于 `min_seq - 1` 的客户端先重取快照，再从 `min_seq - 1` 之后续读。
+- `node.updated` 在节点记录有实际变化时写出（状态、认证、能力、注册信息等）。心跳只刷新 `last_seen_at` 时节点记录原地更新、`version` 不变，每个节点最多每 60 秒写一条；需要最新联系时间时读 `GET /nodes`。
 - `GET /nodes` 的每个节点带 `attempts`：该节点上有效（assigned、leased、running）的 attempt，`[{"attempt_id", "job_id", "title", "status", "epoch", "lease_expires_at", "harness", "model", "effort", "coordinates"}]`；`coordinates` 为 true 表示它是受管协调回合。
 - `GET /nodes`（包括 `retired=1`）的每个节点带整数 `pending_writebacks`：该节点状态为 `requested/received` 的 `project_apply/project_recover` 操作，加上 `target_node_id` 为该节点且状态为 `started` 的应用，按 `application_id` 去重；再加上 `target_node_id` 为该节点、仍有待写入条目（`pending`）的契约自动回写，每个任务算一项。同一应用的写入与恢复操作只算一项；没有应用 ID 的操作各算一项。除上述两类以外的 `node_op` 种类、已结束操作、本机应用不计入。
 - `GET /checkpoints/{id}/files`（read）→ `{"checkpoint_id", "manifest_sha256", "files": [{"path", "sha256", "size", "executable"}]}`；文件内容用 `GET /blobs/<sha256>` 读取。
@@ -626,7 +629,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 | `GET /settings/backups` | 无 | `{"settings": {"revision", "keep", "updated_at", "updated_by"}}`；未设置时 revision=0、keep=8 |
 | `PUT /settings/backups` | `{"request_id", "expected_revision", "keep"}`；keep 为正整数 | 保存 revision+1 并执行清理，返回 retention 操作；result 含 settings、removed；版本不符为 409 version_mismatch |
 
-列表实时核对但不写核对历史；只有变更操作记录核对结果。保留清理仅作用于 managed 目录，按创建时间、事件序号排序，绝不删除最新的有效备份（它也是唯一有效备份时仍保护）；不清理 upgrade 或其他目录。keep 是目标数量，保护恢复点优先于份数。核对失败不把损坏目录计为有效恢复点。
+列表只做轻量核对：读清单，核对数据库与 blob 文件存在且大小一致，以只读不可变方式读 schema、代次与事件序号；不复制、不重算摘要、不跑 integrity_check，`valid` 只说明清单与文件齐全，内容是否完好看 `last_verification`（最近一次 verify 或创建时的完整核对）。controller 的每个请求都在同一把锁里处理：verify、恢复预览与归档导出对几百 MB 的备份要读完整份数据，期间其他请求与节点心跳排队等待，在没有执行中任务时进行。只有变更操作记录核对结果。保留清理仅作用于 managed 目录，按创建时间、事件序号排序，绝不删除最新的有效备份（它也是唯一有效备份时仍保护）；不清理 upgrade 或其他目录。keep 是目标数量，保护恢复点优先于份数。核对失败不把损坏目录计为有效恢复点。
 
 位置始终标为 `instance`；HTTP 导出成功不等于文件已保存到实例之外。客户端“另存为”或 CLI `export --to` 成功保存并核对哈希后，才能说明选定位置有副本；是否真正离开实例取决于实际保存位置。归档不含加密层。
 
@@ -639,7 +642,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - 预览、列表、导出、inspect 都不调用 `backup()`，不处理请求到期、不写 controller 数据库。它们会在临时目录复制并核对备份；原始备份的文件、哈希及旁文件保持不变。
 - 离线恢复须在 controller 停止后、目标主机执行。当前库可读时，默认 `carry-forward`：备份之后撤销或删除的客户端、退役/删除的节点及消失或替换的凭据按拒绝优先结转；缩减过的客户端 scopes 不会扩大。即使给 `keep`，也不能覆盖已知撤销。备份之后新增的客户端、节点及换过的凭据逐项列在 `identity.re_pair`。
 - 当前库不可读或不存在时，必须显式选择 `keep`（保留备份授权，结果警告无法确认备份之后撤销）或 `revoke-all`（撤销全部客户端/节点凭据，重新配对）。不选或选 carry-forward 返回 `identity_required`。所有恢复清除旧浏览器会话及未用配对码；管理令牌仍按目标主机现有文件处理，不随备份迁移。
-- generation 更新为 `max(可读当前库,备份)+1`，执行权全部撤销、派单暂停，提交闸门取备份原值；这是执行 fencing，与授权撤销分别记录。快照中未结束的节点操作（通用操作与项目写回、恢复操作都包括在内）记为 timed_out（`error.code: restore_requires_reconcile`），不重新下发：备份之后节点可能已经执行过它们。项目写回与恢复的应用记录保留为待确认，节点之后上报的结果按 §13.10 的对账规则更新应用；也可以先对账再显式发起 recover。
+- generation 更新为 `max(可读当前库, 备份, --high-water)+1`（`--high-water` 是运维在数据库之外记录的已在线使用过的最高代次，可省略），执行权全部撤销、派单暂停，提交闸门取备份原值；这是执行 fencing，与授权撤销分别记录。快照中未结束的节点操作（通用操作与项目写回、恢复操作都包括在内）记为 timed_out（`error.code: restore_requires_reconcile`），不重新下发：备份之后节点可能已经执行过它们。项目写回与恢复的应用记录保留为待确认，节点之后上报的结果按 §13.10 的对账规则更新应用；也可以先对账再显式发起 recover。
 - 核对失败返回如 `backup_object_missing`（具体对象）、`backup_database_hash`、`backup_database_corrupt`、`backup_blob_hash`、`backup_references_invalid`、`backup_schema_incompatible`，不替换当前数据库。恢复结果写 `controller.restored` 事件、maintenance_op 记录以及 `<data_dir 的父目录>/restore-results/<op_id>.json`。
 
 公共 CLI：
@@ -653,7 +656,7 @@ agent-collab maintenance restore-preview <id>
 agent-collab maintenance barrier-preview
 agent-collab maintenance retention [连接参数] set --keep N [--expected-revision N] [--request-id UUID]
 agent-collab maintenance inspect --from <目录或tar>
-agent-collab maintenance restore --data-dir D --from <目录或tar> [--identity carry-forward|keep|revoke-all] [--dry-run]
+agent-collab maintenance restore --data-dir D --from <目录或tar> [--identity carry-forward|keep|revoke-all] [--high-water N] [--dry-run]
 ```
 
 在线命令沿用 `--profile`、`--url`、`--token-file`、`--ca-file`，输出 JSON。export 在本机临时文件完成下载并核对大小与哈希后再替换目标；核对失败保留原目标。离线命令不用连接参数；dry-run 只给身份与代次计划，不写库、不生成恢复回执，controller 停止与锁由真正恢复时再次核对。它不能替代 restore-preview 的业务影响清点。CLI 成功返回 0、已完成失败操作返回 1、离线参数/核对拒绝返回 2、连接不可用返回 3。

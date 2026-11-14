@@ -356,6 +356,7 @@ systemctl start agent-collab-controller
 
 - ECS：状态根目录 `/var/lib/agent-collab`，controller 数据在其 `controller/`，定时备份在同级 `backups/`。禁止把备份放进 controller 数据目录或其祖先。HTTP `/overview`、`/doctor` 的 `backup` 对象读取 `<controller 数据目录的父目录>/backups/status.json`；缺文件时为 `unknown`，损坏文件报告读取错误。安装器在线 doctor 在 `components.controller.backup` 转发这个对象；离线 doctor 仍为 `unknown`。
 - 默认每 6 小时一轮，ECS `keep=8`、`max_bytes=500000000`（十进制 500 MB），Mac `keep_offsite=28`。按时运行时 8 份与 28 份分别相当于约 2 天与 7 天的历史。单份大小等于数据库加全部被引用 blob（确定性 tar 不压缩，以 COMPLETE 为准），随任务工件增长：一次现场测量为 89 MB，此时本地先碰到 500 MB 上限、实际保留约 5 份，实例外 28 份约 2.5 GB。按实际尺寸调整 `max_bytes` 与 `--keep-offsite`。这些是调度与保留配置，不是保证的 RPO。
+- `--max-bytes` 是全部定时完整集 tar 字节的总留存预算，不限制单份的生成：单份超过它照样生成并作为最新集保留，只是更早的集合会在下一轮按预算删除。最新集同时是最新已确认实例外集时，上一份不再受保护，下一轮就会被删；需要在实例内多留一份（例如切换前的恢复点）时，先按“单份大小 × 想保留的份数”提高预算。每轮还需要约“数据库大小 + 一份 tar”的临时空间（快照与打包都在备份目录里完成）。
 - 本地 `.lock` 使用非阻塞 `flock`；Windows 使用等效字节锁。锁忙退出码 `75`，不改变状态；其他失败为 `1`。锁文件不删除，崩溃由 OS 解锁。遗留 `.tmp-*` 下一轮自动删除；其他不完整目录不计入保留策略。`upgrade-*` 完全不受定时保留策略管理。
 - 完整集是 `<id>/backup.tar` 与最后原子发布的 `COMPLETE.json`，其中含 tar/DB SHA-256、tar 字节数、备份创建时间和 generation。tar 只包含 manifest 声明的数据库和 blob，名称排序、mtime/uid/gid 固定。保留策略按 tar 字节总和删除最旧完整集，永远保留最新集和最新已确认实例外复制的集；保护集可使份数/容量超过配置。没有实例外确认时仍至少保留最新完整集。
 - `OFFSITE.json` 是 Mac 校验成功后的回执；同 ID 重复确认幂等，较旧的延迟回执不覆盖较新的实例外确认。ECS 的 `status.json` 分别记录 `local.last_success_* / last_failure_at / last_error` 和 `offsite.last_confirmed_* / location`。

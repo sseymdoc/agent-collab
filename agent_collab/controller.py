@@ -64,6 +64,8 @@ def digest_token(token):
 # 与节点共用同一版本身份读取（§11.3）：versions/<v>/release-manifest.json，开发运行时回退到包版本。
 RELEASE = release_info()
 ARCHIVE_EVENT_LIMIT = 1000  # 每个节点可写入“恢复前 attempt”归档事件的总数上限
+# 心跳只刷新最近联系时间时，每个节点最多这么久写一条 node.updated（其余心跳原地更新记录，不写事件）。
+NODE_EVENT_INTERVAL_S = 60
 
 
 def merge_health(old, new):
@@ -138,6 +140,7 @@ class App:
         self.blobs = BlobStore(self.data_dir, self.config['max_blob_bytes'])
         self.store = Store(self.data_dir)
         self.request = (('admin', None), '', '')  # 当前请求的 (identity, method, route)，供请求来源记录使用
+        self.node_events = {}  # node_id → 最近一次因心跳写 node.updated 的时间（进程内；重启后第一次心跳照常写）
         token_file = self.data_dir / 'admin.token'
         try:
             fd = os.open(str(token_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -392,7 +395,14 @@ class App:
             raise ValueError('unsafe static path')
         root = Path(__file__).parent / 'static'
         index = root / 'index.html'
-        if not index.is_file() or not self.config['web_console']:
+        if not self.config['web_console']:
+            # 运维有意停用了浏览器控制台：说明入口在哪里，与“启用了但没装页面”区分开。
+            if path == '/':
+                return Response(200, [('Content-Type', 'text/plain; charset=utf-8')],
+                                'agent-collab controller：浏览器控制台已停用。请使用桌面端或 agent-collab 命令行'
+                                '（agent-collab client pair）连接这个地址。\n'.encode('utf-8'))
+            raise APIError('not_found', 'web console is disabled')
+        if not index.is_file():
             if path == '/':
                 return Response(200, [('Content-Type', 'text/plain; charset=utf-8')], b'agent-collab controller; UI is not installed.\n')
             raise APIError('not_found', 'static UI not installed')
@@ -1873,8 +1883,16 @@ class App:
         if type(data.get('authority_generation')) is not int or not isinstance(data.get('attempts'), list):
             raise ValueError('invalid heartbeat')
         reconcile = data['authority_generation'] != self.meta()['authority_generation']
-        node = self.change('node', node, now, status='online', last_seen_at=d.timestamp(now),
-                           auth_health=merge_health(node['auth_health'], data.get('auth_health', {})))
+        health = merge_health(node['auth_health'], data.get('auth_health', {}))
+        if node['status'] == 'online' and node['auth_health'] == health and \
+                now - self.node_events.get(node_id, float('-inf')) < NODE_EVENT_INTERVAL_S:
+            # 只是又一次心跳：原地刷新最近联系时间，不推进 version、不写事件。在线判断、租约与超时照常按 last_seen_at。
+            # 每次心跳一条完整节点快照（含模型目录）会让事件表与备份持续膨胀；状态与认证的变化走下面的分支立即写。
+            node = dict(node, last_seen_at=d.timestamp(now))
+            self.store.put('node', node_id, node)
+        else:
+            node = self.change('node', node, now, status='online', last_seen_at=d.timestamp(now), auth_health=health)
+            self.node_events[node_id] = now
         renewed, revoked, cancel = [], [], []
         seen = set()
         for entry in data['attempts']:
@@ -2260,6 +2278,8 @@ class App:
             from .backup import summary as backup_summary
             jobs = self.store.all('job')
             return response({'counts': {s: sum(j['status'] == s for j in jobs) for s in p.JOB_STATUSES},
+                             # 运行状态之外的待办：每个工作包最新修订的结论（与 CLI 摘要的 outcome 同一判定）。
+                             'outcomes': d.outcome_counts(jobs),
                              'nodes': self.active_nodes(), 'durable_checkpoint_at': max((j['durable_checkpoint_at'] for j in jobs if j['durable_checkpoint_at']), default=None),
                              'controller': dict(self.meta(), version=RELEASE['version'], git_commit=RELEASE['git_commit'],
                                                 metadata_version=self.meta()['version'], features=list(p.FEATURES),
@@ -2309,9 +2329,12 @@ class App:
         return value
 
     def min_seq(self):
+        """能完整重放的第一条序号。选择性裁剪（prune_redundant_node_events）会在序号中间留下空洞，
+        所以它不低于记录的重放水位加一：游标落在水位之前就要重取快照，只看 MIN(seq) 不够。"""
+        floor = self.store.get('meta', 'events', {}).get('complete_after', 0) + 1
         minimum = self.store.db.execute('SELECT MIN(seq) FROM events').fetchone()[0]
         if minimum is not None:
-            return minimum
+            return max(minimum, floor)
         last = self.store.db.execute("SELECT seq FROM sqlite_sequence WHERE name='events'").fetchone()
         return (last[0] + 1) if last else 1
 
@@ -3285,7 +3308,10 @@ def main(argv=None):
             command.add_argument('--from', dest='source', required=True)
             command.add_argument('--identity', choices=('carry-forward', 'keep', 'revoke-all'))
         elif name == 'prune-events':
-            command.add_argument('--keep', type=int, required=True)
+            mode = command.add_mutually_exclusive_group(required=True)
+            mode.add_argument('--keep', type=int, help='按序号只保留最新 N 条，不分事件类型（会删掉任务与审计历史）')
+            # 只删除只刷新了最近联系时间的节点快照，并记录重放水位；需要 controller 已停止。
+            mode.add_argument('--redundant-node-updates', action='store_true')
         elif name == 'barrier':
             # 切换屏障：见 barrier()。只在 controller 停止后运行。
             command.add_argument('--request-id', required=True)
@@ -3319,11 +3345,19 @@ def main(argv=None):
                     store.close()
                 print(json.dumps({'code': code, 'scopes': scopes, 'ttl_s': args.ttl}))
             elif args.command == 'prune-events':
-                store = Store(data_dir)
-                try:
-                    store.prune_events(args.keep)
-                finally:
-                    store.close()
+                if args.redundant_node_updates:
+                    with ControllerLock(data_dir):  # 运行中的 controller 持有这把锁：必须先停止它
+                        store = Store(data_dir)
+                        try:
+                            print(json.dumps(store.prune_redundant_node_events()))
+                        finally:
+                            store.close()
+                else:
+                    store = Store(data_dir)
+                    try:
+                        store.prune_events(args.keep)
+                    finally:
+                        store.close()
             else:
                 p.check_node_id(args.node_id)
                 if args.ttl <= 0:

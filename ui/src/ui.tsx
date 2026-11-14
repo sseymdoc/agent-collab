@@ -44,7 +44,7 @@ export function when(iso?: string | null) {
 
 const LABEL: Record<string, string> = {
   queued: '排队', waiting_capability: '等待能力', running: '执行中', recovering: '恢复中', waiting_reconcile: '待对账',
-  cancel_requested: '已请求取消', cancelled: '已取消', completed: '已完成待验收', failed: '失败',
+  cancel_requested: '已请求取消', cancelled: '已取消', completed: '已完成', failed: '失败',
   assigned: '已分配', leased: '已领取', succeeded: '成功', lost: '失联', superseded: '已被取代',
   unprotected: '未启用自动恢复', preparing: '准备中（未受保护）', protected: '已受保护',
   unverified: '未验收', passed: '验收通过', rework: '需返工', blocked: '受阻',

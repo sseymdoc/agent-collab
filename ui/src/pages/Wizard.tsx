@@ -14,13 +14,14 @@ export const SESSION_NOTE = '本机服务在你登录系统后运行，注销后
 export const installed = (i: any) => !!i && (typeof i.installed === 'boolean' ? i.installed : !!i.version)
 
 // 构建身份（ADR 0004）：formal 正式版、candidate 开发候选版、internal-test 内部测试版、dev 开发构建。
+// 正式身份带预发布版本号（X.Y.Z-rc.N）的是正式根下的发行候选，不是稳定版；平台签名另由安装包本身体现。
 const KIND_MARK: Record<string, string> = { candidate: ' · 开发候选版', dev: ' · 开发构建（不对外分发）' }
 
 export function BuildMark({ info }: { info: any }) {
   if (!info) return null
   return <><p className="muted"><small>桌面端 {info.version}{info.commit ? ' · ' + String(info.commit).slice(0, 7) : ''} · {info.platform}/{info.arch}
     {info.instance ? ' · 实例 ' + info.instance : ''}
-    {info.automation || info.kind === 'internal-test' ? <b className="warn-text"> · 内部测试版（含自动化钩子，不对外分发）</b> : KIND_MARK[info.kind] ?? (info.candidate ? ' · 开发候选版' : '')}</small></p>
+    {info.automation || info.kind === 'internal-test' ? <b className="warn-text"> · 内部测试版（含自动化钩子，不对外分发）</b> : info.kind === 'formal' && String(info.version).includes('-') ? ' · 发行候选版（预发布）' : KIND_MARK[info.kind] ?? (info.candidate ? ' · 开发候选版' : '')}</small></p>
     {info.payload === false && <p className="warn-text"><small>随包组件核对没有通过：{info.payload_error}。项目目录与本机部署功能已停用，请重新运行安装程序修复。</small></p>}</>
 }
 

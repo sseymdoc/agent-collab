@@ -51,7 +51,6 @@ import uuid
 
 DEFAULT_URL = os.environ.get('AGENT_COLLAB_URL', 'http://127.0.0.1:18669')
 LOOPBACK = ('127.0.0.1', 'localhost', '::1')
-RESTING = ('completed', 'failed', 'cancelled', 'waiting_reconcile')  # 不再自行变化、等人或等下一步的状态
 ENDED = ('completed', 'failed', 'cancelled')
 
 
@@ -464,23 +463,8 @@ def summarize(conn, job):
             report = next((x.get('report') for x in reversed(c.get('attempts', [])) if x.get('report')), None) or {}
             rounds.append({'job_id': c['job_id'], 'status': c['status'], 'decision': report.get('decision'), 'notes': report.get('notes'),
                            'node_id': next((x['node_id'] for x in reversed(c.get('attempts', []))), None)})
-    acceptance = job['acceptance']['status']
-    if job['status'] not in RESTING:
-        outcome = 'running'
-    elif any(r['status'] not in ENDED for r in rounds):
-        # 失败或待对账也可能触发协调回合；回合结束前它可能新建修复修订，不能先判为需人工处理。
-        outcome = 'awaiting_coordination'
-    elif job['status'] != 'completed':
-        outcome = 'needs_attention'
-    elif acceptance in ('rework', 'blocked'):
-        outcome = 'needs_attention'
-    elif job['contract']['publish']['requires_acceptance'] and acceptance != 'passed':
-        outcome = 'awaiting_acceptance'
-    elif not job['delivery_version']:
-        # 执行结束不等于成果已发布：手动发布等调用方，自动发布等执行节点完成发布。
-        outcome = 'ready_to_publish' if job['contract']['publish']['mode'] == 'manual' else 'awaiting_publication'
-    else:
-        outcome = 'done'
+    from .domain import job_outcome  # 与总览的待办计数同一判定
+    outcome = job_outcome(job, any(r['status'] not in ENDED for r in rounds))
     return {'job_id': job['job_id'], 'work_package_id': job['work_package_id'], 'title': job['title'],
             'status': job['status'], 'status_reason': job['status_reason'], 'outcome': outcome,
             'node_id': current.get('node_id'), 'model_policy': job.get('model_policy'),

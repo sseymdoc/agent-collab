@@ -146,6 +146,18 @@ class DesktopCopyTests(unittest.TestCase):
                 with self.subTest(change=change), self.assertRaises(SystemExit):
                     build.fragments(dist)
 
+    def test_formal_versions_are_final_or_release_candidates(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        for version in ('0.3.0', '0.3.0-rc.1', '10.20.30-rc.12'):
+            self.assertTrue(build.version_fits('formal', version), version)
+        for version in ('0.3.0-dev.22', '0.3.0-rc1', '0.3.0-rc.', '0.3.0-rc.1.2', '0.3', '0.3.0-beta.1', 'v0.3.0'):
+            self.assertFalse(build.version_fits('formal', version), version)
+        self.assertTrue(build.version_fits('candidate', '0.3.0-dev.22'))
+        self.assertFalse(build.version_fits('candidate', '0.3.0'))
+
     def test_windows_tauri_command_keeps_backslashes_and_drops_outer_quotes(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('build_desktop', legacy.ROOT / 'scripts/build_desktop.py')

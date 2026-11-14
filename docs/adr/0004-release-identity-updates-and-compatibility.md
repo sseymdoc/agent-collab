@@ -16,10 +16,10 @@ M2 的候选包只有“开发候选版 / 内部测试版”两种身份，两�
    | `candidate` 开发候选版 | `org.agent-collab.desktop.cand` | `cand` | 18769 | `agent-collab-cand` | `stable`（缺省）、`preview`，指向测试更新地址 | 测试公钥 |
    | `internal-test` 内部测试版 | `org.agent-collab.desktop.cand-internal-test` | `itest` | 18779 | `agent-collab-itest` | `internal-test`，只指向测试更新地址 | 测试公钥 |
 
-   - 版本号：正式版不带预发布后缀；候选与内部测试版必须带。`automation` feature 只允许在内部测试版。
+   - 版本号：正式版为 `X.Y.Z`，或正式根下的发行候选 `X.Y.Z-rc.N`（只进 `preview` 通道，不进 `stable`）；候选与内部测试版必须带预发布后缀。`automation` feature 只允许在内部测试版。
    - 内部测试版与候选版的实例、端口、服务名、凭据服务名都不同，可以在同一台机器上先后或同时存在，不争抢同一份本机部署。
    - 正式版的实例为空，与命令行安装的缺省前缀是同一份：桌面端在那里发现已有安装（包括现有的个人部署）时只报告，不接管、不替换身份；候选凭据不会被正式版读取（服务名不同）。导入、重新配对与接管既有部署都要用户在界面里明确操作。
-   - 更新通道与公钥在构建时写进二进制，页面只能在本身份允许的通道之间切换。正式身份的构建如果带测试公钥、测试地址、`automation`、预发布版本号或不安全传输开关，流水线直接失败（`scripts/release_gate.py`）。
+   - 更新通道与公钥在构建时写进二进制，页面只能在本身份允许的通道之间切换。正式身份的构建如果带测试公钥、测试地址、`automation`、`-rc.N` 以外的预发布版本号、进 `stable` 的发行候选或不安全传输开关，流水线直接失败（`scripts/release_gate.py`）。
 
 2. **一份产品发行清单描述一次发行的全部组件**（`product-manifest.json`，流水线从最终产物生成）：发行 ID（等于桌面版本号）、身份与通道、源提交与干净状态、构建时间；各平台的最低系统、产物文件名/大小/SHA-256、签名与公证状态；组件版本与摘要（桌面外壳、随包载荷、后台发行包、Python 运行时）；协议版本与 controller features、数据库 schema 范围与指纹；兼容范围、升级顺序与可回退范围；cargo features 与第三方许可文件。GUI 版本（semver，`0.3.0-dev.1`）与后台版本（PEP 440，`0.3.0.dev1`）各用各的写法，清单写明对应关系。清单由更新验签同一把私钥签名（`product-manifest.json.sig`）。
 

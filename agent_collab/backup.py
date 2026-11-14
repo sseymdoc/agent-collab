@@ -180,6 +180,38 @@ def inspect_backup(source, work_dir=None):
         return info
 
 
+def describe_backup(source):
+    """列表用的轻量核对：读清单、核对数据库与 blob 文件在且大小对，以只读不可变方式读 schema、代次与事件序号。
+
+    不复制、不重算摘要、不跑 integrity_check：controller 的每个请求都在同一把锁里处理，几百 MB 的备份逐个深度核对
+    会让节点心跳排队超时。完整核对用 verify（结果保存为 last_verification）、恢复预览或 inspect。"""
+    source = Path(source)
+    try:
+        manifest = payload_manifest(source)
+        database = source / manifest['database']
+        if database.is_symlink() or not database.is_file():
+            raise BackupError('backup_object_missing', 'missing backup database', object=database.name)
+        blobs = BlobStore(source)
+        for entry in manifest['blobs']:
+            digest = p.check_sha256(entry['sha256'])
+            if not blobs.exists(digest, entry['size']):
+                raise BackupError('backup_object_missing', 'missing or resized backup blob: ' + digest, sha256=digest)
+        db = sqlite3.connect(database.resolve().as_uri() + '?mode=ro&immutable=1', uri=True)
+        try:
+            schema = schema_info(db)
+            meta = json.loads(db.execute("SELECT data FROM records WHERE kind='meta' AND id='controller'").fetchone()[0])
+            event_seq = db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]
+        finally:
+            db.close()
+    except BackupError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, IndexError, sqlite3.DatabaseError) as exc:
+        raise BackupError('backup_payload_invalid', 'invalid backup payload: ' + str(exc)) from exc
+    return dict(created_at=manifest['created_at'], schema=schema, db_sha256=manifest['db_sha256'],
+                blob_count=len(manifest['blobs']), blob_bytes=sum(entry['size'] for entry in manifest['blobs']),
+                authority_generation=meta['authority_generation'], event_seq=event_seq)
+
+
 class BackupLock(ControllerLock):
     """Reuse the controller's nonblocking flock / Windows byte-range lock."""
     def __init__(self, directory):

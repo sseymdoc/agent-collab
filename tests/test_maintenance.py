@@ -130,6 +130,57 @@ class MaintenanceTests(ClientCase):
         self.assertFalse(self.app.store.all('node_token'))
         self.assertFalse(self.app.store.all('client_token'))
 
+    def test_listing_is_light_and_deep_checks_stay_in_verify(self):
+        # 每个请求都在 controller 的同一把锁里处理：列表不能逐个复制、重算摘要，否则几百 MB 的备份会让心跳排队超时。
+        self.node()
+        ident, path = self.create_backup()
+        before = contents(path)
+        with mock.patch.object(m, 'inspect_backup', side_effect=AssertionError('list must not deep-check')), \
+                mock.patch('agent_collab.backup.file_hash', side_effect=AssertionError('list must not hash')):
+            listed = self.call('GET', '/maintenance/backups')['backups']
+        item = next(x for x in listed if x['id'] == ident)
+        self.assertTrue(item['valid'])
+        self.assertEqual(item['authority_generation'], 1)
+        self.assertTrue(item['schema']['fingerprint'] and item['event_seq'] and item['db_sha256'])
+        self.assertEqual(contents(path), before)  # 只读不可变打开：原目录没有新增或改动文件
+        # 同样大小的内容损坏只有完整核对能发现：列表仍按清单报告，verify 报错并记入 last_verification。
+        database = next(path.glob('controller*.db'))
+        data = bytearray(database.read_bytes())
+        data[-1] ^= 0xFF
+        database.write_bytes(bytes(data))
+        verified = self.call('POST', '/maintenance/backups/' + ident + '/verify', {'request_id': uid()})['maintenance_op']
+        self.assertEqual(verified['status'], 'failed')
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertTrue(item['valid'])
+        self.assertFalse(item['last_verification']['ok'])
+        # 缺文件仍在列表里报出来。
+        database.unlink()
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertFalse(item['valid'])
+        self.assertEqual(item['error']['code'], 'backup_object_missing')
+
+    def test_high_water_keeps_restored_generation_above_every_online_generation(self):
+        # 备份在代次 1；之后线上已经用过 3（例如一次恢复、一次屏障），当前库又丢了：不带下限只会得到 2，复用线上出现过的代次。
+        self.node()
+        _, source = self.create_backup()
+        self.close_app()
+        (self.temp / 'data' / 'controller.db').write_bytes(b'not sqlite')
+        self.assertEqual(m.restore_offline(self.temp / 'data', source, identity='revoke-all', dry_run=True, clock=self.clock)['authority_generation'], 2)
+        for bad in (-1, '3', True):
+            with self.assertRaises(ValueError):
+                m.restore_offline(self.temp / 'data', source, identity='revoke-all', high_water=bad, clock=self.clock)
+        preview = m.restore_offline(self.temp / 'data', source, identity='revoke-all', dry_run=True, high_water=3, clock=self.clock)
+        self.assertEqual(preview['authority_generation'], 4)
+        result = m.restore_offline(self.temp / 'data', source, identity='revoke-all', high_water=3, clock=self.clock)
+        self.assertEqual((result['authority_generation'], result['high_water']), (4, 3))
+        self.reopen()
+        self.assertEqual(self.app.meta()['authority_generation'], 4)
+        self.assertTrue(self.app.meta()['dispatch_paused'])
+        # 下限低于当前库与备份时不起作用，不会让代次倒退。
+        _, again = self.create_backup()
+        self.close_app()
+        self.assertEqual(m.restore_offline(self.temp / 'data', again, dry_run=True, high_water=1, clock=self.clock)['authority_generation'], 5)
+
     def test_inspect_verify_restore_archive_preserve_every_source_file(self):
         node = self.node()
         self.job()
