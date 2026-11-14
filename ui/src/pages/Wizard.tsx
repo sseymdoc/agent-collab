@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
+import { api } from '../api'
+import { session } from '../session'
 import { invoke } from '../transport'
-import { Badge, Json, Section, errText, show } from '../ui'
+import { Badge, Json, Section, errText, show, when } from '../ui'
 
 // 首次使用与本机部署（仅桌面端，docs/desktop.md “本机部署”）。本机服务由操作系统托管，与界面进程无关。
 // local_discover 的 install 是安装器 `install --discover` 的输出；下面只按常见字段展示，完整内容在“原始信息”里。
@@ -11,11 +13,15 @@ export const SESSION_NOTE = '本机服务在你登录系统后运行，注销后
 // 是否已有安装：discover 输出没有明确字段时按有无版本判断。
 export const installed = (i: any) => !!i && (typeof i.installed === 'boolean' ? i.installed : !!i.version)
 
+// 构建身份（ADR 0004）：formal 正式版、candidate 开发候选版、internal-test 内部测试版、dev 开发构建。
+const KIND_MARK: Record<string, string> = { candidate: ' · 开发候选版', dev: ' · 开发构建（不对外分发）' }
+
 export function BuildMark({ info }: { info: any }) {
   if (!info) return null
-  return <p className="muted"><small>桌面端 {info.version}{info.commit ? ' · ' + String(info.commit).slice(0, 7) : ''} · {info.platform}/{info.arch}
+  return <><p className="muted"><small>桌面端 {info.version}{info.commit ? ' · ' + String(info.commit).slice(0, 7) : ''} · {info.platform}/{info.arch}
     {info.instance ? ' · 实例 ' + info.instance : ''}
-    {info.automation ? <b className="warn-text"> · 内部测试版（含自动化钩子，不对外分发）</b> : info.candidate ? ' · 开发候选版（未签名）' : ''}</small></p>
+    {info.automation || info.kind === 'internal-test' ? <b className="warn-text"> · 内部测试版（含自动化钩子，不对外分发）</b> : KIND_MARK[info.kind] ?? (info.candidate ? ' · 开发候选版' : '')}</small></p>
+    {info.payload === false && <p className="warn-text"><small>随包组件核对没有通过：{info.payload_error}。项目目录与本机部署功能已停用，请重新运行安装程序修复。</small></p>}</>
 }
 
 const KIND: Record<string, string> = { controller: 'controller', worker: '节点' }
@@ -119,13 +125,15 @@ export function LocalService() {
   const [st, setSt] = useState<any>(null)
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // 卸载成功后本机部署不再存在、面板随之隐藏：卸载结果（状态目录保留在哪里）单独留在原处，不随面板消失。
+  const [removed, setRemoved] = useState<any>(null)
   const act = async (action: string) => {
     setBusy(true); setErr(null)
     try { setSt(await invoke('local_service', { action })) } catch (e) { setErr(errText(e)) } finally { setBusy(false) }
     if (action !== 'status') invoke('local_discover').then(setD, () => {})
   }
   useEffect(() => { invoke('local_discover').then(x => { setD(x); if (installed(x?.install)) void act('status') }, () => {}) }, []) // eslint-disable-line
-  if (!installed(d?.install)) return null
+  if (!installed(d?.install)) return removed ? <Section title="本机服务"><UninstallResult res={removed} /></Section> : null
   return <Section title="本机服务" extra={<span className="muted">这台机器上本实例的后台服务；关闭窗口不影响它们</span>}>
     <InstallInfo install={d.install} />
     {st && <dl className="kv">
@@ -144,5 +152,77 @@ export function LocalService() {
       }}>停止</button>
       {busy && <small className="muted">处理中…</small>}
     </div>
+    {/worker|all-in-one/.test(String(d.install.role)) && d.install.identity?.paired && <NodeBindings />}
+    <Uninstall onDone={res => { setRemoved(res); invoke('local_discover').then(setD, () => {}) }} />
   </Section>
+}
+
+// 节点本机的项目目录授权（docs/protocol.md §13.10）：只在这台机器上、经系统对话框选目录。controller 只看到项目 ID 与目录名，
+// 之后可以请这台节点把该项目已发布的成果写回这个目录（三方比较，冲突缺省不写）。没有图形界面的节点用
+// `agent-collab agent project-bind`。
+export function NodeBindings() {
+  const [b, setB] = useState<any[] | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [pick, setPick] = useState('')
+  const [projects, setProjects] = useState<any[]>([])
+  // 读取中不授权：否则迟到的旧列表会覆盖授权后的列表。读取失败可以重读。
+  const [loading, setLoading] = useState(true)
+  const load = () => { setLoading(true); setErr(null); return invoke('node_bindings').then(r => setB(r.bindings ?? []), e => setErr(errText(e))).finally(() => setLoading(false)) }
+  useEffect(() => {
+    void load()
+    // 已连接 controller 时列出它的项目供选择；节点所属的 controller 可能不是当前连接的那个，所以也可以直接填项目 ID。
+    if (session()) api.projects().then(r => setProjects((r.projects ?? []).filter((p: any) => !p.archived_at)), () => {})
+  }, [])
+  const act = async (f: () => Promise<any>) => {
+    setBusy(true); setErr(null)
+    try { const r = await f(); if (r && !r.cancelled) setB(r.bindings ?? []) } catch (e) { setErr(errText(e)) } finally { setBusy(false) }
+  }
+  const valid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(pick)
+  return <div className="card inner">
+    <h3>项目目录授权（本机节点）</h3>
+    <p className="muted">授权后，controller 可以请这台节点把该项目已发布的成果写回所选目录；有冲突的文件缺省不写。撤销只删除授权，不动目录。</p>
+    {b && !b.length && <p className="muted">还没有授权任何目录。</p>}
+    {b && b.length > 0 && <table className="grid"><thead><tr><th>项目</th><th>目录</th><th>授权时间</th><th></th></tr></thead><tbody>
+      {b.map(x => <tr key={x.project_id}>
+        <td>{projects.find(p => p.project_id === x.project_id)?.name ?? <code>{x.project_id}</code>}</td>
+        <td><code>{x.path}</code></td><td>{when(x.bound_at)}</td>
+        <td><button className="danger" disabled={busy} onClick={() => {
+          if (window.confirm('撤销这个项目在本机节点上的目录授权？目录里的文件不会被改动。')) void act(() => invoke('node_unbind', { project_id: x.project_id }))
+        }}>撤销</button></td>
+      </tr>)}
+    </tbody></table>}
+    <div className="actions">
+      {projects.length > 0 && <select value={projects.some(p => p.project_id === pick) ? pick : ''} onChange={e => setPick(e.target.value)}>
+        <option value="">选择项目…</option>{projects.map(p => <option key={p.project_id} value={p.project_id}>{p.name}</option>)}</select>}
+      <input placeholder="或填写项目 ID" value={pick} onChange={e => setPick(e.target.value.trim().toLowerCase())} size={38} />
+      {b === null && !loading && <button disabled={busy} onClick={() => void load()}>重新读取</button>}
+      <button disabled={busy || !valid || loading} onClick={() => void act(() => invoke('node_bind', { project_id: pick }))}>选择文件夹并授权</button>
+    </div>
+    {err && <p className="err">{err}</p>}
+  </div>
+}
+
+// 卸载本机后台：停用并移除本实例的服务与启动项、启动器与代码；状态目录（数据库、节点身份、备份、日志）保留。
+function Uninstall({ onDone }: { onDone: (res: any) => void }) {
+  const [res, setRes] = useState<any>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  return <details><summary>卸载本机后台</summary>
+    <p className="muted">卸载桌面端不会自动移除本机后台服务；要移除它们在这里操作（Windows 卸载程序也会询问）。只移除本实例的服务、启动项与代码，
+      不动用户项目、官方 CLI 的配置与登录、共享缓存和其他实例。状态目录保留，之后重新安装时身份与数据沿用；要彻底删除，卸载后自行删除状态目录。</p>
+    <div className="actions"><button className="danger" disabled={busy} onClick={async () => {
+      if (!window.confirm('卸载本机后台服务？正在执行的任务会中断，节点会离线。状态目录保留。')) return
+      setBusy(true); setErr(null)
+      let r: any = null
+      try { r = await invoke('local_uninstall', { purge_code: true }); setRes(r) } catch (e) { setErr(errText(e)) } finally { setBusy(false); onDone(r) }
+    }}>卸载本机后台（保留数据）</button>{busy && <small className="muted">处理中…</small>}</div>
+    {err && <p className="err">{err}</p>}
+    {res && <UninstallResult res={res} />}
+  </details>
+}
+
+function UninstallResult({ res }: { res: any }) {
+  return <p className={res.ok ? 'ok' : 'err'}>{res.ok ? '已卸载本机后台服务、启动项与代码。状态目录（数据库、节点身份、备份与日志）保留在 ' : '没有卸载成功，状态目录 '}<code>{res.kept_state_dir}</code>
+    {res.ok ? '；要彻底删除，自行删除这个目录。' : '；安装器输出：' + res.output}</p>
 }

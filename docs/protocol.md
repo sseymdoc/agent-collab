@@ -363,11 +363,11 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 
 | scope | 允许 |
 | --- | --- |
-| `read` | 除 `GET /clients`、`GET /doctor`（需要 `maintain`）外的全部 GET：任务、事件与事件流、检查点与文件清单、blob、节点、总览、调度解释、协调租约、模型设置与目录、模板、输入基线 |
+| `read` | 除 `GET /clients`、`GET /doctor`、`/maintenance/*`、`GET /settings/backups`（需要 `maintain`）外的全部 GET：任务、事件与事件流、检查点与文件清单、blob、节点、总览、调度解释、协调租约、模型设置与目录、模板、输入基线 |
 | `tasks` | 创建任务、契约草拟、取消、重试、验收、发布、回写结果、协调租约取得与释放、上传 blob、登记输入基线 |
 | `settings` | 修改模型设置 |
 | `devices` | 节点排空与迁移 |
-| `maintain` | 暂停与恢复派单、doctor、客户端列表与撤销、签发客户端配对码、接管协调租约 |
+| `maintain` | 暂停与恢复派单、doctor、客户端列表与撤销、签发客户端配对码、接管协调租约、§14 备份维护与预检、备份保留设置 |
 
 角色是 scope 的固定组合：`owner` 为全部五项，`operator` 为 `read`+`tasks`，`viewer` 为 `read`。权限在每个路由上由 controller 检查；缺少权限返回 403 `forbidden`，`details.required_scope` 给出所需权限。管理令牌与浏览器会话等同于全部权限。节点令牌不能调用客户端端点。
 
@@ -448,6 +448,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - `GET /events?before=<seq>&limit=<n>`（read）→ `{"events": [...], "min_seq"}`：序号小于 `before` 的最近 `limit` 条全局事件，按序号升序；`before=0` 表示从最新一条开始。用于从新到旧翻看活动。不带 `before` 时仍是 `after=<seq>` 的向后续读。
 - `GET /jobs/{id}/events?before=<seq>&limit=<n>`（read）→ `{"events": [...]}`：该 job 序号小于 `before` 的事件，按序号升序，最多 `limit` 条（1–1000，缺省 200）。
 - `GET /nodes` 的每个节点带 `attempts`：该节点上有效（assigned、leased、running）的 attempt，`[{"attempt_id", "job_id", "title", "status", "epoch", "lease_expires_at", "harness", "model", "effort", "coordinates"}]`；`coordinates` 为 true 表示它是受管协调回合。
+- `GET /nodes`（包括 `retired=1`）的每个节点带整数 `pending_writebacks`：该节点状态为 `requested/received` 的 `project_apply/project_recover` 操作，加上 `target_node_id` 为该节点且状态为 `started` 的应用，按 `application_id` 去重；再加上 `target_node_id` 为该节点、仍有待写入条目（`pending`）的契约自动回写，每个任务算一项。同一应用的写入与恢复操作只算一项；没有应用 ID 的操作各算一项。除上述两类以外的 `node_op` 种类、已结束操作、本机应用不计入。
 - `GET /checkpoints/{id}/files`（read）→ `{"checkpoint_id", "manifest_sha256", "files": [{"path", "sha256", "size", "executable"}]}`；文件内容用 `GET /blobs/<sha256>` 读取。
 
 ## 13. 项目、输入与成果应用、节点管理（向后兼容；旧字段语义不变）
@@ -570,7 +571,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - 任意模式下都可以提交验收运行；job 带 `acceptance_run`，`GET /jobs?acceptance_run=1` 列出它们。
 - 备份清单（`backup-manifest.json`）带 `event_seq`：快照里最后一条事件的序号。
 - `GET /activity?after=<seq>`（read）→ `{"after", "last_seq", "jobs": [{"job_id", "title", "acceptance_run", "coordinates", "project_id"}], "ordinary_jobs", "acceptance_jobs", "counts", "disposable"}`：序号大于 `after` 的事件里受理的任务与各类事实的数量（确认的检查点、发布、验收、下载、基线、项目、节点写回 `integrated`、已写入或结果未知的应用 `applications_written`、其间开始且仍没有最终结果的应用 `applications_unsettled` 等）。协调回合随它协调的任务归类。`disposable` 为 true 表示其间没有普通任务，也没有任何写回、已写入或结果未定的应用。
-- 切换屏障：`agent-collab controller barrier --data-dir D --request-id <UUID> --reason R`，在已停止的 controller 上运行。要求派单已暂停、提交闸门不是 `open`。它把恢复代次加一并撤销此前签发的全部执行权（与 `restore` 相同的处理，但数据不回退）：attempt 的租约令牌作废、进行中的 attempt 记为失联、未结束的任务停在 `waiting_reconcile`（`stale_generation`）、协调租约失效、节点下次心跳被要求对账；尚未被节点领取（`requested`）的管理操作记 `failed`（`error: stale_generation`；从备份恢复只作废通用操作，不作废项目写回与恢复，因为备份之后节点可能已经执行过它们）；其中未领取的 `project_apply` 对应的远端写回记 `failed`（`reason: stale_generation`，`written` 为空），未领取的 `project_recover` 不改变应用记录（仍为 `started`，可以再次 recover）；已领取的照常对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果。普通的停止再启动保留恢复代次、租约与协调租约。
+- 切换屏障：`agent-collab controller barrier --data-dir D --request-id <UUID> --reason R`，在已停止的 controller 上运行。要求派单已暂停、提交闸门不是 `open`。它把恢复代次加一并撤销此前签发的全部执行权（与 `restore` 相同的处理，但数据不回退）：attempt 的租约令牌作废、进行中的 attempt 记为失联、未结束的任务停在 `waiting_reconcile`（`stale_generation`）、协调租约失效、节点下次心跳被要求对账；尚未被节点领取（`requested`）的管理操作记 `failed`（`error: stale_generation`；从备份恢复的处理不同：快照里未结束的节点操作，包括项目写回与恢复，都记为 `timed_out` 而不重新下发，写回与恢复的应用记录保留为待确认，见 §14.2）；其中未领取的 `project_apply` 对应的远端写回记 `failed`（`reason: stale_generation`，`written` 为空），未领取的 `project_recover` 不改变应用记录（仍为 `started`，可以再次 recover）；已领取的照常对账。节点凭据、客户端凭据、管理令牌与已结束任务的历史不变。写 `controller.barrier` 事件；同一 `request_id` 重复执行返回第一次的结果。普通的停止再启动保留恢复代次、租约与协调租约。
 
 **13.10 远端项目写回**（`remote_apply` 能力）
 
@@ -585,7 +586,7 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
   - `POST /projects/{id}/applications/{application_id}/recover` `{"request_id", "action": "status|resume|rollback|abandon"}` → 201 op（`kind: project_recover`）。只用于远端写回、且记录仍为 `started`，否则 409。`status` 以外的动作在这次应用的 `project_apply` 或另一个非 status 的 `project_recover` 仍为 `requested` 或 `received` 时返回 409（`details.operation_id` 是那项操作）；受理后应用记录带 `recovery_operation_id`，此后只认这项操作的结果，超时后晚到的原应用结果不再结束记录。
   - 校验：任务属于该项目且有已发布检查点（409）；节点在册（404）、未退役（409 `node_retired`）、声明了该项目的绑定（409 `not_bound`）；项目未归档（写回，409 `project_archived`）。
   - 操作参数全部由 controller 按任务记录填写：`project_id`、`job_id`、`checkpoint_id` 与 `manifest_sha256`（已发布检查点）、`base_manifest_sha256`（任务的输入基线，可为 null）、`exclude`（契约的 `workspace.exclude`）；写回另有 `application_id`、`skip_conflicts`，恢复另有 `application_id`、`action`。通用的 `POST /nodes/{id}/operations` 不接受这三种操作（400）。远端写回的结果只由目标节点上报：经 `POST /projects/{id}/applications/{application_id}` 上报远端写回返回 403。
-- 已上报过结果的 `project_apply` 或 `project_recover` 又被下发（controller 没有它的结果，例如从备份恢复回到了领取之前）时，节点不重新执行，确认领取后按本机应用日志补报当时的结果。
+- 已上报过结果的 `project_apply` 或 `action` 不是 `status` 的 `project_recover` 又被下发（controller 没有它的结果）时，节点不重新执行，确认领取后按本机应用日志补报当时的结果；`status` 是只读的现状核对，重放时重新核对一次并返回当前的 `result.report`。
 - 节点执行：只在绑定目录上调用 `agent_collab/project.py` 的 plan、apply、recover（§13.4 的规则：三方比较、冲突缺省不写、`skip_conflicts` 时部分写入、逐文件备份与日志、中断后续写、回滚或按现状结束）；应用日志与备份在节点数据目录的 `projects/` 里。manifest 与成果内容用节点令牌经 `GET /blobs/<sha256>` 取得并核对哈希（节点令牌此前就可读 blob，没有新增权限）。节点同一时间只执行一项这类操作。
 - 结果：
   - `project_plan`：`result` 为计划（`changes`、`summary`、`base_manifest_sha256`、`manifest_sha256`、`root_name`），没有 `root`。过长时截断：冲突排在前面保留，带 `truncated` 与原条数 `counts`。
@@ -600,6 +601,71 @@ attempt 结束或失联后的决策（`domain.recovery_decision`）：
 - 不重复执行：节点在确认领取之前把操作落盘到 `<节点数据目录>/operations/<op_id>.json`，开始执行之前记为 `running`。进程重启后见到 `running` 的操作不再执行：写回类按本机应用日志补报能确定的结果（没有日志说明一个文件都没写，应用记 `failed`、`reason: interrupted_before_write`；日志已有最终结果就补报它；日志停在写入中就报告操作失败，应用保持 `started`）。结果上报失败时留在本地，之后补报；见过的 `op_id` 不再处理。管理请求超时、客户端重试与节点重启都不会让同一次写回写第二次。
 - 已知限制：节点重启后第一次注册不带绑定，紧接着的那次注册带上，其间指向该节点的请求得到 `not_bound`。
 
-## 14. 不在 v1 承诺范围
+## 14. 备份维护、恢复预览与切换预检
+
+所有 `/maintenance/*` 与 `GET/PUT /settings/backups` 都需要 `maintain`；节点凭据不能调用。API 只接受实例内备份 ID，不接受服务器路径；未知请求字段与查询参数拒绝。备份 ID 为 `managed-*` 或安装器的 `upgrade-*`，范围固定为 `<data_dir 的父目录>/backups/`，拒绝链接目录。变更使用 §5 的 `request_id` 幂等机制：原样重放返回同一操作与结果，换内容返回 409；重放仍先验证权限。
+
+**14.1 维护操作与备份**
+
+维护操作同步完成，响应为 `{"maintenance_op": {...}}`，记录保存于数据库：
+
+```json
+{"op_id", "kind": "backup|verify|retention|restore", "status": "running|succeeded|failed",
+ "steps": [{"name", "status"}], "result", "error", "requested_by", "requested_at", "started_at", "finished_at"}
+```
+
+同步请求返回时已为 `succeeded` 或 `failed`；`running` 是执行中的内部状态。业务失败也返回 HTTP 200 的已完成操作并保存幂等回执，调用方必须检查 `status`；参数/权限/版本错误仍返回 4xx。失败操作的重放不再执行，重试须换 request_id。备份的文件载荷与数据库不是跨文件事务；进程被强制终止可能留下没有操作回执的目录，列表会核对它，不能把目录存在视为成功。
+
+| 端点 | 请求 | 结果 |
+| --- | --- | --- |
+| `POST /maintenance/backups` | `{"request_id", "label"?}`；label 至多 200 字符，仅作说明 | 创建 `managed-<UTC时间>-<短ID>` 一致备份，核对后执行保留策略；result 含 `backup_id`、label、`location: instance`、removed |
+| `GET /maintenance/operations/{op_id}` | 无 | 持久保存的 maintenance_op |
+| `GET /maintenance/backups` | 无 | `{"backups": [...]}`：id、kind（managed/upgrade）、created_at、schema（user_version、fingerprint）、db_sha256、blob_count、blob_bytes、authority_generation、event_seq、last_verification、location、valid；损坏备份另带 error |
+| `POST /maintenance/backups/{id}/verify` | `{"request_id"}` | 在临时副本核对数据库 SHA-256、integrity_check、schema、blob 清单与哈希、引用和代次/事件序号；保存最近核对结果 |
+| `GET /maintenance/backups/{id}/archive` | 无 | 确定性 tar 流；`Content-Length` / `X-Archive-Bytes` 为字节数，`X-Content-SHA256` 为归档 SHA-256；只有 manifest、数据库、引用 blobs |
+| `GET /settings/backups` | 无 | `{"settings": {"revision", "keep", "updated_at", "updated_by"}}`；未设置时 revision=0、keep=8 |
+| `PUT /settings/backups` | `{"request_id", "expected_revision", "keep"}`；keep 为正整数 | 保存 revision+1 并执行清理，返回 retention 操作；result 含 settings、removed；版本不符为 409 version_mismatch |
+
+列表实时核对但不写核对历史；只有变更操作记录核对结果。保留清理仅作用于 managed 目录，按创建时间、事件序号排序，绝不删除最新的有效备份（它也是唯一有效备份时仍保护）；不清理 upgrade 或其他目录。keep 是目标数量，保护恢复点优先于份数。核对失败不把损坏目录计为有效恢复点。
+
+位置始终标为 `instance`；HTTP 导出成功不等于文件已保存到实例之外。客户端“另存为”或 CLI `export --to` 成功保存并核对哈希后，才能说明选定位置有副本；是否真正离开实例取决于实际保存位置。归档不含加密层。
+
+**14.2 恢复预览与离线恢复**
+
+`GET /maintenance/restore-preview?backup_id=<id>` 返回 `verdict`、backup、changes、identity、unresolved_applications、history_incomplete、disposable、disposable_scope、file_effects。changes 逐项列出记录类型、ID、新增/改变/删除、变动字段、可公开的前后摘要及恢复影响；包含任务、attempt、检查点、验收、发布、本机与远端应用、项目、模型/协调/备份设置、身份和凭据变化，不输出凭据哈希。
+
+- `safe`：快照核对通过、历史足够完整、只有可丢弃的验收状态；`needs_reconcile`：存在其他事实、待确认应用或信息不足；`blocked`：备份载荷损坏或 schema 不兼容，带具体 error。
+- `disposable` 沿用 `/activity` 的任务与写回统计，不覆盖项目、设置与配对，不能单独当作安全结论。节点和本机项目文件写入不会被撤回；`started/unknown` 应用必须与实际目录和本机 journal 对账。
+- 预览、列表、导出、inspect 都不调用 `backup()`，不处理请求到期、不写 controller 数据库。它们会在临时目录复制并核对备份；原始备份的文件、哈希及旁文件保持不变。
+- 离线恢复须在 controller 停止后、目标主机执行。当前库可读时，默认 `carry-forward`：备份之后撤销或删除的客户端、退役/删除的节点及消失或替换的凭据按拒绝优先结转；缩减过的客户端 scopes 不会扩大。即使给 `keep`，也不能覆盖已知撤销。备份之后新增的客户端、节点及换过的凭据逐项列在 `identity.re_pair`。
+- 当前库不可读或不存在时，必须显式选择 `keep`（保留备份授权，结果警告无法确认备份之后撤销）或 `revoke-all`（撤销全部客户端/节点凭据，重新配对）。不选或选 carry-forward 返回 `identity_required`。所有恢复清除旧浏览器会话及未用配对码；管理令牌仍按目标主机现有文件处理，不随备份迁移。
+- generation 更新为 `max(可读当前库,备份)+1`，执行权全部撤销、派单暂停，提交闸门取备份原值；这是执行 fencing，与授权撤销分别记录。快照中未结束的节点操作（通用操作与项目写回、恢复操作都包括在内）记为 timed_out（`error.code: restore_requires_reconcile`），不重新下发：备份之后节点可能已经执行过它们。项目写回与恢复的应用记录保留为待确认，节点之后上报的结果按 §13.10 的对账规则更新应用；也可以先对账再显式发起 recover。
+- 核对失败返回如 `backup_object_missing`（具体对象）、`backup_database_hash`、`backup_database_corrupt`、`backup_blob_hash`、`backup_references_invalid`、`backup_schema_incompatible`，不替换当前数据库。恢复结果写 `controller.restored` 事件、maintenance_op 记录以及 `<data_dir 的父目录>/restore-results/<op_id>.json`。
+
+公共 CLI：
+
+```sh
+agent-collab maintenance backup [--label 说明] [--request-id UUID]
+agent-collab maintenance backups
+agent-collab maintenance verify <id> [--request-id UUID]
+agent-collab maintenance export <id> --to <本机文件>
+agent-collab maintenance restore-preview <id>
+agent-collab maintenance barrier-preview
+agent-collab maintenance retention [连接参数] set --keep N [--expected-revision N] [--request-id UUID]
+agent-collab maintenance inspect --from <目录或tar>
+agent-collab maintenance restore --data-dir D --from <目录或tar> [--identity carry-forward|keep|revoke-all] [--dry-run]
+```
+
+在线命令沿用 `--profile`、`--url`、`--token-file`、`--ca-file`，输出 JSON。export 在本机临时文件完成下载并核对大小与哈希后再替换目标；核对失败保留原目标。离线命令不用连接参数；dry-run 只给身份与代次计划，不写库、不生成恢复回执，controller 停止与锁由真正恢复时再次核对。它不能替代 restore-preview 的业务影响清点。CLI 成功返回 0、已完成失败操作返回 1、离线参数/核对拒绝返回 2、连接不可用返回 3。
+
+**14.3 屏障待发布成果与弃置**
+
+`GET /maintenance/barrier-preview` 返回 `{"ready", "pending_results", "dispatch_paused", "intake"}`。pending_results 是最新 attempt 成功、有 durable/verified 检查点、最新 durable 检查点尚未发布且未明确弃置的任务；每项包含 job_id、title、attempt_id、checkpoint_id、acceptance、delivery_checkpoint_id、reason。只检查当前成果，不要求历史检查点全部发布。
+
+`POST /jobs/{id}/dismiss`（tasks）接受 `{"request_id", "expected_version", "reason", "checkpoint_id"?}`；reason 非空、至多 1000 字符，沿用 job CAS、幂等及协调租约门禁。只记录最新待发布检查点的弃置；带 `checkpoint_id` 时它必须就是这个检查点，否则 409 `conflict`（确认之后又出现了新的待发布检查点），不删除成果；job 及详情增加 `dismissed_checkpoint_id`、`dismissal`，写 `job.dismissed`。该检查点后续发布返回 409 `checkpoint_dismissed`。新的 attempt/checkpoint 仍需单独处理。
+
+离线 `barrier()` 在持有 controller 锁后，于同一个 `BEGIN IMMEDIATE` 事务里重新检查暂停、提交闸门、pending_results 与代次推进。有未处理成果即拒绝，错误 `barrier_pending_results` 带任务清单；预览不能代替这次权威核对。先发布或明确弃置，之后才可执行屏障。普通更新不调用屏障。
+
+## 15. 不在 v1 承诺范围
 
 活进程迁移、模型内部推理状态、未上传的本地改动、任意 Shell 或模型调用的 exactly-once、控制面高可用。见 README 的保障说明。

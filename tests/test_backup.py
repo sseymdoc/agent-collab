@@ -334,7 +334,7 @@ class ScheduledBackupTests(ControllerCase):
         extracted = self.temp / 'restore-source'
         b.verify_archive(self.dest / (complete['id'] + '.tar'), complete, extracted)
         isolated = self.temp / 'isolated'
-        self.assertEqual(restore(isolated, extracted, self.clock), complete['authority_generation'] + 1)
+        self.assertEqual(restore(isolated, extracted, self.clock, identity='keep'), complete['authority_generation'] + 1)
         self.app.close()
         self.app = App(isolated, clock=self.clock)
         old_admin = self.admin

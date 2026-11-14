@@ -172,6 +172,11 @@ impl Ops {
         Ok(Running { ops: self, op })
     }
 
+    /// 正在进行的项目操作的名称（更新安装前的空闲检查用）。
+    pub fn active(&self) -> Option<&'static str> {
+        self.slot().as_ref().map(|op| op.name)
+    }
+
     /// 给这一代连接上正在进行的操作置取消标志；操作在下一个核对点停下（写入阶段：当前文件写完之后）。
     /// 返回被取消的操作与它当时的阶段；没有操作在进行时返回 None。
     fn cancel(&self, epoch: u64) -> Option<(&'static str, String)> {
@@ -829,7 +834,7 @@ impl<'a> Ctx<'a> {
             StatusCode::NOT_FOUND => return Err(err("not_found", "controller 上没有清单里的这份内容")),
             status => return Err(http_error("下载失败", status, &[])),
         }
-        let mut sink = BlobSink::create(&dir)?;
+        let mut sink = BlobSink::create(&dir, false)?;
         loop {
             let chunk = response.chunk().await;
             self.check()?;

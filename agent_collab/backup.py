@@ -1,5 +1,6 @@
 """Scheduled consistent snapshots and verified, restartable off-instance pulls."""
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -11,12 +12,14 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import uuid
 
 from . import domain as d, protocol as p
 from .blobstore import BlobStore
 from .controller import ControllerLock, backup, database_references, file_hash, sync_directory
+from .store import SCHEMA
 
 
 LOCKED_EXIT = 75
@@ -26,6 +29,155 @@ COMPLETE_KEYS = ('id', 'created_at', 'tar_name', 'tar_sha256', 'tar_bytes',
 
 class BackupBusy(RuntimeError):
     pass
+
+
+class BackupError(ValueError):
+    """Diagnostic rejection shared by maintenance HTTP and offline commands."""
+    def __init__(self, code, message, **details):
+        super().__init__(message)
+        self.code, self.details = code, details
+
+    def result(self):
+        return dict(code=self.code, message=str(self), details=self.details)
+
+
+def schema_info(db):
+    rows = [tuple(row) for row in db.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
+    return dict(user_version=db.execute('PRAGMA user_version').fetchone()[0],
+                fingerprint=p.sha256_bytes(json.dumps(rows, separators=(',', ':')).encode()))
+
+
+def payload_manifest(source):
+    manifest = read_json(Path(source) / 'backup-manifest.json')
+    if (manifest.get('version') != 1 or type(manifest.get('authority_generation')) is not int or
+            manifest['authority_generation'] < 1 or not isinstance(manifest.get('blobs'), list)):
+        raise BackupError('backup_manifest_invalid', 'invalid backup manifest')
+    digest = p.check_sha256(manifest['db_sha256'])
+    if manifest.get('database') not in ('controller.db', 'controller-' + digest + '.db'):
+        raise BackupError('backup_manifest_invalid', 'unsafe snapshot database name')
+    d.seconds(manifest['created_at'])
+    return manifest
+
+
+def payload_paths(manifest):
+    paths = ['backup-manifest.json', manifest['database']]
+    seen = set()
+    for entry in manifest['blobs']:
+        digest, size = p.check_sha256(entry['sha256']), entry['size']
+        if type(size) is not int or size < 0 or digest in seen:
+            raise BackupError('backup_manifest_invalid', 'invalid blob inventory', sha256=digest)
+        seen.add(digest)
+        paths.append('blobs/{}/{}/{}'.format(digest[:2], digest[2:4], digest))
+    return paths
+
+
+def _copy_payload(source, stage):
+    manifest = payload_manifest(source)
+    for name in payload_paths(manifest):
+        path, target = source / name, stage / name
+        if path.is_symlink() or not path.resolve().is_relative_to(source):
+            raise BackupError('backup_unsafe_path', 'link outside backup payload', object=name)
+        if not path.is_file():
+            raise BackupError('backup_object_missing', 'missing backup object: ' + name, object=name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(path), str(target))
+
+
+def _extract_payload(source, stage):
+    names = set()
+    # No extractall: reject links, devices, duplicate entries and arbitrary paths on both platforms.
+    with tarfile.open(str(source), 'r:') as archive:
+        for member in archive:
+            name = member.name
+            allowed = (name in ('backup-manifest.json', 'controller.db') or
+                       re.fullmatch(r'controller-[0-9a-f]{64}\.db', name) or
+                       re.fullmatch(r'blobs/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{64}', name))
+            if not allowed or not member.isfile() or name in names:
+                raise BackupError('backup_unsafe_archive', 'unsafe or duplicate archive member', object=name)
+            names.add(name)
+            target = stage / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(member) as stream, target.open('xb') as output:
+                shutil.copyfileobj(stream, output)
+    expected = set(payload_paths(payload_manifest(stage)))
+    if names != expected:
+        raise BackupError('backup_inventory_mismatch', 'archive inventory differs from manifest',
+                          missing=sorted(expected - names), unexpected=sorted(names - expected))
+
+
+def _verify_payload(stage):
+    manifest = payload_manifest(stage)
+    database = stage / manifest['database']
+    if file_hash(database) != manifest['db_sha256']:
+        raise BackupError('backup_database_hash', 'backup database hash mismatch', object=database.name)
+    blobs, listed = BlobStore(stage), {}
+    for entry in manifest['blobs']:
+        digest, size = entry['sha256'], entry['size']
+        path = blobs.path(digest)
+        if not path.is_file():
+            raise BackupError('backup_object_missing', 'missing backup blob: ' + digest, sha256=digest)
+        if not blobs.exists(digest, size) or file_hash(path) != digest:
+            raise BackupError('backup_blob_hash', 'backup blob hash/size mismatch: ' + digest, sha256=digest)
+        listed[digest] = size
+    db = sqlite3.connect(str(database))
+    try:
+        integrity = [row[0] for row in db.execute('PRAGMA integrity_check')]
+        if integrity != ['ok']:
+            raise BackupError('backup_database_corrupt', 'backup database integrity check failed', integrity=integrity)
+        schema = schema_info(db)
+        expected = sqlite3.connect(':memory:')
+        try:
+            expected.executescript(SCHEMA)
+            if schema != schema_info(expected):
+                raise BackupError('backup_schema_incompatible', 'unsupported backup database schema', schema=schema)
+        finally:
+            expected.close()
+        meta = json.loads(db.execute("SELECT data FROM records WHERE kind='meta' AND id='controller'").fetchone()[0])
+        if meta['authority_generation'] != manifest['authority_generation']:
+            raise BackupError('backup_inventory_mismatch', 'backup authority generation mismatch')
+        try:
+            references = database_references(db, blobs)
+        except (ValueError, OSError) as exc:
+            raise BackupError('backup_references_invalid', str(exc)) from exc
+        if references != listed:
+            raise BackupError('backup_inventory_mismatch', 'backup references differ from blob inventory',
+                              missing=sorted(set(references) - set(listed)), extra=sorted(set(listed) - set(references)))
+        event_seq = db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]
+        if 'event_seq' in manifest and manifest['event_seq'] != event_seq:
+            raise BackupError('backup_inventory_mismatch', 'backup event sequence mismatch')
+        return dict(manifest=manifest, schema=schema, db_sha256=manifest['db_sha256'],
+                    authority_generation=meta['authority_generation'], controller_id=meta['controller_id'],
+                    event_seq=event_seq, blob_count=len(listed), blob_bytes=sum(listed.values()),
+                    created_at=manifest['created_at'], ok=True)
+    except sqlite3.DatabaseError as exc:
+        raise BackupError('backup_database_corrupt', 'backup database is unreadable: ' + str(exc)) from exc
+    finally:
+        db.close()
+
+
+@contextmanager
+def verified_snapshot(source, work_dir=None):
+    """Never open SQLite or create a lock in the original backup directory."""
+    source = Path(source).resolve()
+    with tempfile.TemporaryDirectory(prefix='.verify-', dir=str(work_dir) if work_dir else None) as temporary:
+        stage = Path(temporary)
+        try:
+            if source.is_dir():
+                _copy_payload(source, stage)
+            else:
+                _extract_payload(source, stage)
+            info = _verify_payload(stage)
+        except BackupError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError, IndexError, tarfile.TarError) as exc:
+            raise BackupError('backup_payload_invalid', 'invalid backup payload: ' + str(exc)) from exc
+        yield stage, info
+
+
+def inspect_backup(source, work_dir=None):
+    with verified_snapshot(source, work_dir) as (_, info):
+        return info
 
 
 class BackupLock(ControllerLock):
@@ -160,7 +312,7 @@ def deterministic_tar(source, destination):
     source = Path(source)
     manifest = read_json(source / 'backup-manifest.json')
     digest = p.check_sha256(manifest['db_sha256'])
-    if manifest['database'] != 'controller-' + digest + '.db':
+    if manifest['database'] not in ('controller.db', 'controller-' + digest + '.db'):
         raise ValueError('unsafe snapshot database name')
     paths = [source / 'backup-manifest.json', source / manifest['database']]
     for entry in manifest['blobs']:

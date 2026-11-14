@@ -286,12 +286,13 @@ class ServiceTests(unittest.TestCase):
         new, files = ins.read_release(self.v2)
         args = ins.parser().parse_args([])
         for target, payload in ((new, files), (manifest, None)):
+            args.rollback = payload is None
             calls = []
             def record(argv, **kwargs):
                 calls.append(argv)
                 return subprocess.CompletedProcess(argv, 0, '', '')
             with patch.object(ins, 'run', side_effect=record), patch.object(ins.Services, 'register'), \
-                    patch.object(ins, 'wait_worker_status'), patch.object(ins, 'wait_doctor'):
+                    patch.object(ins, 'wait_worker_status'), patch.object(ins, 'wait_doctor', return_value={'ok': True}):
                 ins.transaction(config, old, target, payload, args)
             enable = ['schtasks', '/Change', '/TN', 'agent-collab-worker', '/ENABLE']
             start = ['schtasks', '/Run', '/TN', 'agent-collab-worker']

@@ -12,7 +12,7 @@
 
 ## 连接与凭据
 
-- 一条连接 = controller 地址 + 配对时得到的 `controller_id` + 本客户端的 `client_id`。连接的非机密信息保存在应用配置目录的 `connections.json`；`client_token` 只保存在系统凭据存储（macOS 钥匙串、Windows 凭据管理器），服务名 `agent-collab`，账户名 `<controller_id>/<client_id>`。
+- 一条连接 = controller 地址 + 配对时得到的 `controller_id` + 本客户端的 `client_id`。连接的非机密信息保存在应用配置目录的 `connections.json`；`client_token` 只保存在系统凭据存储（macOS 钥匙串、Windows 凭据管理器），账户名 `<controller_id>/<client_id>`，服务名按构建身份分开：正式版 `agent-collab`，开发候选版 `agent-collab-cand`，内部测试版 `agent-collab-itest`（ADR 0004）。不同身份互相读不到对方的凭据。
 - 同一应用配置目录只运行一个实例（目录里的 `instance.lock` 加跨进程排他锁）：连接记录与凭据的修改不会被另一个实例覆盖；第二个实例启动时提示已在运行并退出。
 - 凭据存储读写失败时命令返回 `secure_storage_unavailable`，不写入任何明文替代位置。
 - 页面拿不到 `client_token`：它不出现在命令返回值、事件、日志和 `connections.json` 里。本机助手也拿不到它：助手不访问网络，上传与下载由外壳完成。
@@ -38,7 +38,9 @@
 | `not_found` | controller 上没有这个对象，或本机没有这条连接 |
 | `io` | 本机文件读写失败 |
 | `not_bound` | 这个项目在这台机器上还没有选定目录 |
-| `busy` | 已有一项项目操作在进行（同一时间只运行一项） |
+| `busy` | 已有一项项目操作在进行（同一时间只运行一项）；或桌面端更新的下载、安装正在进行，或现在不满足安装更新的空闲条件 |
+| `incompatible` | 检查到的新版本与当前 controller 不兼容（缺少必需的 features，或 controller API 版本不同），不下载也不安装 |
+| `not_configured` | 这个构建没有配置更新通道（没有 updater 公钥、更新地址或通道，或是开发构建） |
 | `cancelled` | 操作被用户取消 |
 | `helper_unavailable` | 本机助手不可用（安装包不完整） |
 | 其他 | 本机助手返回的错误码原样透出：`not_a_directory`、`unstable`、`path_conflict`、`unicode_conflict`、`source_changed`、`unfinished_application`、`insufficient_space`、`blob_mismatch`、`target_not_empty`、`no_application`、`no_snapshot` |
@@ -47,7 +49,7 @@
 
 | 命令 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- |
-| `app_info` | 无 | `{"version", "commit", "platform", "arch", "candidate", "automation", "helper", "instance"}` | 外壳自身的版本身份。`automation` 表示编译进了自动化钩子（只有内部测试包为 true）；`helper` 表示本机助手可用；`instance` 是本机部署的实例名（正式版为空串） |
+| `app_info` | 无 | `{"version", "commit", "platform", "arch", "kind", "candidate", "automation", "helper", "payload", "payload_error", "identifier", "credential_service", "instance"}` | 外壳自身的版本身份。`kind` 是构建身份（`formal`、`candidate`、`internal-test`，没有指定的开发构建为 `dev`）；`automation` 表示编译进了自动化钩子（只有内部测试包为 true）；`helper` 表示本机助手可用；`payload` 是随包载荷核对的结果，没通过时 `payload_error` 给出原因（缺文件、清单外的残留文件、内容不符）；`instance` 是本机部署的实例名（正式版为空串） |
 | `connections_list` | 无 | `{"connections": [connection...], "active": {"id", "epoch"} \| null}` | connection 为 `{"id", "name", "url", "controller_id", "client_id", "kind", "scopes", "paired_at", "custom_ca", "ca_fingerprint"?, "revoked_at"?}`；`revoked_at` 只出现在已在 controller 上撤销、本机凭据尚待清理的连接上，这类连接只能再次“忘记” |
 | `connection_pair` | `{"url", "code", "name", "custom_ca"?}` | connection，或 `{"cancelled": true}` | `POST /clients/pair`（`kind: "desktop"`），凭据写入系统凭据存储后才保存连接。`custom_ca` 为 true 时先弹出打开文件对话框选取 CA 证书；取消选取则不配对、配对码不消耗 |
 | `connection_open` | `{"id"}` | `{"epoch", "identity", "controller"}` | 读取凭据，调用 `GET /client` 并核对 `controller_id`，成功后成为当前连接；带 `revoked_at` 的连接直接返回 `unauthorized`，不影响当前连接 |
@@ -110,16 +112,43 @@
 | `local_setup` | `{"role", "controller_url"?, "pairing_code"?, "node_id"?}` | `{"ok", "output", "install"}` | 用随包的发行包与运行时安装或升级本机部署。`role` 为 `all-in-one`（本机 controller 加节点）、`worker`（此机作为节点，连接已有 controller，需要配对码）或 `controller`。运行时放进安装前缀下的受管目录，服务定义引用它；已有安装在同一前缀上升级，身份与数据保留，此前有意停用的服务保持停用。`output` 是安装器输出的末尾 |
 | `local_service` | `{"action"}` | 安装器 `service` 子命令的 JSON | `action` 为 `status`、`start`、`stop`。`stop` 同时关闭自启动并记为有意停用 |
 | `local_pair` | 无 | connection | 仅本机部署含 controller 时：在本机生成一次性配对码并把桌面端配对到本机 controller（`http://127.0.0.1:<端口>`）。配对码不经过页面 |
+| `local_uninstall` | `{"purge_code"}` | `{"ok", "output", "kept_state_dir", "install"}` | 卸载本实例的本机后台：停用并移除服务与启动项、当前指针、启动器与代码（`purge_code` 时连同已归档的版本）。状态目录（数据库、节点身份、备份、日志）保留，返回它的位置；不动用户项目、官方 CLI 的配置与登录、共享缓存与其他实例 |
+| `node_bindings` | 无 | `{"bindings": [{"project_id", "root_name", "path", "bound_at"}], "file"}` | 本机节点为哪些项目授权了哪个目录（节点主人在自己机器上看，含路径）。controller 只看到项目 ID 与目录名 |
+| `node_bind` | `{"project_id"}` | 同上，或 `{"cancelled": true}` | 弹出选择文件夹对话框，为这个项目授权一个目录（`agent project-bind`）；之后 controller 可以请这台节点把该项目已发布的成果写回这个目录（三方比较，冲突缺省不写）。只在本机部署含已配对的节点时可用 |
+| `node_unbind` | `{"project_id"}` | 同上 | 撤销授权，只删除绑定，不动目录 |
+
+- `local_setup` 在随包发行包旁有 `<发行包>.sig` 与 `allowed_signers` 时把它们交给安装器：第一次安装固定这份信任，之后的升级必须由同一把发行密钥签名（`docs/install.md`）。
+- `local_discover` 另给 `upgrade`：随包后台版本相对已安装版本（PEP 440 语义）为 `newer`、`same` 或 `older`；`newer` 时页面在“维护 → 本机后台”提示升级，升级仍是安装器的事务（排空、备份、切换、健康检查，期望状态不变）。
 
 - 实例：正式版安装到缺省前缀，服务用缺省名称。开发候选版与内部测试版构建时带实例名（`app_info.instance`），安装到独立的前缀与状态目录，服务名带实例后缀，可以与同一台机器上的正式安装并存，互不触碰。
 - 桌面端只管理它自己这个实例的安装。在缺省前缀上发现已有安装时（例如连接着远端 controller 的现有节点），只报告，不替换它的 controller 地址或身份。
 - 远端节点的服务启停不经桌面端执行；见 `docs/protocol.md` §13.6。
 
+### 更新、备份导出与诊断
+
+桌面更新由 Tauri 官方 updater（`tauri-plugin-updater`，只用 Rust API）检查、下载、验签与安装，ADR 0004 第 5、6 条。更新通道与地址在构建时定下，验签公钥在 Tauri 配置的 `plugins.updater.pubkey`，并开启 `requireSignedVersion`（签名里绑定的版本必须等于宣布的版本）。
+
+| 命令 | 参数 | 返回 | 说明 |
+| --- | --- | --- | --- |
+| `update_status` | 无 | `{"identity", "current", "settings", "settings_broken", "last_check", "offer", "downloaded", "blockers", "history"}` | `identity` 是构建身份与允许的通道；`settings_broken` 为真表示设置文件读不出或已损坏，自动更新按关闭处理，重新保存设置后恢复；`blockers` 是现在不能安装的原因（进行中的项目操作、本机部署操作）；`history` 是最近的更新记录 |
+| `update_settings` | `{"channel", "auto_check", "auto_download", "auto_install"}` | 设置 | 通道只能是本身份允许的（正式版 `stable`、`preview`，缺省 `stable`）。保存在应用配置目录的 `update-settings.json` |
+| `update_check` | `{"features"?}` | `{"available", "version"?, "notes"?, "summary"?, "compat"?, ...}` | 取 `<更新地址>/<通道>/latest.json`；有新版本时再取同目录的 `product-manifest.json` 与 `.sig`，用同一把公钥核对签名，核对发行 ID 与构建身份。设置文件损坏时返回 `invalid`；检查期间切换了通道，结果作废并返回 `invalid`。`features` 是当前连接的 controller 的 features，`compat.verdict` 为 `accept`、`degraded`、`reject` 或 `unknown`（没有连接）。只提供更高的版本 |
+| `update_download` | `{"features"}` | `{"version", "bytes", "op_id"}` | 下载并验签（进度经事件 `ac-update`）；兼容结论为 reject 时拒绝（`incompatible`）；`features` 与检查时相同（当前连接的 controller 的 features，没有连接时为 null），连接换了会要求先重新检查 |
+| `update_install` | `{"features"}` | 不返回（重启） | 安全空闲条件：没有进行中的项目操作与本机部署操作，否则 `busy`。Windows 上启动安装程序后退出、安装完成后重新打开；macOS 就地替换应用包后重启。兼容结论为 reject 时拒绝 |
+| `backup_save` | `{"epoch", "backup_id"}` | `{"path", "bytes", "sha256"}` 或 `{"cancelled": true}` | 把 controller 上的一份备份（`GET /maintenance/backups/{id}/archive`）经“另存为”保存到这台机器，按响应头 `X-Content-SHA256` 核对后落盘；之后它才算一份副本；它是否在实例之外取决于保存位置（与 controller 同机部署时要另外复制到别的存储）。Unix 上导出的文件只有当前用户可读；Windows 上沿用所选文件夹的权限，应选择只有自己能访问的位置 |
+| `diagnostics_export` | `{"epoch"?, "include_task_logs"}` | `{"id", "preview"}` | 用本机助手生成诊断包（`agent-collab diagnostics export`），暂存在应用本机数据目录的 `diagnostics/`。`epoch` 给出时外壳用当前连接取 `GET /client`、`/doctor`、`/nodes` 与最近事件交给助手（助手不访问网络、拿不到凭据），用完即删 |
+| `diagnostics_preview` | `{"id", "name"}` | `{"ok", "text"}` | 导出之后查看包内某个文件的文本 |
+| `diagnostics_save` | `{"id"}` | `{"path", "bytes"}` 或 `{"cancelled": true}` | 预览之后经“另存为”保存，并删除暂存的那一份。诊断只落本机，不上传 |
+
+- 更新是一条持久记录（应用本机数据目录的 `updates/<op_id>.json`）：`compat → download → verify → prepare → backup（桌面更新不改数据，记 skipped）→ switch → health`。启动时按实际运行的版本对账停在 running 的记录：已是目标版本且载荷核对通过记 `done`；载荷不完整记 `pending`（重新运行安装程序修复后，下次启动再核对并记 `done`）；仍是原版本记 `failed`（旧版本继续可用）。
+- 桌面更新只替换应用目录里的外壳与随包载荷，本机后台服务从安装前缀运行，不被打断。
+- 页面在外壳发出 `auto_check`（启动后约 20 秒、之后每天一次）时按本机策略检查；自动下载与自动安装是可选的，自动安装同样要满足空闲条件。
+
 ## 权限隔离
 
 - 主窗口只加载随包分发的页面（macOS 为 `tauri://localhost`，Windows 为 `http://tauri.localhost`，协议与端口精确匹配），不导航到其他地址；内容安全策略只允许自身资源与原生桥。
 - 原生桥命令只对主窗口开放。页面里展示的模型输出、日志、Markdown 与工件一律按文本渲染，不执行其中的脚本或 HTML，因此拿不到原生桥。
-- 外壳不提供任意文件读写、命令执行或 Shell 能力。文件写入只有三处：`blob_save` 与 `result_download` 的目标由系统对话框返回；`result_apply` 与 `result_recover` 只写用户经对话框绑定给项目的目录。读取只有项目绑定目录（`project_scan`、`project_upload`）与用户经对话框选取的 CA 证书。
+- 外壳不提供任意文件读写、命令执行或 Shell 能力。文件写入：`blob_save`、`result_download`、`backup_save`、`diagnostics_save` 的目标由系统对话框返回；`result_apply` 与 `result_recover` 只写用户经对话框绑定给项目的目录；`node_bind` 的目录由选择文件夹对话框返回。读取只有项目绑定目录（`project_scan`、`project_upload`）与用户经对话框选取的 CA 证书；诊断由助手在本实例的前缀与状态目录里收集。
 - 本机助手是随包的 Python 运行时加 `agent_collab` 代码，由外壳以固定的子命令启动（`project local <动作>`、`install`、`service`、`controller client-code`），参数里的路径都来自外壳自己的记录。助手不访问网络，不读写客户端凭据。
 - 关闭窗口只结束界面进程。controller 与节点的任务不受影响；重新打开后页面从 controller 读取当前状态。
 
@@ -148,13 +177,16 @@ cd ../desktop && cargo tauri build         # Windows：NSIS 安装包；macOS：
 - 没有 Node 的机器可以直接使用另一台机器构建好的 `agent_collab/static/`：页面产物与平台无关。
 - `AGENT_COLLAB_COMMIT=<提交>` 写入 `app_info.commit`。
 - 本机助手随包分发：构建前把 Python 运行时与 `agent_collab` 代码、发行包放进 `desktop/src-tauri/resources/`（`runtime/`、`app/`、`release/`），它们作为应用资源打进安装包。缺少这些资源的构建 `app_info.helper` 为 false，项目目录与本机部署功能不可用。
-- 随包发行包的文件名在构建时写进 `AGENT_COLLAB_BUNDLED_RELEASE`（`build.rs` 读 `resources/release/` 里唯一的那个），运行时只用它：Windows 安装包覆盖升级不会删掉上一版留下的资源文件，`resources/release/` 里可能同时有新旧发行包。`resources/app/agent_collab/` 里同样可能残留上一版删掉的模块文件；它们不会被导入，除非新版本再引用同名模块。干净的做法是先卸载再安装。
-- 候选包的实例名与本机端口也在构建时给出（`AGENT_COLLAB_INSTANCE`、`AGENT_COLLAB_LOCAL_PORT`），本机部署的前缀、状态目录与服务名都带实例名，与正式版分开。
+- 随包载荷有确定清单（ADR 0004 第 7 条）：流水线在组装好 `resources/` 之后写出 `payload.json`（逐文件 SHA-256 与大小），`build.rs` 把它的摘要编进二进制（`AGENT_COLLAB_PAYLOAD_SHA256`）。外壳第一次使用助手前核对：缺文件、内容不符或有清单外的文件都拒绝启动助手，`app_info.payload_error` 给出原因，页脚提示重新运行安装程序。没有 `payload.json` 的开发构建不核对。
+- Windows 安装器钩子（`windows/hooks.nsh`，`bundle.windows.nsis.installerHooks`）：复制文件之前清空受管的 `resources/app`、`runtime`、`release` 与 `payload.json`，覆盖安装与更新因此不留上一版删除或改名的模块；中途被打断时载荷不完整，助手拒绝启动，重新运行安装程序修复。卸载时若有本构建实例的本机后台（或上次没清除完的程序文件），询问是否一并卸载：选“是”用随包的运行时与本机助手运行 `install --uninstall --purge-code`（与“卸载本机后台”相同），没有完全清除时如实提示并可以取消这次卸载；静默卸载与选择“否”保留后台，在前缀里写 `desktop-uninstalled.txt`；更新模式不经过这里。行为表见 [install.md](install.md)“卸载桌面端时的本机后台”。安装后钩子记下界面语言，卸载向导与安装向导语言一致（`bundle.windows.nsis.languages` 为英文与简体中文：中文系统显示中文，其他系统用英文）。`windows/instance.nsh` 由 `build.rs` 按实例名生成（前缀目录名与实例名）。安装包在 `resources/licenses/` 里随附许可材料。
+- 随包发行包的文件名在构建时写进 `AGENT_COLLAB_BUNDLED_RELEASE`（`build.rs` 读 `resources/release/` 里唯一的那个），运行时只用它。
+- 构建身份与更新在构建时给出（ADR 0004 第 1 条）：`AGENT_COLLAB_BUILD_KIND`（`formal`、`candidate`、`internal-test`）、`AGENT_COLLAB_INSTANCE` 与 `AGENT_COLLAB_LOCAL_PORT`（正式版空 / 18669，候选 `cand` / 18769，内部测试 `itest` / 18779）、`AGENT_COLLAB_UPDATE_BASE` 与 `AGENT_COLLAB_UPDATE_CHANNELS`。本机部署的前缀、状态目录与服务名都带实例名，与正式版分开。正式身份的构建不能带 `automation` 与实例名（`build.rs` 拒绝），其余由发行门禁核对。
+- 发行构建用 `scripts/build_desktop.py`：`build`（组装载荷、按身份生成配置、构建、平台签名与公证的接入点、从最终产物生成更新签名）、`manifest`（产品发行清单与 `latest.json`）、`sign`（在唯一的签名机上给不带更新签名构建的平台片段补更新签名）、`gate`（发行门禁）。签名顺序：macOS 先签随包运行时里的嵌套代码再生成载荷清单，应用由 Tauri 按 `signingIdentity` 签名（候选用临时签名 `-`，正式用 Developer ID 与 hardened runtime），公证与 stapling 之后才打更新归档；Windows 有证书时运行时二进制在生成载荷清单前签名，安装包由 Tauri 按证书签名，之后才生成更新签名。更新签名用 `tauri signer sign --app-version` 绑定版本，必须对应最后实际分发的字节。
 - 构建身份有三种，界面与 `app_info` 如实标明：
   - 正式版：版本号不带预发布后缀，不带 `automation`，实例名为空。
   - 开发候选版（可对外试用）：版本号带预发布后缀，不带 `automation`；用独立的应用标识与实例名构建，数据目录、安装前缀与服务名都与正式版分开。
   - 内部测试版：在候选版基础上编译进 `automation` feature，只用于自动化验证真实窗口，不对外分发。文件名带 `internal-test`。
-- 当前产物没有代码签名与公证：Windows 安装时会出现 SmartScreen 提示，macOS 包只有临时签名，从别的机器拷入后需要用户手动放行。签名、公证与自动更新属于后续里程碑。
+- 候选包没有平台代码签名与公证：Windows 安装时会出现 SmartScreen 提示，macOS 包是临时签名（应用包签名完整、资源已封存，但不能通过 Gatekeeper），从别的机器拷入或经浏览器下载后需要用户手动放行。正式发行要的签名身份、公证账号、正式更新密钥与 HTTPS 发布位置见 `docs/release-checklist.md`。
 - `cargo test`（在 `desktop/src-tauri`）覆盖事件流帧解析、地址与路径校验、连接代次、controller 身份核对、下载落盘、项目绑定与助手输出解析。
 
 ## 自动化钩子

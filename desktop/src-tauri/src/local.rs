@@ -13,6 +13,15 @@ use tauri::{AppHandle, Manager, State};
 use super::helper::{self, Captured, Helper};
 use super::{bundle, data_dir, device_name, err, helper_unavailable, invalid, io, pair, validate, BridgeError, Result, Shell};
 
+/// 按实例区分的名字：安装目录与系统凭据存储的服务名都用它，两边不会对不上。
+pub fn instance_name(instance: &str) -> String {
+    if instance.is_empty() {
+        "agent-collab".to_string()
+    } else {
+        format!("agent-collab-{instance}")
+    }
+}
+
 /// 本机部署的实例名：正式版为空串；开发候选版与内部测试版在构建时给出（环境变量 `AGENT_COLLAB_INSTANCE`），
 /// 安装到独立的前缀与状态目录，服务名带实例后缀，与同一台机器上的正式安装互不触碰。
 pub const INSTANCE: &str = match option_env!("AGENT_COLLAB_INSTANCE") {
@@ -66,8 +75,7 @@ impl Deployment<'_> {
     }
 
     fn directory(&self, kind: &str) -> PathBuf {
-        let name = if self.instance.is_empty() { "agent-collab".to_string() } else { format!("agent-collab-{}", self.instance) };
-        self.home.join(".local").join(kind).join(name)
+        self.home.join(".local").join(kind).join(instance_name(self.instance))
     }
 
     /// 安装前缀（代码）。实例为空时与安装器的缺省值相同。
@@ -191,6 +199,31 @@ fn redact(output: String, secret: Option<&str>) -> String {
     }
 }
 
+/// 随包发行包的来源签名（流水线放在发行包旁边：`<发行包>.sig` 与 `allowed_signers`）。有就交给安装器核对：
+/// 第一次安装时固定这份信任，之后的升级都要由同一把发行密钥签名（ADR 0004 第 5 条）。
+fn release_signature(release: &Path) -> Vec<OsString> {
+    let signature = PathBuf::from(format!("{}.sig", release.display()));
+    let signers = release.with_file_name("allowed_signers");
+    if signature.is_file() && signers.is_file() {
+        vec!["--signature".into(), signature.into(), "--allowed-signers".into(), signers.into()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// 随包后台版本相对本机已安装版本：`newer`、`same`、`older`；任一方缺失为 null，写法不认识为 `unknown`。
+fn upgrade(bundled: Option<&str>, installed: Option<&str>) -> Value {
+    let (Some(bundled), Some(installed)) = (bundled, installed) else { return Value::Null };
+    match (super::update::pep440_key(bundled), super::update::pep440_key(installed)) {
+        (Some(a), Some(b)) => json!(match a.cmp(&b) {
+            std::cmp::Ordering::Greater => "newer",
+            std::cmp::Ordering::Equal => "same",
+            std::cmp::Ordering::Less => "older",
+        }),
+        _ => json!("unknown"),
+    }
+}
+
 fn busy() -> BridgeError {
     err("busy", "本机部署的另一项操作还在进行")
 }
@@ -205,8 +238,15 @@ fn deployment(home: &Path) -> Deployment<'_> {
 
 /// 运行助手的一个部署子命令并收集输出。
 async fn run(app: &AppHandle, helper: Helper, command: Vec<OsString>, timeout: Duration) -> Result<Captured> {
+    run_up_to(app, helper, command, timeout, 1024 * 1024).await
+}
+
+/// 诊断导出与预览的输出：摘要上限 2 MiB，按缩进 JSON 打印后会更大。
+const DIAGNOSTICS_OUTPUT: usize = 8 * 1024 * 1024;
+
+async fn run_up_to(app: &AppHandle, helper: Helper, command: Vec<OsString>, timeout: Duration, limit: usize) -> Result<Captured> {
     let cwd = data_dir(app)?;
-    tauri::async_runtime::spawn_blocking(move || helper::capture(helper.command(&cwd, &command), timeout))
+    tauri::async_runtime::spawn_blocking(move || helper::capture_up_to(helper.command(&cwd, &command), timeout, limit))
         .await
         .map_err(|_| err("helper_unavailable", "本机助手异常结束"))?
 }
@@ -231,10 +271,14 @@ pub async fn local_discover(app: AppHandle) -> Result<Value> {
     let cli = |name: &str| find_cli(&dirs, name, cfg!(windows)).map(|path| path.to_string_lossy().into_owned());
     let (codex, claude) = (cli("codex"), cli("claude"));
     let version = bundle.release.as_deref().and_then(helper::release_version);
+    let helper_available = bundle.helper.is_some();
+    let install = discover(&app, bundle.helper, &home).await;
     Ok(json!({
-        "helper": bundle.helper.is_some(),
+        "helper": helper_available,
         "bundle": { "version": version, "runtime": bundle.runtime.is_some() },
-        "install": discover(&app, bundle.helper, &home).await,
+        // 随包后台版本与本机已安装版本的比较（PEP 440 语义）：newer 时页面提示“本机后台可升级”。
+        "upgrade": upgrade(version.as_deref(), install["version"].as_str()),
+        "install": install,
         "cli": { "codex": codex, "claude": claude },
     }))
 }
@@ -256,7 +300,8 @@ pub async fn local_setup(
     let given = |value: &Option<String>| value.as_deref().map(str::trim).filter(|text| !text.is_empty()).map(str::to_owned);
     let (controller_url, pairing_code, node_id) = (given(&controller_url), given(&pairing_code), given(&node_id));
     let request = Setup { role: &role, controller_url: controller_url.as_deref(), pairing_code: pairing_code.as_deref(), node_id: node_id.as_deref() };
-    let command = deployment(&home).setup(&release, &runtime, &request).map_err(invalid)?;
+    let mut command = deployment(&home).setup(&release, &runtime, &request).map_err(invalid)?;
+    command.extend(release_signature(&release));
     let _serial = shell.deploying.try_lock().map_err(|_| busy())?;
     let captured = run(&app, helper.clone(), command, SETUP_TIMEOUT).await?;
     Ok(json!({
@@ -299,6 +344,248 @@ pub async fn local_pair(app: AppHandle, shell: State<'_, Shell>) -> Result<Value
     drop(captured);
     let code = code.ok_or_else(|| io(format!("本机 controller 没有给出配对码（退出码 {}）", exit.map_or("无".to_string(), |code| code.to_string()))))?;
     pair(&app, &shell, deployment.controller_url(), &code, &device_name(), None).await.map(|conn| conn.view())
+}
+
+// ---------------------------------------------------------------- 卸载本机后台
+
+/// 卸载这个构建管理的本机部署：停止并移除它的服务与启动项、当前指针、启动器与当前代码；`purge_code` 时连同已归档的版本。
+/// 状态目录（数据库、节点身份、备份与日志）始终保留：要删除它们由用户在确认后自己删除状态目录（界面给出位置）。
+/// 不碰用户项目、官方 CLI 的配置与登录、共享缓存，也不碰别的实例。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn local_uninstall(app: AppHandle, shell: State<'_, Shell>, purge_code: bool) -> Result<Value> {
+    let home = home_dir(&app)?;
+    let helper = bundle(&app).helper.ok_or_else(helper_unavailable)?;
+    let deployment = deployment(&home);
+    deployment.check().map_err(invalid)?;
+    let mut command = args(["install", "--uninstall"]);
+    if purge_code {
+        command.push("--purge-code".into());
+    }
+    command.extend(deployment.location());
+    let _serial = shell.deploying.try_lock().map_err(|_| busy())?;
+    let captured = run(&app, helper.clone(), command, SERVICE_TIMEOUT).await?;
+    Ok(json!({
+        "ok": captured.code == Some(0),
+        "output": captured.tail,
+        "kept_state_dir": deployment.state_dir().to_string_lossy(),
+        "install": discover(&app, Some(helper), &home).await,
+    }))
+}
+
+// ---------------------------------------------------------------- 节点本机的项目目录授权（§13.10）
+
+/// 这台机器上的节点数据目录。只在本机部署含节点、且节点已配对时可用。
+fn worker_dir(deployment: &Deployment) -> Result<PathBuf> {
+    deployment.check().map_err(invalid)?;
+    let dir = deployment.state_dir().join("worker");
+    if !dir.join("agent.json").is_file() {
+        return Err(err("not_found", "这台机器上没有已配对的本机节点"));
+    }
+    Ok(dir)
+}
+
+fn project_id(value: &str) -> Result<String> {
+    match uuid::Uuid::parse_str(value) {
+        Ok(id) if id.hyphenated().to_string() == value => Ok(value.to_string()),
+        _ => Err(invalid("project_id 必须是小写 UUID")),
+    }
+}
+
+/// 运行节点的绑定子命令（`agent project-bind / project-unbind / project-bindings --data-dir <节点数据目录>`）。
+async fn binding_command(app: &AppHandle, shell: &Shell, action: &str, extra: Vec<OsString>) -> Result<Value> {
+    let home = home_dir(app)?;
+    let helper = bundle(app).helper.ok_or_else(helper_unavailable)?;
+    let dir = worker_dir(&deployment(&home))?;
+    let mut command = args(["agent", action, "--data-dir"]);
+    command.push(dir.into());
+    command.extend(extra);
+    let _serial = if action == "project-bindings" { None } else { Some(shell.deploying.try_lock().map_err(|_| busy())?) };
+    let captured = run(app, helper, command, DISCOVER_TIMEOUT).await?;
+    let output = json_output(&captured.stdout).ok_or_else(|| io(format!("节点没有给出结果：{}", helper::tail_chars(&captured.tail, 600))))?;
+    if captured.code != Some(0) || output.get("error").is_some() {
+        let message = output["error"]["message"].as_str().or(output["error"].as_str()).unwrap_or("节点拒绝了这次操作").to_string();
+        return Err(invalid(message));
+    }
+    Ok(output)
+}
+
+/// 本机节点为哪些项目授权了哪个目录（含本机路径：这是节点主人在自己机器上看）。controller 只看到项目 ID 与目录名。
+#[tauri::command]
+pub async fn node_bindings(app: AppHandle, shell: State<'_, Shell>) -> Result<Value> {
+    binding_command(&app, &shell, "project-bindings", Vec::new()).await
+}
+
+/// 在这台机器上为一个项目授权一个目录：目录只能经系统的选择文件夹对话框选取；之后 controller 可以请这台节点把
+/// 该项目已发布的成果写回这个目录（仍按三方比较，冲突缺省不写）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn node_bind(window: tauri::WebviewWindow, app: AppHandle, shell: State<'_, Shell>, project_id: String) -> Result<Value> {
+    let project_id = self::project_id(&project_id)?;
+    worker_dir(&deployment(&home_dir(&app)?))?;
+    let Some(folder) = super::dialog::pick_folder(&window, "选择授权给这个项目写回的文件夹").await? else {
+        return Ok(json!({ "cancelled": true }));
+    };
+    binding_command(&app, &shell, "project-bind", vec![project_id.into(), folder.into()]).await
+}
+
+/// 撤销授权：只删除绑定，不动目录。正在进行的写回不受影响（节点执行时会再次核对绑定）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn node_unbind(app: AppHandle, shell: State<'_, Shell>, project_id: String) -> Result<Value> {
+    let project_id = self::project_id(&project_id)?;
+    binding_command(&app, &shell, "project-unbind", vec![project_id.into()]).await
+}
+
+// ---------------------------------------------------------------- 诊断导出
+
+/// 诊断包暂存在应用本机数据目录的 `diagnostics/`，预览之后由用户另存；只落本机，不上传。
+fn diagnostics_dir(app: &AppHandle) -> Result<PathBuf> {
+    let dir = data_dir(app)?.join("diagnostics");
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).map_err(io)?;
+    Ok(dir)
+}
+
+fn diagnostics_file(app: &AppHandle, id: &str) -> Result<PathBuf> {
+    match uuid::Uuid::parse_str(id) {
+        Ok(parsed) if parsed.hyphenated().to_string() == id => Ok(diagnostics_dir(app)?.join(format!("{id}.zip"))),
+        _ => Err(invalid("诊断包 ID 无效")),
+    }
+}
+
+/// 用当前连接取几项 controller 信息交给助手（助手不访问网络、拿不到凭据）；拿不到的项如实记下原因。
+async fn controller_info(shell: &Shell, epoch: u64) -> Result<Value> {
+    let active = shell.lock().current(epoch)?;
+    let mut info = serde_json::Map::new();
+    for (key, path) in [("client", "/client"), ("doctor", "/doctor"), ("nodes", "/nodes"), ("events", "/events?before=0&limit=200")] {
+        let url = super::validate::api_url(&active.base, path).map_err(invalid)?;
+        let value = match shell.send(epoch, &active, active.http.api.get(url)).await {
+            Ok(response) => {
+                let status = response.status();
+                match super::read_body(response).await {
+                    Ok(body) if status.is_success() => serde_json::from_slice::<Value>(&body).unwrap_or(json!({ "error": "响应不是 JSON" })),
+                    Ok(_) => json!({ "error": format!("HTTP {}", status.as_u16()) }),
+                    Err(e) => json!({ "error": e.message }),
+                }
+            }
+            // 连接已切换或关闭：不把旧连接的信息当作这次诊断的内容。
+            Err(e) if e.code == "stale_connection" => return Err(e),
+            Err(e) => json!({ "error": e.message }),
+        };
+        info.insert(key.to_string(), value);
+    }
+    // 事件只留元数据：负载里有任务记录（契约与正文），既不该进诊断，也会让整节超过助手的 1 MiB 上限而被丢弃。
+    if let Some(events) = info.get_mut("events").and_then(|v| v.get_mut("events")).and_then(Value::as_array_mut) {
+        for event in events.iter_mut().filter_map(Value::as_object_mut) {
+            event.remove("payload");
+        }
+    }
+    // 助手读这个文件的上限是 1 MiB（按写入的缩进格式算）：超过时先省略事件，仍超过就整节只留一条说明。
+    let size = |info: &serde_json::Map<String, Value>| serde_json::to_vec_pretty(info).map_or(usize::MAX, |v| v.len());
+    if size(&info) > 900 * 1024 {
+        info.insert("events".into(), json!({ "error": "省略：controller 信息超过诊断上限" }));
+    }
+    if size(&info) > 900 * 1024 {
+        return Ok(json!({ "error": "controller 信息超过诊断上限，没有收集" }));
+    }
+    Ok(Value::Object(info))
+}
+
+/// 生成一份诊断包并返回预览。`epoch` 给出时附带当前连接的 controller 信息；`include_task_logs` 时收集任务原始日志
+/// （可能包含项目内容，照样脱敏）。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn diagnostics_export(app: AppHandle, shell: State<'_, Shell>, epoch: Option<u64>, include_task_logs: bool) -> Result<Value> {
+    let home = home_dir(&app)?;
+    let helper = bundle(&app).helper.ok_or_else(helper_unavailable)?;
+    let deployment = deployment(&home);
+    deployment.check().map_err(invalid)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let out = diagnostics_file(&app, &id)?;
+    let mut command = args(["diagnostics", "export", "--out"]);
+    command.extend([out.clone().into(), "--prefix".into(), deployment.prefix().into(), "--state-dir".into(), deployment.state_dir().into()]);
+    let info_file = match epoch {
+        Some(epoch) => {
+            let info = controller_info(&shell, epoch).await?;
+            let path = diagnostics_dir(&app)?.join(format!("{id}-controller.json"));
+            super::write_json(&path, &info)?;
+            command.extend(["--controller-info".into(), path.clone().into()]);
+            Some(path)
+        }
+        None => None,
+    };
+    if include_task_logs {
+        command.push("--include-task-logs".into());
+    }
+    let captured = run_up_to(&app, helper, command, SETUP_TIMEOUT, DIAGNOSTICS_OUTPUT).await;
+    if let Some(path) = info_file {
+        let _ = std::fs::remove_file(path); // 原始应答只给助手读一次
+    }
+    let captured = captured?;
+    let preview = json_output(&captured.stdout).filter(|_| captured.code == Some(0) && out.is_file());
+    let preview = preview.ok_or_else(|| io(format!("诊断导出失败：{}", helper::tail_chars(&captured.tail, 600))))?;
+    // 助手运行期间换了连接：这份包里是旧连接的 controller 信息，不作为当前连接的结果返回，暂存包一并删除。
+    if let Some(epoch) = epoch {
+        if let Err(e) = shell.lock().current(epoch) {
+            let _ = std::fs::remove_file(&out); // 返回不了包 ID，留着也无法保存
+            return Err(e);
+        }
+    }
+    Ok(json!({ "id": id, "preview": preview }))
+}
+
+/// 查看已生成的诊断包里某个文件的文本（有上限），用于导出后的预览。
+#[tauri::command]
+pub async fn diagnostics_preview(app: AppHandle, id: String, name: String) -> Result<Value> {
+    let helper = bundle(&app).helper.ok_or_else(helper_unavailable)?;
+    let file = diagnostics_file(&app, &id)?;
+    if name.is_empty() || name.len() > 200 || name.contains("..") || name.starts_with(['/', '\\']) {
+        return Err(invalid("文件名无效"));
+    }
+    let mut command = args(["diagnostics", "preview"]);
+    command.extend([file.into(), "--show".into(), OsString::from(name)]);
+    let captured = run_up_to(&app, helper, command, DISCOVER_TIMEOUT, DIAGNOSTICS_OUTPUT).await?;
+    Ok(json!({ "ok": captured.code == Some(0), "text": helper::tail_chars(&captured.stdout, 256 * 1024) }))
+}
+
+/// 把预览过的诊断包另存到用户选定的位置；之后删除暂存的那一份。
+#[tauri::command]
+pub async fn diagnostics_save(window: tauri::WebviewWindow, app: AppHandle, id: String) -> Result<Value> {
+    let file = diagnostics_file(&app, &id)?;
+    if !file.is_file() {
+        return Err(err("not_found", "这份诊断包已不存在，重新导出"));
+    }
+    let Some(dest) = super::dialog::save(&window, format!("agent-collab-diagnostics-{}.zip", &id[..8])).await? else {
+        return Ok(json!({ "cancelled": true }));
+    };
+    // 选中的就是暂存包本身（含目录别名）：它已经在那里，不复制，也不能在最后删掉。
+    if std::fs::canonicalize(&dest).ok().zip(std::fs::canonicalize(&file).ok()).is_some_and(|(a, b)| a == b) {
+        let bytes = std::fs::metadata(&file).map_err(io)?.len();
+        return Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes }));
+    }
+    // 先复制到目标目录里的临时文件，成功后再改名覆盖：复制中途出错不会损坏用户原有的同名文件。
+    // 临时文件名不可预测，并以 create_new 独占创建：不会覆盖已有文件，也不会跟随同名链接。
+    let staging = dest.with_file_name(format!(".agent-collab-diagnostics-{}.part", uuid::Uuid::new_v4()));
+    let copy = || -> std::io::Result<u64> {
+        let mut source = std::fs::File::open(&file)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600); // 诊断包只给当前用户读
+        let mut target = options.open(&staging)?;
+        let n = std::io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+        drop(target);
+        std::fs::rename(&staging, &dest)?;
+        Ok(n)
+    };
+    let bytes = match copy() {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(io(e));
+        }
+    };
+    let _ = std::fs::remove_file(&file);
+    Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes }))
 }
 
 #[cfg(test)]
@@ -444,6 +731,15 @@ mod tests {
         let home = Path::new("/home/u");
         assert_eq!(search_dirs(Some(path.as_os_str()), home, false), [first.clone(), second.clone(), home.join(".local").join("bin")]);
         assert_eq!(search_dirs(None, home, true), [home.join(".local").join("bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
+    }
+
+    #[test]
+    fn bundled_backend_is_compared_semantically() {
+        assert_eq!(upgrade(Some("0.3.0.dev10"), Some("0.3.0.dev9")), json!("newer"));
+        assert_eq!(upgrade(Some("0.3.0.dev1"), Some("0.3.0.dev1")), json!("same"));
+        assert_eq!(upgrade(Some("0.2.0.dev7"), Some("0.2.0")), json!("older"));
+        assert_eq!(upgrade(Some("0.3.0.dev1"), None), Value::Null);
+        assert_eq!(upgrade(Some("weird"), Some("0.2.0")), json!("unknown"));
     }
 
     #[test]

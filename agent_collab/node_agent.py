@@ -24,7 +24,7 @@ from .adapters.codex import PROVIDER as codex_provider, CodexAdapter, model_cata
 from .adapters.claude import ClaudeAdapter
 from .adapters.stub import StubAdapter
 from .adapters.checks import ContractChecks
-from .adapters.commands import CODEX_CLEARED_ENV, NO_WINDOW, resolve_commands, probe_auth, probe_auth_detail
+from .adapters.commands import CODEX_CLEARED_ENV, NO_WINDOW, resolve_commands, probe_auth, probe_auth_detail, which
 from .release import VERSION, release_info, version_directory
 
 LOG = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ def detect(config=None, commands=None, runner=None):
     # 协议 §3：只列出找到的工具；版本读不到时为 "unknown"，不存在的工具为 null。
     tools = {}
     for name in ('python3', 'git', 'node'):
-        path = shutil.which(name)
+        path = which(name, runner=runner)
         version = probe([path, '--version'], runner=runner) if path else None
         # Windows 的 WindowsApps 应用执行别名（如 python3 跳转商店）不是可用工具。
         alias = bool(path) and 'windowsapps' in path.lower() and not version

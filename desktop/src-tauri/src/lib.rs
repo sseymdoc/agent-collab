@@ -11,6 +11,7 @@ mod local;
 mod projects;
 mod sse;
 mod tls;
+mod update;
 mod validate;
 
 use std::borrow::Cow;
@@ -28,7 +29,11 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use validate::API_PREFIX as API;
 
-const SERVICE: &str = "agent-collab";
+/// 系统凭据存储里的服务名，按构建身份的实例分开（ADR 0004 第 1 条）：正式版 `agent-collab`，
+/// 候选版 `agent-collab-cand`，内部测试版 `agent-collab-itest`。不同身份互相读不到对方的凭据。
+fn service_name() -> String {
+    local::instance_name(local::INSTANCE)
+}
 const MAX_BODY: usize = 16 * 1024 * 1024;
 /// 60 秒没有收到任何字节（含 SSE 心跳）即认为连接停滞。
 const IDLE: Duration = Duration::from_secs(60);
@@ -102,7 +107,7 @@ fn http_error(what: &str, status: StatusCode, body: &[u8]) -> BridgeError {
 }
 
 fn helper_unavailable() -> BridgeError {
-    err("helper_unavailable", "本机助手不可用：安装包不完整，缺少随包的 Python 运行时或后台程序")
+    err("helper_unavailable", "本机助手不可用：安装包不完整，或随包载荷核对没有通过（窗口底部的版本信息里有原因）；重新运行安装程序修复")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -206,6 +211,55 @@ struct Shell {
     ops: projects::Ops,
     /// 本机部署的安装与服务启停逐个进行。
     deploying: tokio::sync::Mutex<()>,
+    /// 进行中的备份导出数：导出期间不安装桌面端更新（安装会重启应用，导出随之中断）。
+    exports: std::sync::atomic::AtomicUsize,
+    /// 桌面端更新的安装已经开始：不再接受新的备份导出。
+    installing: std::sync::atomic::AtomicBool,
+}
+
+/// 备份导出期间计数，离开作用域即减一。安装已开始时拒绝。
+/// 与 `Installing` 都先登记自己、再看对方（SeqCst），两边同时开始时至少一边会看到另一边。
+struct Exporting<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Exporting<'a> {
+    fn start(shell: &'a Shell) -> Result<Self> {
+        Self::admit(&shell.exports, &shell.installing)
+    }
+
+    fn admit(exports: &'a std::sync::atomic::AtomicUsize, installing: &std::sync::atomic::AtomicBool) -> Result<Self> {
+        exports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = Self(exports);
+        if installing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(err("busy", "桌面端更新正在安装，稍后再导出备份"));
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for Exporting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 安装更新期间关闭备份导出的准入，离开作用域（安装没有进行下去）即重新打开。
+pub(crate) struct Installing<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> Installing<'a> {
+    pub(crate) fn start(shell: &'a Shell) -> Self {
+        Self::close(&shell.installing)
+    }
+
+    fn close(installing: &'a std::sync::atomic::AtomicBool) -> Self {
+        installing.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(installing)
+    }
+}
+
+impl Drop for Installing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Shell {
@@ -216,6 +270,8 @@ impl Shell {
             http: tls::http(None)?,
             ops: projects::Ops::default(),
             deploying: tokio::sync::Mutex::new(()),
+            exports: std::sync::atomic::AtomicUsize::new(0),
+            installing: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -437,7 +493,7 @@ async fn credential<T: Send + 'static>(
     op: impl FnOnce(&keyring::Entry) -> keyring::Result<T> + Send + 'static,
 ) -> Result<T> {
     let account = format!("{}/{}", conn.controller_id, conn.client_id);
-    tauri::async_runtime::spawn_blocking(move || keyring::Entry::new(SERVICE, &account).and_then(|entry| op(&entry)))
+    tauri::async_runtime::spawn_blocking(move || keyring::Entry::new(&service_name(), &account).and_then(|entry| op(&entry)))
         .await
         .map_err(|_| err("secure_storage_unavailable", "系统凭据存储不可用：操作异常结束"))?
         .map_err(storage_err)
@@ -465,17 +521,24 @@ fn iso8601(secs: u64, millis: u32) -> String {
 
 #[tauri::command]
 fn app_info(app: AppHandle) -> Value {
+    let helper = bundle(&app);
     json!({
         "version": app.package_info().version.to_string(),
         // 构建时由环境变量 AGENT_COLLAB_COMMIT 传入；未设置为 null。
         "commit": option_env!("AGENT_COLLAB_COMMIT"),
         "platform": std::env::consts::OS,
         "arch": match std::env::consts::ARCH { "aarch64" => "arm64", other => other },
-        // 预发布版本号或编译进了自动化钩子的构建都不是正式发行版。
-        "candidate": cfg!(feature = "automation") || env!("CARGO_PKG_VERSION").contains('-'),
+        // 构建身份（ADR 0004）：formal、candidate、internal-test；没有指定的开发构建为 dev。只有 formal 是正式发行版。
+        "kind": update::KIND,
+        "candidate": update::KIND != "formal" || cfg!(feature = "automation") || app.package_info().version.to_string().contains('-'),
         // 内部测试版：编译进了自动化钩子（cargo feature `automation`），不对外分发。
         "automation": cfg!(feature = "automation"),
-        "helper": bundle(&app).helper.is_some(),
+        "helper": helper.helper.is_some(),
+        // 随包载荷核对：通过为 true；没通过时 payload_error 给出原因（缺文件、清单外的残留文件、内容不符）。
+        "payload": helper.payload.is_ok(),
+        "payload_error": helper.payload.err(),
+        "identifier": app.config().identifier,
+        "credential_service": service_name(),
         // 本机部署的实例名；正式版为空串。
         "instance": local::INSTANCE,
     })
@@ -867,12 +930,19 @@ struct BlobSink {
 }
 
 impl BlobSink {
-    fn create(dir: &Path) -> Result<Self> {
+    /// `private`：只有当前用户可读写（Unix；备份导出用），普通工件下载沿用默认权限。
+    fn create(dir: &Path, private: bool) -> Result<Self> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let path = dir.join(format!(".agent-collab-{}-{nanos:08x}.part", std::process::id()));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let file = options
             .open(&path)
             .map_err(|e| io(format!("无法在目标目录创建临时文件：{e}")))?;
         Ok(Self { path, file: Some(file), hasher: Sha256::new(), bytes: 0 })
@@ -929,7 +999,7 @@ async fn blob_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, s
         status => return Err(err("network", format!("下载失败（HTTP {}）", status.as_u16()))),
     }
     let dir = dest.parent().ok_or_else(|| io("所选路径没有上级目录"))?;
-    let mut sink = BlobSink::create(dir)?;
+    let mut sink = BlobSink::create(dir, false)?;
     loop {
         let chunk = response.chunk().await;
         shell.lock().current(epoch)?;
@@ -940,6 +1010,52 @@ async fn blob_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, s
     }
     let bytes = sink.finish(&sha256, &dest)?;
     Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes }))
+}
+
+/// 备份导出（生成归档与下载）的总时限。
+const BACKUP_EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// 把 controller 上的一份备份导出到这台机器（“另存为”选定的位置），之后它才算实例外的备份。
+/// 归档的 SHA-256 由 controller 在响应头里给出（`X-Content-SHA256`），落盘前核对，不符则不保存。
+/// 备份含任务、项目与设置等敏感数据：只存到用户自己选的位置，不进入诊断导出。
+#[tauri::command(rename_all = "snake_case")]
+async fn backup_save(window: WebviewWindow, shell: State<'_, Shell>, epoch: u64, backup_id: String) -> Result<Value> {
+    let active = shell.lock().current(epoch)?;
+    if !backup_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || backup_id.is_empty() || backup_id.len() > 120 {
+        return Err(invalid("备份 ID 格式无效"));
+    }
+    let url = validate::api_url(&active.base, &format!("/maintenance/backups/{backup_id}/archive")).map_err(invalid)?;
+    let Some(dest) = dialog::save(&window, validate::file_name(&format!("agent-collab-backup-{backup_id}.tar"))).await? else {
+        return Ok(json!({ "cancelled": true }));
+    };
+    shell.lock().current(epoch)?;
+    let _exporting = Exporting::start(&shell)?;
+    // controller 先生成并核对归档再回响应头，大备份可能超过常规客户端 60 秒的读超时：用不带读超时的客户端，整体限时。
+    let mut response = shell.send(epoch, &active, active.http.bulk.get(url).timeout(BACKUP_EXPORT_TIMEOUT)).await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = read_body(response).await.unwrap_or_default();
+        return Err(http_error("导出备份", status, &body));
+    }
+    let expected = response
+        .headers()
+        .get("x-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| validate::sha256_hex(v))
+        .map(str::to_owned)
+        .ok_or_else(|| bad_response("备份导出"))?;
+    let dir = dest.parent().ok_or_else(|| io("所选路径没有上级目录"))?;
+    let mut sink = BlobSink::create(dir, true)?;
+    loop {
+        let chunk = response.chunk().await;
+        shell.lock().current(epoch)?;
+        match chunk.map_err(net)? {
+            Some(chunk) => sink.write(&chunk)?,
+            None => break,
+        }
+    }
+    let bytes = sink.finish(&expected, &dest)?;
+    Ok(json!({ "path": dest.to_string_lossy(), "bytes": bytes, "sha256": expected }))
 }
 
 // ---------------------------------------------------------------- 命令：系统通知
@@ -1014,6 +1130,9 @@ pub fn run() {
         .plugin(navigation_guard())
         // 只用它的 Rust API 发通知；capabilities 里没有授予它的页面权限，页面只能经 `notify` 命令。
         .plugin(tauri_plugin_notification::init())
+        // 桌面更新：只用它的 Rust API（update_* 命令），capabilities 里没有授予它的页面权限。
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(update::Updates::default())
         .setup(|app| {
             match instance_lock(&app.path().app_config_dir()?)? {
                 Some(lock) => {
@@ -1028,6 +1147,7 @@ pub fn run() {
                 }
             }
             projects::clear_staging(app.handle()); // 上次运行被中断时留下的暂存文件
+            update::startup(app.handle()); // 对账上次没有结束的更新记录，安排自动检查
             #[cfg(feature = "automation")]
             automation::grant(app)?;
             Ok(())
@@ -1059,6 +1179,19 @@ pub fn run() {
             local::local_setup,
             local::local_service,
             local::local_pair,
+            local::local_uninstall,
+            local::node_bindings,
+            local::node_bind,
+            local::node_unbind,
+            local::diagnostics_export,
+            local::diagnostics_preview,
+            local::diagnostics_save,
+            backup_save,
+            update::update_status,
+            update::update_settings,
+            update::update_check,
+            update::update_download,
+            update::update_install,
             #[cfg(feature = "automation")]
             automation::automation_report,
         ]);
@@ -1070,6 +1203,25 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_exports_and_update_installs_exclude_each_other() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (exports, installing) = (AtomicUsize::new(0), AtomicBool::new(false));
+        {
+            let _export = Exporting::admit(&exports, &installing).unwrap();
+            // 安装看得到进行中的导出（blockers 据此返回 busy）。
+            assert_eq!(exports.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(exports.load(Ordering::SeqCst), 0);
+        {
+            let _install = Installing::close(&installing);
+            assert!(Exporting::admit(&exports, &installing).is_err());
+            assert_eq!(exports.load(Ordering::SeqCst), 0, "a refused export leaves no count behind");
+        }
+        // 安装没有进行下去（守卫离开作用域）后重新接受导出。
+        assert!(Exporting::admit(&exports, &installing).is_ok());
+    }
 
     fn active() -> Arc<Active> {
         Arc::new(Active {
@@ -1348,7 +1500,7 @@ mod tests {
         let dest = dir.join("hello.txt");
         std::fs::write(&dest, b"old contents").unwrap(); // 用户已在对话框里确认覆盖
 
-        let mut sink = BlobSink::create(&dir).unwrap();
+        let mut sink = BlobSink::create(&dir, false).unwrap();
         sink.write(b"he").unwrap();
         sink.write(b"llo").unwrap();
         assert_eq!(sink.finish(HELLO_SHA256, &dest), Ok(5));
@@ -1362,12 +1514,12 @@ mod tests {
         let dir = scratch_dir("mismatch");
         let dest = dir.join("out.bin");
 
-        let mut sink = BlobSink::create(&dir).unwrap();
+        let mut sink = BlobSink::create(&dir, false).unwrap();
         sink.write(b"tampered").unwrap();
         assert_eq!(code(sink.finish(HELLO_SHA256, &dest)), "io");
         assert!(entries(&dir).is_empty());
 
-        let mut sink = BlobSink::create(&dir).unwrap();
+        let mut sink = BlobSink::create(&dir, false).unwrap();
         sink.write(b"partial").unwrap();
         assert_eq!(entries(&dir).len(), 1);
         drop(sink); // 下载中途出错或代次变化

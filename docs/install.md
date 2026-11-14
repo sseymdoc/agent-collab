@@ -1,7 +1,7 @@
 # 本地发行包与安装运维
 
 Python 3.9+、标准库、系统自带工具；安装器不下载 Python、依赖、模型工具或发行包，不提供发布 URL。
-使用可信的本地源码或已核对来源的本地发行包。manifest 校验能发现损坏/篡改文件，**不提供签名或发行者身份认证**。
+使用可信的本地源码或已核对来源的本地发行包。manifest 校验能发现损坏/篡改文件；独立发行包通过 OpenSSH 签名与固定的 allowed_signers 验证来源，哈希清单本身不认证发行者。
 共享实现为 `agent_collab/installer.py`；`install.sh` 和 `install.ps1` 只查找 Python、禁用字节码写入并转交参数。
 
 ## 构建和目录
@@ -19,7 +19,8 @@ python3 -B scripts/build_release.py --version 0.1.0
 否则 `ui_built=false`，controller 仍可通过 API 使用。安装器不负责构建 UI。
 
 manifest 记录版本、构建时间、Git HEAD（若可用）、工作区是否脏、Python 要求、schema 兼容范围、
-schema 指纹、每个载荷文件的 SHA-256 与大小。manifest 自身不递归计算自己的哈希。
+schema 指纹、`protocol_version`、`features`、`compat`、每个载荷文件的 SHA-256 与大小。
+协议字段从源码 `protocol.py` 的字面量通过 AST 读取，不导入或执行被打包的模块。构建脚本不签名；流水线在最终归档字节上签名。manifest 自身不递归计算自己的哈希。
 版本目录不可覆盖：同一个版本必须使用同一个包；修改源码后请使用新版本号。
 校验在内存中完成；本版单包解压后最多 512 MiB、20,000 个文件，不适合直接打包大型模型或运行数据。
 
@@ -30,6 +31,9 @@ schema 指纹、每个载荷文件的 SHA-256 与大小。manifest 自身不递�
   current -> versions/<version>  # POSIX 原子符号链接
   current.txt                 # Windows 原子替换的版本指针；启动脚本每次读取
   installation.json           # 安装参数、当前和上一版本、desired；没有令牌内容
+  update-journal.json         # 最近一次安装/升级/回退的持久步骤与恢复信息
+  trust/allowed_signers       # 固定的 OpenSSH 发行信任
+  release-sources/<version>/  # 原始包与可选签名；回退重新验签
   bin/agent-collab            # POSIX 命令入口；Windows 为 agent-collab.ps1
   launcher.py, services/      # 启动器与已渲染的服务定义
 <state-dir>/
@@ -101,7 +105,7 @@ MultipleInstancesPolicy=IgnoreNew 防止重叠，已有实例运行时重复触�
 采用时间触发器的依据是同一台机器上的实测：原任务定义里的 RestartOnFailure（保留，间隔 1 分钟、最多 3 次）
 没有覆盖进程被强制结束这种退出；挂在登录触发器上的重复要到下一次登录才生效，
 而安装和升级都是在会话中途重新注册任务。安装器停止任务前先禁用它，启动时重新启用，避免触发器在切换版本期间拉起进程。
-安装器在停止与启动之间被强行终止时，任务停留在禁用状态、不会自行恢复：按“Doctor、drain、升级、回退”一节核对安装状态后运行 `service start`。
+安装器在停止与启动之间被强行终止时，任务停留在禁用状态、不会自行恢复：先运行 `install --discover`，再按“中断与恢复”一节使用 `install --recover`。
 agent.lock 在 Windows 使用非阻塞字节锁、POSIX 使用 flock，第二个同数据目录进程立即失败。
 
 Windows worker 缺省工作区为 `%SystemDrive%\agent-collab-work\<用户名>`，可用 `--workspace-root` 指定。
@@ -180,7 +184,7 @@ Windows 将入口换为 `.\installer\install.ps1`、路径换为本地磁盘，`
 | `--dry-run` | 验证包并打印步骤，不写文件或调用变更 API |
 | `--rollback` | 回到记录的上一版本；先检查当前 schema，不能单纯换二进制 |
 | `--uninstall` | 移除服务、启动器、current 和当前活动版本；保留数据与其他归档版本 |
-| `--purge-code` | 仅与卸载合用，额外删除整个 versions 和 runtime；仍不删除 state-dir |
+| `--purge-code` | 仅与卸载合用，额外删除整个 versions 和 runtime；仍不删除 state-dir。Windows 上经已安装的启动器卸载时，卸载进程正从 runtime 运行，删不掉它：此时保留 runtime 并提示，再从桌面端或别的 Python 运行一次卸载即可删除 |
 | `--admin-token-file <文件>` | drain 所需管理员令牌文件；只读取，不复制；all-in-one 默认读取本地 controller/admin.token |
 | `--drain` | 只排空并等待，完成后保持 drain=true，供独立维护使用 |
 | `--drain-timeout <秒>` | 默认 300；超时中止升级，旧版本不被停止，尝试恢复原 drain 状态 |
@@ -285,7 +289,7 @@ start/stop 成功时 JSON 输出含完整 desired 映射；任一步失败时输
 要避免这种情况，先排空并等活动 attempt 归零再停。升级、同版本重装、回退和失败后的自动回滚都保留当前 desired，
 不会用 previous 记录里的历史意图覆盖它。切换版本时的临时停止也不改变 desired。
 stopped 组件仍更新服务定义，但 Windows 任务注册为禁用且不 Run，macOS 保持 disable 且不 bootstrap/kickstart，
-Linux 不 enable/start；stdout 写明 `kept stopped: <组件名>`。这些组件不调用 drain、在线 doctor 或等待心跳，只核对 manifest/schema；
+Linux 不 enable/start；stdout 写明 `kept stopped: <组件名>`。这些组件不调用 drain、在线 doctor 或等待心跳；使用安装记录的解释器从目标版本目录导入对应模块，核对 manifest/schema；
 活动 attempt 检查和状态锁仍然有效。running 组件继续按原有健康检查流程验收。
 进程异常退出由服务管理器恢复（Windows 每分钟的时间触发器、launchd KeepAlive、systemd `Restart=on-failure`），
 被 `service stop` 停用的节点不受这些机制影响。
@@ -360,7 +364,7 @@ macOS 与 Linux 使用系统自带 sshd，按同样原则限制来源与账户�
 ```sh
 PREFIX="$HOME/.local/share/agent-collab"
 "$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role worker
-# 离线只检查 current、manifest、schema，运行状态显式 unknown：
+# 离线检查 current、manifest、schema 与目标模块导入，运行状态显式 unknown：
 "$PREFIX/bin/agent-collab" doctor --prefix "$PREFIX" --role worker --no-service
 
 "$PREFIX/bin/agent-collab" install --prefix "$PREFIX" --drain \
@@ -379,6 +383,7 @@ controller-only 升级不需要远端管理员令牌；离线安装的上述 ins
 `--admin-token-file` 指向的文件里放其中任意一种持有者令牌，由有权限的运维通过已有安全渠道在执行机器准备；安装器不会自行复制它。
 
 排空使用当前 node version + 新 request_id，等待 `active_attempts=0`，缺失字段不视为空闲。
+节点视图提供 `pending_writebacks` 时还必须等它为整数 0；缺失时按旧 controller 只等 attempts，并明确提示“未核对写回操作”。
 drain 不强杀活动 attempt；超时或网络错误在停服务之前中止。升级完成会恢复原 drain 值。
 独立 `--drain` 后要恢复接单，先查询最新版本，再显式提交：
 
@@ -391,9 +396,11 @@ drain 不强杀活动 attempt；超时或网络错误在停服务之前中止。
 
 将 42 换成 GET 返回的该节点当前版本；CLI 会补 request_id。
 
-升级/回退首先检查本地 attempts/*/meta.json；有 preparing/running 时提示先排空并拒绝，除非显式 --allow-active。
+升级/回退首先检查本地 `attempts/*/meta.json` 和 `operations/*.json`：
+有 preparing/running attempt，或 claimed/queued/running/finished 写回操作时拒绝；finished 表示结果尚未报告。
+提示包含写回总数与各状态计数，不包含本机项目路径。`--allow-active` 是显式覆盖，本机进程锁与 schema 检查仍生效。
 停服取得锁后再次检查，防止检查到停服之间新领任务。升级保留 agent.json 自定义键，不重配已有节点身份。
-升级顺序：验证所有包文件和本地活动状态 → 写入新 versions 目录 → 排空 worker → 停服务/确认锁 → controller backup →
+升级顺序：兼容检查与来源/文件核对 → 写入新 versions 目录 → 排空 worker → 停服务/确认锁 → controller backup →
 切换指针和固定版本服务定义 → 按 desired 启动或保持停用 → 为 running worker 核对 status.json → doctor（stopped 仅离线）→ 恢复 drain → 写成功记录。
 失败会停止新版本，重新验证旧 manifest 与数据库兼容性后切回旧版，仍按原 desired 决定启停。失败的新代码和所有备份保留，以便审查。
 worker 的 status.json 必须来自新版本目录、匹配 version/git_commit，包含有效 PID 与此次启动后的成功心跳时间；
@@ -424,15 +431,115 @@ runuser -u agent-collab -- "<PYTHON>" -B -m agent_collab.controller restore \
 非 Linux 受管安装换成对应的 `--prefix`/`--state-dir`，并以安装时的用户执行。
 
 restore 会递增 `authority_generation`、撤销旧租约、暂停派单，并要求人工对账；不要手工覆盖数据库或只改 current。
-安装过程中断或 schema 不兼容导致自动回退拒绝时，安装器保留不一致的指针/记录并拒绝继续猜测；
-先检查备份、current、installation.json 与服务定义，在恢复兼容数据后由运维核对并修复记录。
-`.install-lock` 采用独占目录；异常断电后只应在确认没有安装器运行且核对上述状态后清理此锁。
+安装过程中断或 schema 不兼容导致自动回退拒绝时，按下节对账；不要手工覆盖 current、installation.json 或先删除锁。
 
 doctor 汇总原有 controller `/api/v1/doctor` 与 `node_agent doctor` 输出、服务状态、current 和 manifest 校验。
 controller doctor 需要管理员权限；组件不可达时报告 `unknown` 与错误类型，返回非零。
 worker 部分含 `effective`：不含密钥的最终生效配置，用来在一处核对节点身份与并发、工作区、解释器，
 以及每个 harness 的可执行文件、PATH 前置目录和 `managed_argv`（由适配器实际使用的参数构造函数生成，运行期才确定的值显示为占位符）。
+停用组件与 `--no-service` 的 doctor 在安装解释器中执行目标模块导入，不启动服务、不监听端口；
+组件结果为 `status=offline`、`imports=verified`、`runtime=unknown`，同时写入 journal 的 health 步骤。
 `--no-service` 的 ok 仅说明离线结构检查通过，不代表服务运行、TLS 连通、模型工具登录或真实任务已验收。
+
+## 发行签名、版本与兼容
+
+后台版本只接受 `X.Y.Z[{a|b|rc}N][.devN]`，必须有三段数字，`X.Y`、semver 后缀、epoch、post 和 local 形式被拒绝。
+比较按 [PEP 440 的版本顺序](https://packaging.python.org/en/latest/specifications/version-specifiers/)：
+`0.2.0.dev7 < 0.2.0a1.dev1 < 0.2.0a1 < 0.2.0b1 < 0.2.0rc9 < 0.2.0rc10 < 0.2.0`。
+普通安装拒绝低于当前版本的包；`--rollback` 只回到记录的上一版本，`--allow-downgrade` 可明确选择更旧的包，两者均检查 schema。
+
+签名命名空间与身份均固定为 `agent-collab-release`，验证调用系统的
+[`ssh-keygen -Y verify`](https://man.openbsd.org/ssh-keygen)，不实现自定义签名算法：
+
+```sh
+# 发行流水线在最终包上签名（签名后不能改包）
+ssh-keygen -Y sign -f /secure/release-key -n agent-collab-release agent-collab-0.2.0.tar.gz
+# allowed_signers 每行：agent-collab-release ssh-ed25519 AAAA...（由可信渠道取得公钥）
+sh installer/install.sh --release /local/agent-collab-0.2.0.tar.gz \
+  --signature /local/agent-collab-0.2.0.tar.gz.sig --allowed-signers /local/allowed_signers \
+  --prefix "$PREFIX" --role worker --controller-url https://controller.example:8443 --pairing-code ONE_TIME_CODE
+```
+
+首次传入 `--allowed-signers` 后固定到 `<prefix>/trust/allowed_signers`。以后升级与回退使用固定文件；
+传入不同内容必须同时指定 `--replace-trust`，输出会提示替换。验签失败不更换信任；没有可用的 ssh-keygen 时拒绝验签操作（见下面“验签工具”）。
+信任文件按字节核对，换行或注释改变也算变更。签名与待安装字节绑定，归档保留在 `release-sources/<version>/`；
+回退重新核对保存的归档签名与当前版本目录逐文件清单。固定信任后，没有签名的包被拒绝，只有明确 `--allow-unsigned` 才放行；
+没有固定信任且不提供签名时可以安装，但输出“未验证来源”。显式提供的无效签名始终被拒绝。
+已有旧版本没有保存归档时，固定信任后的回退需要明确 `--allow-unsigned` 或先提供并安装可验证的同版本发行包。
+自动回退也核对当前信任；不能证明来源或 schema 兼容时保留 `pending`。`--dry-run` 验签但不固定或替换信任。
+
+### 验签工具（OpenSSH 8.1 以上）
+
+`-Y verify` 从 OpenSSH 8.1 开始提供。安装器依次尝试：Windows 上系统自带的 OpenSSH 客户端（`%SystemRoot%\System32\OpenSSH\ssh-keygen.exe`）、Microsoft Win32-OpenSSH 安装包的位置（`%ProgramFiles%\OpenSSH\ssh-keygen.exe`，它不加进 PATH），最后是 PATH 上的 `ssh-keygen`；macOS 与 Linux 按 PATH（macOS 为系统自带的 `/usr/bin/ssh-keygen`）。结果分四种，都在改动安装、服务与信任之前给出：
+
+| 情况 | 安装器的处理 | 输出 |
+| --- | --- | --- |
+| 找不到 ssh-keygen | 拒绝 | `release signature verification unavailable: ssh-keygen was not found` 加获取办法 |
+| 工具不支持 `-Y verify`（8.1 之前的版本） | 换下一个工具；都不行就拒绝 | `… does not support "ssh-keygen -Y verify" (<ssh -V 的版本>)` 加更新办法 |
+| 工具无法运行或没有给出结果 | 换下一个工具；都不行就拒绝 | `… could not run …` 或 `… ended without a verification result` |
+| 签名、signer 或 namespace 不符 | 立即拒绝，不再试别的工具 | `release signature verification failed: …` |
+
+Windows 上的获取与更新（只用本机验签工具，不需要启用 sshd 或开放 22 端口）：
+
+```powershell
+& "$env:SystemRoot\System32\OpenSSH\ssh.exe" -V                 # 系统自带客户端的版本
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0    # 没有时安装（管理员；或“设置 → 可选功能 → OpenSSH 客户端”）
+msiexec /i OpenSSH-Win64-<版本>.msi ADDLOCAL=Client             # 低于 8.1 时：Microsoft Win32-OpenSSH 的 MSI，只装客户端
+```
+
+Win32-OpenSSH 的 MSI 来自 Microsoft 维护的 [PowerShell/Win32-OpenSSH](https://github.com/PowerShell/Win32-OpenSSH/releases) 发布页，装到 `%ProgramFiles%\OpenSSH`；安装器会找到它，不需要改 PATH。
+
+```sh
+python3 -B -m agent_collab release inspect /local/agent-collab-0.2.0.tar.gz
+python3 -B -m agent_collab release compare 0.2.0rc9 0.2.0rc10
+python3 -B -m agent_collab release compat --release /local/agent-collab-0.2.0.tar.gz \
+  --as worker --controller https://controller.example:8443 --profile default
+python3 -B -m agent_collab release compat --release /local/agent-collab-0.2.0.tar.gz \
+  --as controller --controller-info /local/controller-client.json
+```
+
+`inspect` 只读核对逐文件哈希并输出完整 manifest，不把哈希通过表述为来源认证。`compare` 的 comparison 为 -1、0 或 1。
+`compat` 输出 JSON，退出码分别为 accept=0、degraded=1、reject=2；连接选项沿用 CLI 的 `--profile`、`--token-file`、`--ca-file`。
+`--controller-info` 接受 `GET /client` 原始 JSON（含 controller）或其中的 controller 对象。
+
+- 协议版本不同、缺 `worker_requires`、controller 低于可选声明 `worker_min_controller`、节点低于 controller 的 `controller_min_worker`：reject。
+- 缺 `worker_optional`：degraded，列出缺失 features 和受影响功能；其余已核对约束满足时 accept。
+- 作为 controller 检查时，在线读取 `GET /nodes`；离线文件可附 `nodes` 数组。现有非退役节点低于目标 `controller_min_worker` 时拒绝，先节点后 controller。
+- 旧 manifest/controller 缺 protocol 或 compat、无法取得节点列表/版本：degraded 并列出 unchecked；不推断核对成功。
+- 安装器的 compat 步骤复用同一判断。运行中的 controller 使用本机管理令牌；worker 使用 `--admin-token-file`，节点令牌没有 `/client` 权限。
+  不可达、停用或没有获授权凭据时明确记录未核对在线兼容性；能取得信息时 reject 阻止升级，degraded 提示后继续。schema 检查独立生效。
+
+## 中断与恢复
+
+`update-journal.json` 用原子替换持久保存最近一次 install/upgrade/rollback，包括 op_id、from/to、pid、时间、desired、
+旧安装记录、目标配置与原 drain 值；不记录配对码、令牌内容或任务内容。
+步骤固定为 `compat → verify → prepare → backup → switch → health`，每步开始与结束均写入时间和简短说明。
+步骤状态为 pending/running/done/failed（未执行的步骤保留 pending）；事务状态为 running/done/failed/pending。
+切换前失败且旧状态恢复时记 failed；切换后失败按 schema 与来源检查自动回退，无法确认或回退失败记 pending。
+
+```sh
+# 从可信安装器入口执行；指针损坏时不要依赖已安装的 launcher
+python3 -B installer/entry.py --prefix "$PREFIX" --discover
+python3 -B installer/entry.py --prefix "$PREFIX" --recover --admin-token-file /local/authorized-admin.token
+python3 -B installer/entry.py --prefix "$PREFIX" --recover --rollback --admin-token-file /local/authorized-admin.token
+```
+
+`--discover` 只读返回 interrupted 摘要、实际指针版本、installation.json 版本和 PID 存活情况，不清锁、不恢复服务。
+发现未结束 journal 或残留锁时，普通安装、升级与服务变更拒绝继续，并提示恢复选项。
+`--recover` 只在旧 PID 已退出时对账；PID 存活或无法判断时不接管。
+
+| 实际状态 | 恢复行为 |
+| --- | --- |
+| 指针仍为旧版本 | 校验旧目录与 schema，恢复服务定义、desired 和原 drain；journal 记 failed |
+| 指针为新版本，记录仍为旧版本 | 核对已完成的准备步骤、manifest、签名与 schema，再注册服务、按 desired 启动、健康检查、恢复 drain、写安装记录；记 done |
+| 新版本指针，显式 `--recover --rollback` | 核对旧版本来源和 schema 后切回旧版；保持当前期望状态，记 failed |
+| 首次安装在切换前中断 | 无旧服务可恢复，记 failed，保留已初始化状态供再次安装 |
+| 指针/记录/步骤不能对账、同版本切换阶段不明、schema 不兼容或恢复失败 | 保留 pending 与说明，不猜测成功 |
+
+原本 stopped 的组件在恢复、回退中仍为 stopped，只做离线健康检查。恢复过程中再次终止时，OS 会释放恢复互斥锁，
+下一次仍按 journal 与实际状态对账。恢复可能需要重新提供临时管理凭据；固定信任下恢复无签名版本仍需 `--allow-unsigned`。
+没有 journal 的旧安装照常升级，首次经新安装器更新后开始记录；没有 journal 的旧残留锁只能人工核对，不能自动猜测恢复。
+普通兼容升级与 `--recover` 都使用正常停止/启动语义，不调用 `controller restore` 或切换屏障；数据库恢复属于独立运维操作。
 
 ## 卸载与验证边界
 
@@ -445,6 +552,25 @@ sh installer/install.sh --prefix "$PREFIX" --uninstall --purge-code
 离线安装继续加 `--no-service`。默认删除活动版本，归档代码与 runtime 保留；`--purge-code` 才删除全部 versions 和 runtime。
 任何卸载模式都不删除 state-dir、备份、节点身份、任务历史、业务工作区或官方工具登录配置，
 不删除 Linux 专用账户，不改反向代理。保留最小 installation.json 以支持幂等卸载和重新安装。
+卸载可以重复运行：上一次 `--purge-code` 删到一半（例如 Windows 上运行时的文件正被别的进程占着）时，结束占用的进程后再运行一次即可接着删除，卸载不运行安装记录里的那个解释器。
+
+### 卸载桌面端时的本机后台
+
+桌面端与本机后台（controller、节点的服务与程序文件）分开安装、分开卸载。卸载桌面端默认不动后台，桌面端覆盖更新也就不会停掉不需要更新的后台。
+
+| 平台与方式 | 本机后台 | 程序文件（`versions`、`runtime`） | 状态目录（数据库、节点身份、备份、日志） |
+| --- | --- | --- | --- |
+| Windows 交互卸载，询问时选“是” | 停用并移除服务与启动项（与桌面端“卸载本机后台”同一个安装器操作） | 移除 | 保留，完成后提示位置；要彻底删除，自行删除这个目录 |
+| Windows 交互卸载，没有完全清除 | 提示“没有完全清除”与安装器结果（输出在“显示细节”里）；可以选“否”取消这次卸载、保留桌面端，关闭占用文件的程序后再运行卸载程序接着清除；选“是”照常卸载桌面端 | 可能残留，不会自行运行 | 保留 |
+| Windows 交互卸载选“否”，或静默卸载（`/S`） | 保留并继续运行；前缀里写 `desktop-uninstalled.txt`，记下实例、前缀、状态目录与继续管理的方法 | 保留 | 保留 |
+| macOS 把应用移到废纸篓 | 保留并继续运行：两个 LaunchAgent 指向前缀里的托管运行时，不引用应用包 | 保留 | 保留 |
+
+之后要移除保留下来的后台：重新安装桌面端，在连接页“本机服务”里卸载；或用前缀里的命令入口（Windows 上它保留自己正在使用的 `runtime`，之后可以直接删除这个目录）：
+
+```sh
+"$PREFIX/bin/agent-collab" install --prefix "$PREFIX" --uninstall --purge-code      # macOS / Linux
+& "$Prefix\bin\agent-collab.ps1" install --prefix $Prefix --uninstall --purge-code   # Windows PowerShell
+```
 
 测试所有临时目录都在仓库 `.dev/tmp`，不注册真实服务、不写用户全局配置、不调用模型或真实控制端：
 

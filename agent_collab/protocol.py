@@ -62,7 +62,22 @@ FEATURES = ('clients', 'model_settings', 'node_models', 'contract_draft', 'basel
             # §13：项目与项目默认值、成果下载与应用记录、节点管理（配对码、维护、退役、管理操作）、协调设置、原始日志取回。
             'projects', 'applications', 'node_admin', 'coordination_settings', 'raw_logs',
             # §13.10：经目标节点的受限操作把成果写回该节点本机绑定的项目目录；节点看到它才上报 project_bindings。
-            'remote_apply')
+            'remote_apply',
+            # §14（ADR 0004）：备份与恢复预览、回退预检与切换屏障预检的维护 API；节点视图带 pending_writebacks。
+            'maintenance')
+# §14（ADR 0004）发行兼容声明：发行清单（release-manifest.json）原样带上，`agent-collab release compat` 据此判断。
+# 同一 PROTOCOL_VERSION 内按 features 判断；版本号按 release.parse_version 的语义比较，不按字符串。
+COMPAT = {
+    # 本版本作为节点：controller 缺少其中任何一项就拒绝（节点无法正常注册与领取任务）。
+    'worker_requires': ('clients', 'model_settings', 'node_models'),
+    # 本版本作为节点：controller 缺少这些时降级（对应功能不可用），不拒绝。
+    'worker_optional': ('catalog_provenance', 'node_admin', 'remote_apply'),
+    # 本版本作为 controller：接受的最低节点版本。更旧的节点要先升级（升级顺序是先节点、后 controller）。
+    'controller_min_worker': '0.1.0rc9',
+    # 桌面端与 CLI 要求 controller 具备的 features；缺少时拒绝连接后的相应操作并提示先升级 controller。
+    'client_requires': ('clients', 'model_settings', 'contract_draft'),
+    'client_optional': ('projects', 'applications', 'node_admin', 'coordination_settings', 'raw_logs', 'remote_apply', 'maintenance'),
+}
 # 项目应用操作（§13.4）的状态：started 是写入前登记的意图；其余是客户端（或远端写回的目标节点）如实上报的结果。
 APPLICATION_FINAL = ('applied', 'partial', 'conflict', 'failed', 'unknown')
 # 远端项目写回（§13.10）的操作：参数只由 controller 按任务记录填写，不经通用的节点操作端点下发。

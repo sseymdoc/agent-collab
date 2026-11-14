@@ -7,6 +7,9 @@
     agent-collab doctor ...       # 安装完整性、服务及 controller/agent 检查
     agent-collab service ...      # 受管服务 start、stop、status
     agent-collab migrate ...      # 迁移预检（只读盘点）与隔离副本上的升级预演
+    agent-collab maintenance ...  # 备份、备份核对与保留、恢复预览与离线恢复、切换屏障预检，见 maintenance --help
+    agent-collab release ...      # 发行清单核对、版本比较与组件兼容检查，见 release --help
+    agent-collab diagnostics ...  # 本机诊断导出（脱敏、只落本机），见 diagnostics --help
 
 客户端子命令与桌面端共用同一套 API 和授权（docs/protocol.md §12），输出都是 JSON：
 
@@ -830,7 +833,9 @@ def _migrate(argv):
     raise SystemExit('用法：agent-collab migrate preflight ... | agent-collab migrate rehearse ...')
 
 
-MODULES = {'controller': 'agent_collab.controller', 'agent': 'agent_collab.node_agent', 'legacy': 'agent_collab.legacy'}
+MODULES = {'controller': 'agent_collab.controller', 'agent': 'agent_collab.node_agent', 'legacy': 'agent_collab.legacy',
+           # §14（ADR 0004）：备份、恢复与预检（maintenance），发行清单与兼容检查（release），本机诊断导出（diagnostics）。
+           'maintenance': 'agent_collab.maintenance', 'release': 'agent_collab.release_tools', 'diagnostics': 'agent_collab.diagnostics'}
 def _project(argv):
     from . import project_cli
     return project_cli.main(argv)

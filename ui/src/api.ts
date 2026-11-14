@@ -185,6 +185,18 @@ export const api = {
   drain: (node: string, v: number, drain: boolean, migrate = false) =>
     call('POST', '/nodes/' + node + '/drain', { request_id: uuid(), expected_version: v, drain, ...(drain && migrate ? { migrate: true } : {}) }),
   dispatch: (paused: boolean, v: number) => call('POST', '/dispatch', { request_id: uuid(), paused, expected_version: v }),
+  // 维护（§14，maintain 权限）：备份只写到 controller 预授权的备份位置，请求里没有服务器路径。
+  backups: () => call('GET', '/maintenance/backups'),
+  createBackup: (label: string) => call('POST', '/maintenance/backups', { request_id: uuid(), ...(label ? { label } : {}) }),
+  verifyBackup: (id: string) => call('POST', '/maintenance/backups/' + encodeURIComponent(id) + '/verify', { request_id: uuid() }),
+  restorePreview: (id: string) => call('GET', '/maintenance/restore-preview?backup_id=' + encodeURIComponent(id)),
+  barrierPreview: () => call('GET', '/maintenance/barrier-preview'),
+  maintenanceOperation: (op: string) => call('GET', '/maintenance/operations/' + op),
+  backupPolicy: () => call('GET', '/settings/backups'),
+  saveBackupPolicy: (revision: number, keep: number) => call('PUT', '/settings/backups', { request_id: uuid(), expected_revision: revision, keep }),
+  // 明确弃置一个待发布的成果：只记录弃置，不删除任何东西；之后切换屏障不再因它阻断。
+  dismiss: (id: string, wp: string, v: number, reason: string, cp: string) =>
+    call('POST', '/jobs/' + id + '/dismiss', { request_id: uuid(), expected_version: v, reason, checkpoint_id: cp }, coordHeader(wp)),
 }
 
 // 管理操作是异步记录：轮询到结果确定（succeeded / failed / timed_out）。alive() 为 false 时（页面已离开）停止。

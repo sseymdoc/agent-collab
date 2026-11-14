@@ -628,3 +628,50 @@ class RuntimeTests(unittest.TestCase):
             self.cycles(2)
         self.until(lambda: bool(self.fake.completions))
         self.assertEqual(self.fake.completions[assignment['attempt_id']]['failure_class'], 'infra_retryable')
+
+
+class XcodeShimTests(unittest.TestCase):
+    """干净的 macOS（没装开发者工具）上 /usr/bin/git、/usr/bin/python3 只是占位程序：运行它们会在用户桌面弹出安装提示。"""
+
+    def test_shims_without_developer_tools_count_as_missing(self):
+        from agent_collab.adapters import commands
+        import subprocess
+        calls = []
+        missing = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 2)
+        present = lambda argv, **kw: subprocess.CompletedProcess(argv, 0)
+        with patch.object(commands.shutil, 'which', side_effect=lambda name, path=None: None if path else '/usr/bin/' + name):
+            self.assertIsNone(commands.which('git', system='Darwin', runner=missing))
+            self.assertEqual(calls, [['/usr/bin/xcode-select', '-p']])  # 只查询，不运行 git 本身
+            self.assertEqual(commands.which('git', system='Darwin', runner=present), '/usr/bin/git')
+            self.assertEqual(commands.which('git', system='Linux', runner=missing), '/usr/bin/git')
+            self.assertEqual(commands.which('node', system='Darwin', runner=missing), '/usr/bin/node')
+
+    def test_real_tool_later_in_path_is_found_after_a_shim(self):
+        from agent_collab.adapters import commands
+        import subprocess
+        missing = lambda argv, **kw: subprocess.CompletedProcess(argv, 2)
+        found = lambda name, path=None: '/usr/bin/' + name if path is None else (
+            '/opt/homebrew/bin/' + name if '/opt/homebrew/bin' in path.split(os.pathsep) and '/usr/bin' not in path.split(os.pathsep) else None)
+        with patch.object(commands.shutil, 'which', side_effect=found), \
+                patch.dict(commands.os.environ, {'PATH': os.pathsep.join(['/usr/bin', '/opt/homebrew/bin'])}):
+            self.assertEqual(commands.which('git', system='Darwin', runner=missing), '/opt/homebrew/bin/git')
+        # 后台服务的 PATH 只有系统目录时也补上 Homebrew 目录。
+        with patch.object(commands.shutil, 'which', side_effect=found), patch.dict(commands.os.environ, {'PATH': '/usr/bin'}):
+            self.assertEqual(commands.which('git', system='Darwin', runner=missing), '/opt/homebrew/bin/git')
+
+    def test_detect_and_git_scan_do_not_run_shims_on_a_clean_mac(self):
+        import subprocess
+        from agent_collab import project
+        probed = []
+        commands = {name: dict(argv=[], env={}, disabled=None) for name in ('codex', 'claude')}
+        with patch('agent_collab.adapters.commands.platform.system', return_value='Darwin'), \
+             patch('agent_collab.adapters.commands.shutil.which', side_effect=lambda name, path=None: '/usr/bin/' + name if name in ('git', 'python3') and path is None else None), \
+             patch('agent_collab.adapters.commands.subprocess.run', return_value=subprocess.CompletedProcess([], 2)), \
+             patch('agent_collab.node_agent.probe', side_effect=lambda argv, **kw: probed.append(argv)):
+            tools = detect(commands=commands)['tools']
+            with tempfile.TemporaryDirectory() as root:
+                (Path(root) / '.git').mkdir()
+                self.assertEqual(project.git_info(Path(root)), {'available': False})
+        self.assertIsNone(tools['git'])
+        self.assertIsNone(tools['python3'])
+        self.assertEqual(probed, [])

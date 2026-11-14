@@ -98,7 +98,7 @@ class InstallerTests(unittest.TestCase):
         (source / 'agent_collab/static/index.html').write_text('<html>built</html>')
         (source / 'LICENSE').write_bytes(b'MIT License\n')
         (source / 'THIRD_PARTY.md').write_bytes(b'# notices\n')
-        tar, _ = builder.build_release(source, self.temp / 'out', 'ui-test')
+        tar, _ = builder.build_release(source, self.temp / 'out', '1.0.0.dev1')
         manifest, files = ins.read_release(tar)
         self.assertTrue(manifest['ui_built'])
         self.assertIn('agent_collab/static/index.html', files)
@@ -114,7 +114,7 @@ class InstallerTests(unittest.TestCase):
         (self.temp / 'outside.txt').write_text('not a license')
         (source / 'LICENSE').symlink_to(self.temp / 'outside.txt')
         with self.assertRaisesRegex(ValueError, 'symlink'):
-            builder.build_release(source, self.temp / 'out-link', 'link-test')
+            builder.build_release(source, self.temp / 'out-link', '1.0.0.dev2')
 
     def test_tamper_rejected_before_any_prefix_or_state_write(self):
         def tamper(manifest, files):
@@ -169,6 +169,12 @@ class InstallerTests(unittest.TestCase):
             env=dict(os.environ, TMPDIR=str(ROOT / '.dev/tmp'), PYTHONDONTWRITEBYTECODE='1'))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(list(self.temp.iterdir()), [])
+
+    def test_build_scripts_compile(self):
+        # 发行流水线脚本没有单独的测试，至少保证它们能被解析（M3 收尾时一处转义错误只在构建时才暴露）。
+        for path in sorted((Path(__file__).resolve().parents[1] / 'scripts').glob('*.py')):
+            with self.subTest(script=path.name):
+                compile(path.read_text(encoding='utf-8'), str(path), 'exec')
 
     @unittest.skipUnless(shutil.which('pwsh') or shutil.which('powershell.exe'), 'PowerShell parser unavailable')
     def test_powershell_scripts_parse(self):
@@ -364,7 +370,7 @@ class InstallerTests(unittest.TestCase):
         config = ins.read_json(self.prefix / 'installation.json')['config']
         result = ins.doctor(config, offline=True)
         self.assertEqual(result['services']['controller'], 'unknown')
-        self.assertEqual(result['components']['controller'], 'unknown')
+        self.assertEqual(result['components']['controller'], {'status': 'offline', 'imports': 'verified', 'runtime': 'unknown'})
         self.assertTrue(result['ok'])
         (self.prefix / 'versions/1.0.0/agent_collab/cli.py').write_text('tampered')
         self.assertFalse(ins.doctor(config, offline=True)['ok'])
@@ -381,7 +387,7 @@ class InstallerTests(unittest.TestCase):
         # systemd 双引号内反斜杠需转义；在 Windows 上运行本测试时路径含反斜杠。
         quoted = lambda path: str(path).replace('\\', '\\\\')
         self.assertNotIn(str(self.prefix / 'current'), controller)
-        self.assertIn('ReadWritePaths="' + quoted(self.state / 'controller') + '"', controller)
+        self.assertIn('ReadWritePaths="' + quoted(self.state / 'controller') + '" "' + quoted(self.state / 'backups') + '"', controller)
         # systemd 不解析 WorkingDirectory 的引号：必须是未加引号的绝对路径（ECS 实装回归）。
         for unit in linux.values():
             line = next(x for x in unit.decode().splitlines() if x.startswith('WorkingDirectory='))

@@ -11,3 +11,8 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.token
+# 构建时生成（build.rs、发行流水线），不入库。
+/desktop/src-tauri/windows/instance.nsh
+/desktop/src-tauri/resources/payload.json
+/desktop/src-tauri/resources/runtime/
+/desktop/src-tauri/resources/release/

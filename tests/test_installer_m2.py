@@ -84,6 +84,7 @@ class InstallerM2Tests(unittest.TestCase):
                 text = 'state = running' if system == 'Darwin' else 'Running' if system == 'Windows' else 'active'
             return subprocess.CompletedProcess(argv, 0, text, '')
         stack.enter_context(patch.object(ins, 'run', side_effect=runner))
+        stack.enter_context(patch.object(ins, 'release_compatibility', return_value={'decision': 'accept'}))
         stack.enter_context(patch.object(ins.platform, 'system', return_value=system))
         stack.enter_context(patch.object(ins.os, 'getuid', return_value=501, create=True))
         stack.enter_context(patch.object(ins.Path, 'home', return_value=self.temp / 'home'))
@@ -227,6 +228,36 @@ class InstallerM2Tests(unittest.TestCase):
         self.invoke(self.offline_args('--uninstall', '--purge-code'))
         self.assertFalse((self.prefix / 'runtime').exists())
 
+    @patch.object(ins.platform, 'system', return_value='Darwin')
+    def test_purge_keeps_the_runtime_this_uninstaller_runs_from(self, _system):
+        # Windows 上经已安装的启动器卸载时，进程就是 runtime 里的 Python，删不掉它的 DLL；其余照常卸载，再次卸载删掉运行时。
+        self.invoke(self.offline_args('--release', str(self.v1), '--runtime', str(self.runtime_source('first'))))
+        with patch.object(ins, 'runtime_in_use', return_value=True):
+            out, _ = self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        self.assertIn('was kept', out)
+        self.assertTrue((self.prefix / 'runtime').is_dir())
+        self.assertFalse((self.prefix / 'versions').exists())
+        self.assertFalse((self.prefix / 'bin').exists())
+        self.assertIsNone(ins.read_json(self.prefix / 'installation.json')['version'])
+        self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        self.assertFalse((self.prefix / 'runtime').exists())
+
+    @patch.object(ins.platform, 'system', return_value='Darwin')
+    def test_uninstall_finishes_a_purge_whose_runtime_is_already_broken(self, _system):
+        # 上一次 --purge-code 删运行时删到一半（Windows 上被别的进程占着文件）：解释器已经残缺，再次卸载不能先去运行它。
+        self.invoke(self.offline_args('--release', str(self.v1), '--runtime', str(self.runtime_source('first'))))
+        with patch.object(ins, 'runtime_in_use', return_value=True):
+            self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        for python in (self.prefix / 'runtime').rglob('python3'):
+            python.write_text('#!/bin/sh\nexit 1\n')
+        self.invoke(self.offline_args('--uninstall', '--purge-code'))
+        self.assertFalse((self.prefix / 'runtime').exists())
+
+    def test_runtime_in_use_only_for_the_running_interpreter_on_windows(self):
+        here = Path(sys.executable).resolve().parent
+        self.assertEqual(ins.runtime_in_use(here), os.name == 'nt')
+        self.assertFalse(ins.runtime_in_use(self.temp))
+
     def test_runtime_unsafe_archives_rejected_without_partial_directories(self):
         for form, name, link in (('tar', '../escape', None), ('zip', '/absolute', None),
                                  ('tar', 'bin/python3', '../../../outside'),
@@ -295,7 +326,7 @@ class InstallerM2Tests(unittest.TestCase):
         report = json.loads(out)
         self.assertEqual(set(report), {'prefix', 'installed', 'version', 'previous_version', 'role', 'instance',
             'service', 'desired', 'desired_source', 'services', 'autostart', 'service_owner', 'runtime', 'python',
-            'state_dir', 'identity', 'controller_data', 'context'})
+            'state_dir', 'identity', 'controller_data', 'context', 'interrupted'})
         self.assertEqual(report['identity'], {'node_id': config['node_id'], 'controller': config['controller_url'], 'paired': True})
         self.assertNotIn('private', out)
         self.assertEqual(report['desired_source'], 'recorded')
@@ -328,7 +359,7 @@ class InstallerM2Tests(unittest.TestCase):
         config, directory = self.installation('Windows', desired={'worker': 'running'})
         with self.managers('Windows'), patch.object(ins, 'drain_client', return_value=(object(), 'node')), \
                 patch.object(ins, 'drain_and_wait', return_value=False), patch.object(ins, 'set_drain'), \
-                patch.object(ins, 'wait_worker_status'), patch.object(ins, 'wait_doctor'):
+                patch.object(ins, 'wait_worker_status'), patch.object(ins, 'wait_doctor', return_value={'ok': True}):
             stop = ins.Services.stop
             def observe(manager, *args, **kwargs):
                 stop(manager, *args, **kwargs)
@@ -427,8 +458,9 @@ class InstallerM2Tests(unittest.TestCase):
         if os.name == 'nt':
             self.skipTest('baseline byte fixtures use POSIX paths')
         # 固定路径下由基线 f7ebb3e 生成的完整模板 SHA-256，覆盖文件名、argv 与序列化格式。
+        # 有意的变化：controller 单元的 ReadWritePaths 加上 <state>/backups（维护 API 的在线备份写在那里）。
         expected = {
-            'Linux': {'agent-collab-controller.service': '0059f8db1ae5d564a819b69bcbdd53da187eb6303415db86d5d1123717af6fe8',
+            'Linux': {'agent-collab-controller.service': '2e3408734f7055a5623cce5ccf39315a0736f5b42aa7c18b3a2a3d6442b336ce',
                       'agent-collab-worker.service': 'f152907307b89aaab62067e83ff0d9642c6dda4b612cf3098d358d49d748ecd5'},
             'Darwin': {'agent-collab-controller.plist': 'e058cc8cedee7f3fe64976ccba0f12f21c89a3bea8a2b55e1fd19f6c833c0dab',
                        'agent-collab-worker.plist': 'ed2c1bda5d5829e6db6d1a28ad07a1c61fe39937038e7b767c1035c6af6a65e3'},
