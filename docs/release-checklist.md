@@ -26,7 +26,7 @@
 
 | 身份 | 版本号 | `automation` feature | 实例名 / 端口 | 凭据服务名 | 更新通道 | 对外分发 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `formal` 正式版 | 不带预发布后缀 | 不带 | 空 / 18669 | `agent-collab` | `stable`（缺省）、`preview` | 是 |
+| `formal` 正式版 | `X.Y.Z`；发行候选 `X.Y.Z-rc.N`（只进 `preview`） | 不带 | 空 / 18669 | `agent-collab` | `stable`（缺省）、`preview` | 是 |
 | `candidate` 开发候选版 | 带预发布后缀 | 不带 | `cand` / 18769 | `agent-collab-cand` | `stable`、`preview`（测试地址） | 可对外试用 |
 | `internal-test` 内部测试版 | 带预发布后缀 | 编译进 | `itest` / 18779 | `agent-collab-itest` | `internal-test`（测试地址） | 否；文件名带 `internal-test` |
 

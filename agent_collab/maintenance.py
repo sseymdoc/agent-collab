@@ -13,7 +13,7 @@ import uuid
 from urllib.parse import quote
 
 from . import domain as d, protocol as p
-from .backup import (BackupError, atomic_json, deterministic_tar, file_hash,
+from .backup import (BackupError, atomic_json, describe_backup, deterministic_tar, file_hash,
                      inspect_backup, verified_snapshot)
 from .blobstore import BlobStore
 from .store import Store
@@ -265,7 +265,7 @@ def backups(app):
                     created_at=None, schema=None, db_sha256=None, blob_count=None, blob_bytes=None,
                     authority_generation=None, event_seq=None, last_verification=app.store.get('backup_verification', path.name))
         try:
-            info = inspect_backup(path, app.data_dir)
+            info = describe_backup(path)  # 轻量：不复制、不重算摘要；完整核对见 verify 与 last_verification
             item.update({k: info[k] for k in ('created_at', 'schema', 'db_sha256', 'blob_count', 'blob_bytes', 'authority_generation', 'event_seq')})
             item['valid'] = True
         except BackupError as exc:
@@ -281,9 +281,20 @@ def retention_settings(store):
 def prune(app):
     items = [item for item in backups(app) if item['kind'] == 'managed']
     items.sort(key=lambda item: (item['created_at'] or '', item['event_seq'] or 0, item['id']))
-    valid = [item for item in items if item['valid']]
-    protected = valid[-1]['id'] if valid else None
-    removed = []
+    protected, removed = None, []
+    if len(items) > retention_settings(app.store)['keep']:
+        # 列表只做轻量核对；要删别的备份之前，从最新往前完整核对，保护第一份真正可用的恢复点。
+        for item in reversed(items):
+            if not item['valid']:
+                continue
+            try:
+                inspect_backup(backup_path(app, item['id']), app.data_dir)
+            except BackupError:
+                continue
+            protected = item['id']
+            break
+        if protected is None:
+            return removed   # 没有一份通过完整核对（例如空间不足无法复制核对）：一份都不删，保住现有恢复点
     for item in items:
         if len(items) - len(removed) <= retention_settings(app.store)['keep']:
             break
@@ -418,8 +429,12 @@ def api(app, method, route, query, data, identity):
     raise APIError('not_found', 'maintenance route not found')
 
 
-def restore_offline(data_dir, source, identity=None, dry_run=False, clock=time.time):
+def restore_offline(data_dir, source, identity=None, dry_run=False, clock=time.time, high_water=None):
+    """high_water：此前已经在线使用过的最高恢复代次（由运维记录在数据库之外）。恢复后的代次大于它、当前库与备份三者，
+    当前库丢失或不可读时也不会复用已经在线出现过的执行权代次。"""
     from .controller import ControllerLock, revoke_execution, sync_directory
+    if high_water is not None and (type(high_water) is not int or high_water < 0):
+        raise ValueError('high_water must be a non-negative integer')
     data, source = Path(data_dir).resolve(), Path(source).resolve()
     if data == source or data in source.parents or source in data.parents:
         raise ValueError('restore source must be separate from the data directory')
@@ -430,9 +445,10 @@ def restore_offline(data_dir, source, identity=None, dry_run=False, clock=time.t
         def plan():
             current, seq, error = current_state(data)
             identity_plan = identities(saved, current, identity)
-            generation = max((current or {}).get(('meta', 'controller'), {}).get('authority_generation', 0), info['authority_generation']) + 1
+            generation = max((current or {}).get(('meta', 'controller'), {}).get('authority_generation', 0), info['authority_generation'],
+                             high_water or 0) + 1
             return current, seq, dict(op_id=str(uuid.uuid4()), kind='restore', status='succeeded', identity=identity_plan,
-                                      authority_generation=generation, db_sha256=info['db_sha256'], current_error=error,
+                                      authority_generation=generation, high_water=high_water, db_sha256=info['db_sha256'], current_error=error,
                                       requested_by={'kind': 'offline'}, requested_at=d.timestamp(clock()),
                                       started_at=d.timestamp(clock()), finished_at=d.timestamp(clock()), error=None,
                                       steps=[dict(name=name, status='succeeded') for name in ('verify', 'identity', 'fence')],
@@ -505,6 +521,7 @@ def main(argv=None):
             if name == 'restore':
                 command.add_argument('--data-dir', required=True)
                 command.add_argument('--identity', choices=('carry-forward', 'keep', 'revoke-all'))
+                command.add_argument('--high-water', type=int, help='已在线使用过的最高恢复代次；恢复后的代次大于它')
                 command.add_argument('--dry-run', action='store_true')
         else:
             cli.connection_args(command)
@@ -527,7 +544,7 @@ def main(argv=None):
             cli.out(inspect_backup(args.source))
             return 0
         if args.command == 'restore':
-            cli.out(restore_offline(args.data_dir, args.source, args.identity, args.dry_run))
+            cli.out(restore_offline(args.data_dir, args.source, args.identity, args.dry_run, high_water=args.high_water))
             return 0
         conn = cli.Conn(args)
         ident = quote(getattr(args, 'id', ''), safe='')

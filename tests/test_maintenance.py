@@ -130,6 +130,120 @@ class MaintenanceTests(ClientCase):
         self.assertFalse(self.app.store.all('node_token'))
         self.assertFalse(self.app.store.all('client_token'))
 
+    def test_listing_is_light_and_deep_checks_stay_in_verify(self):
+        # 每个请求都在 controller 的同一把锁里处理：列表不能逐个复制、重算摘要，否则几百 MB 的备份会让心跳排队超时。
+        self.node()
+        ident, path = self.create_backup()
+        before = contents(path)
+        with mock.patch.object(m, 'inspect_backup', side_effect=AssertionError('list must not deep-check')), \
+                mock.patch('agent_collab.backup.file_hash', side_effect=AssertionError('list must not hash')):
+            listed = self.call('GET', '/maintenance/backups')['backups']
+        item = next(x for x in listed if x['id'] == ident)
+        self.assertTrue(item['valid'])
+        self.assertEqual(item['authority_generation'], 1)
+        self.assertTrue(item['schema']['fingerprint'] and item['event_seq'] and item['db_sha256'])
+        self.assertEqual(contents(path), before)  # 只读不可变打开：原目录没有新增或改动文件
+        # 同样大小的内容损坏只有完整核对能发现：列表仍按清单报告，verify 报错并记入 last_verification。
+        database = next(path.glob('controller*.db'))
+        data = bytearray(database.read_bytes())
+        data[-1] ^= 0xFF
+        database.write_bytes(bytes(data))
+        verified = self.call('POST', '/maintenance/backups/' + ident + '/verify', {'request_id': uid()})['maintenance_op']
+        self.assertEqual(verified['status'], 'failed')
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertTrue(item['valid'])
+        self.assertFalse(item['last_verification']['ok'])
+        # 缺文件仍在列表里报出来。
+        database.unlink()
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertFalse(item['valid'])
+        self.assertEqual(item['error']['code'], 'backup_object_missing')
+
+    def test_listing_cross_checks_the_manifest_and_creates_nothing(self):
+        self.node()
+        ident, path = self.create_backup()
+        blobs = path / 'blobs'
+        if blobs.is_dir() and not any(blobs.rglob('*')):
+            blobs.rmdir()
+        manifest_path = path / 'backup-manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if not manifest['blobs']:
+            self.call('GET', '/maintenance/backups')
+            self.assertFalse(blobs.exists())               # 列表不建 blobs/ 目录
+        for key, value in (('authority_generation', manifest['authority_generation'] + 1), ('event_seq', manifest.get('event_seq', 0) + 1)):
+            manifest_path.write_text(json.dumps(dict(manifest, **{key: value})), encoding='utf-8')
+            item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+            self.assertFalse(item['valid'], key)
+            self.assertEqual(item['error']['code'], 'backup_inventory_mismatch')
+        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        self.assertTrue(next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)['valid'])
+        # 尺寸不符的 blob 与完整核对报同一个错误码。
+        resized = dict(manifest, blobs=manifest['blobs'] + [{'sha256': 'a' * 64, 'size': 3}])
+        target = path / 'blobs' / 'aa' / 'aa' / ('a' * 64)
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'xx')
+        manifest_path.write_text(json.dumps(resized), encoding='utf-8')
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertEqual(item['error']['code'], 'backup_blob_hash')
+        # 数据库里的 controller 元数据缺字段：这一份记为无效，列表照常返回。
+        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        database = next(path.glob('controller*.db'))
+        db = sqlite3.connect(str(database), isolation_level=None)
+        try:
+            db.execute('PRAGMA journal_mode=DELETE')
+            db.execute("UPDATE records SET data=json_remove(data, '$.authority_generation') WHERE kind='meta' AND id='controller'")
+        finally:
+            db.close()
+        item = next(x for x in self.call('GET', '/maintenance/backups')['backups'] if x['id'] == ident)
+        self.assertFalse(item['valid'])
+        self.assertEqual(item['error']['code'], 'backup_payload_invalid')
+
+    def test_retention_protects_a_deep_checked_backup_not_a_same_size_corrupt_newer_one(self):
+        self.node()
+        older, older_path = self.create_backup()
+        self.clock.advance(1)
+        newer, newer_path = self.create_backup()
+        database = next(newer_path.glob('controller*.db'))
+        data = bytearray(database.read_bytes())
+        data[-1] ^= 0xFF
+        database.write_bytes(bytes(data))       # 大小不变：轻量列表仍报 valid
+        self.app.store.put('settings', 'backups', dict(revision=1, keep=1, updated_at=None, updated_by=None))
+        self.assertEqual(m.prune(self.app), [newer])
+        self.assertTrue(older_path.is_dir())
+        self.assertFalse(newer_path.exists())
+
+    def test_retention_deletes_nothing_when_no_backup_passes_the_full_check(self):
+        self.node()
+        _, first = self.create_backup()
+        self.clock.advance(1)
+        _, second = self.create_backup()
+        self.app.store.put('settings', 'backups', dict(revision=1, keep=1, updated_at=None, updated_by=None))
+        with mock.patch.object(m, 'inspect_backup', side_effect=BackupError('backup_payload_invalid', 'no space to copy')):
+            self.assertEqual(m.prune(self.app), [])
+        self.assertTrue(first.is_dir() and second.is_dir())
+
+    def test_high_water_keeps_restored_generation_above_every_online_generation(self):
+        # 备份在代次 1；之后线上已经用过 3（例如一次恢复、一次屏障），当前库又丢了：不带下限只会得到 2，复用线上出现过的代次。
+        self.node()
+        _, source = self.create_backup()
+        self.close_app()
+        (self.temp / 'data' / 'controller.db').write_bytes(b'not sqlite')
+        self.assertEqual(m.restore_offline(self.temp / 'data', source, identity='revoke-all', dry_run=True, clock=self.clock)['authority_generation'], 2)
+        for bad in (-1, '3', True):
+            with self.assertRaises(ValueError):
+                m.restore_offline(self.temp / 'data', source, identity='revoke-all', high_water=bad, clock=self.clock)
+        preview = m.restore_offline(self.temp / 'data', source, identity='revoke-all', dry_run=True, high_water=3, clock=self.clock)
+        self.assertEqual(preview['authority_generation'], 4)
+        result = m.restore_offline(self.temp / 'data', source, identity='revoke-all', high_water=3, clock=self.clock)
+        self.assertEqual((result['authority_generation'], result['high_water']), (4, 3))
+        self.reopen()
+        self.assertEqual(self.app.meta()['authority_generation'], 4)
+        self.assertTrue(self.app.meta()['dispatch_paused'])
+        # 下限低于当前库与备份时不起作用，不会让代次倒退。
+        _, again = self.create_backup()
+        self.close_app()
+        self.assertEqual(m.restore_offline(self.temp / 'data', again, dry_run=True, high_water=1, clock=self.clock)['authority_generation'], 5)
+
     def test_inspect_verify_restore_archive_preserve_every_source_file(self):
         node = self.node()
         self.job()

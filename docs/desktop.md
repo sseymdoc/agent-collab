@@ -183,7 +183,7 @@ cd ../desktop && cargo tauri build         # Windows：NSIS 安装包；macOS：
 - 构建身份与更新在构建时给出（ADR 0004 第 1 条）：`AGENT_COLLAB_BUILD_KIND`（`formal`、`candidate`、`internal-test`）、`AGENT_COLLAB_INSTANCE` 与 `AGENT_COLLAB_LOCAL_PORT`（正式版空 / 18669，候选 `cand` / 18769，内部测试 `itest` / 18779）、`AGENT_COLLAB_UPDATE_BASE` 与 `AGENT_COLLAB_UPDATE_CHANNELS`。本机部署的前缀、状态目录与服务名都带实例名，与正式版分开。正式身份的构建不能带 `automation` 与实例名（`build.rs` 拒绝），其余由发行门禁核对。
 - 发行构建用 `scripts/build_desktop.py`：`build`（组装载荷、按身份生成配置、构建、平台签名与公证的接入点、从最终产物生成更新签名）、`manifest`（产品发行清单与 `latest.json`）、`sign`（在唯一的签名机上给不带更新签名构建的平台片段补更新签名）、`gate`（发行门禁）。签名顺序：macOS 先签随包运行时里的嵌套代码再生成载荷清单，应用由 Tauri 按 `signingIdentity` 签名（候选用临时签名 `-`，正式用 Developer ID 与 hardened runtime），公证与 stapling 之后才打更新归档；Windows 有证书时运行时二进制在生成载荷清单前签名，安装包由 Tauri 按证书签名，之后才生成更新签名。更新签名用 `tauri signer sign --app-version` 绑定版本，必须对应最后实际分发的字节。
 - 构建身份有三种，界面与 `app_info` 如实标明：
-  - 正式版：版本号不带预发布后缀，不带 `automation`，实例名为空。
+  - 正式版：版本号为 `X.Y.Z`（发行候选为 `X.Y.Z-rc.N`，只进 preview 通道），不带 `automation`，实例名为空。
   - 开发候选版（可对外试用）：版本号带预发布后缀，不带 `automation`；用独立的应用标识与实例名构建，数据目录、安装前缀与服务名都与正式版分开。
   - 内部测试版：在候选版基础上编译进 `automation` feature，只用于自动化验证真实窗口，不对外分发。文件名带 `internal-test`。
 - 候选包没有平台代码签名与公证：Windows 安装时会出现 SmartScreen 提示，macOS 包是临时签名（应用包签名完整、资源已封存，但不能通过 Gatekeeper），从别的机器拷入或经浏览器下载后需要用户手动放行。正式发行要的签名身份、公证账号、正式更新密钥与 HTTPS 发布位置见 `docs/release-checklist.md`。

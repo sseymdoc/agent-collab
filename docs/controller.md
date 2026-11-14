@@ -61,6 +61,8 @@ serve 全生命周期持有 OS 文件锁 `controller.lock`；第二个 serve 或
 
 `catalog_max_age_s`（缺省 172800 秒）是节点模型目录的有效期：取得时间早于它的目录按未核实处理（`docs/protocol.md` §12.5）。`node_operation_timeout_s`（缺省 120 秒）是节点管理操作从请求到完成的时限，超时记 `timed_out`，不重发（§13.6）。`project_operation_timeout_s`（缺省 1800 秒）是远端项目写回的三种操作的时限，到期规则与对账见 §13.10。
 
+节点每次心跳都刷新最近联系时间（`last_seen_at`），在线判断、租约续期与失联判定照常按它计算。只有它变化时，节点记录原地更新，不推进 `version`、不写事件；每个节点最多每 60 秒写一条 `node.updated`（`NODE_EVENT_INTERVAL_S`），所以页面上的“最近联系”最多滞后这么久。状态（在线、疑似失联、不可达）、认证、能力与注册信息的变化照常立即写事件。此前每次心跳都写一条完整的节点快照（含模型目录），是事件表与备份持续变大的原因。
+
 `web_console`（布尔，缺省 true）控制浏览器控制台：设为 false 后 `POST /session` 被拒绝、已有会话在关闭期间不能使用（会话记录保留，重新启用后未过期的会话恢复可用）、不再提供静态页面，客户端凭据与管理令牌不受影响。
 
 模型默认值与部署许可范围不在 `config.json` 里，而是保存在数据库的 `settings/models` 记录中，经 `GET` / `PUT /settings/models` 读写（`docs/protocol.md` §12.3）。新数据库从未设置开始；已有任务或节点记录但没有该记录的数据库，在升级后首次启动时写入一次迁移值，其中协调模型取 `standby_profiles` 里当时生效的 profile。之后设置里的协调模型优先于 profile 的 `model` 与 `effort`。协调是否启用与候选节点列表：经 `PUT /settings/coordination` 保存过之后取那份设置（§13.7），此前取自 `config.json` 的启用开关与 profile 的 `node_ids`。
@@ -195,7 +197,7 @@ SQLite 沿用通用 records 表，不改 SQL 表结构。启动时事务性补�
 ```sh
 python -m agent_collab.controller backup --data-dir /local/controller-data --dest /local/controller-backup
 python -m agent_collab.controller restore --data-dir /local/controller-data --from /local/controller-backup
-python -m agent_collab.controller prune-events --data-dir /local/controller-data --keep 10000
+python -m agent_collab.controller prune-events --data-dir /local/controller-data --redundant-node-updates
 python -m agent_collab.controller barrier --data-dir /local/controller-data --request-id <UUID v4> --reason "<原因>"
 ```
 
@@ -217,7 +219,7 @@ generation 更新为 max(可读当前库,备份)+1，全部旧执行权撤销，
 
 barrier 是可选切换屏障，不用于普通更新。要求 controller 停止、派单暂停、提交闸门不是 open，且最新成功 attempt 的最新 durable 成果已发布或明确弃置。`GET /maintenance/barrier-preview` 列出待处理项；`POST /jobs/{id}/dismiss` 用 tasks 权限、request_id、expected_version、reason 记录弃置，保留数据并禁止以后发布该检查点。barrier 在同一 BEGIN IMMEDIATE 事务内重查这些条件并推进代次，存在未处理成果就拒绝并列出；不要求历史检查点都发布，也不恢复被撤销的授权。同一 request_id 重放不再推进代次。普通重启保留代次、租约与协调租约。
 
-prune-events 只裁剪事件内容，保留 event_id/hash 去重账本，防止迟到重发重复改变状态。旧游标收到 snapshot_required 后重新请求快照。没有后台 blob GC 或幂等/去重账本淘汰策略。
+prune-events 只裁剪事件内容，保留 event_id/hash 去重账本，防止迟到重发重复改变状态。`--redundant-node-updates` 只删除“只刷新了最近联系时间”的节点快照：与同一节点上一条保留的 `node.updated` 相比，除 `last_seen_at`、`version` 之外完全相同；状态、认证、能力、排空等真实变化，每个节点最早与最新的一条，以及其他类型的事件与 `event_keys` 都保留。它要求 controller 已停止（取得数据目录的锁），分批删除，并把最大的被删序号记为重放水位（记录 `meta/events` 的 `complete_after`）；之后 `min_seq` 不低于水位加一，游标落在水位之前的客户端收到 snapshot_required 并重取快照，水位之后的游标照常增量续读。删除只把页面留给数据库复用，文件与备份不会变小；整理文件（VACUUM）是另一项需要停机与临时空间的维护，命令行没有提供。`--keep N` 按序号只保留最新 N 条、不分事件类型，会一并删掉任务、发布与审计的历史事件；不要用它控制容量。旧游标收到 snapshot_required 后重新请求快照。没有后台 blob GC 或幂等/去重账本淘汰策略。
 
 ## 验证与限制
 

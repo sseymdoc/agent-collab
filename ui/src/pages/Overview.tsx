@@ -4,8 +4,11 @@ import { Action, Badge, ModelUnset, Section, show, useData, when } from '../ui'
 const GROUPS: [string, string[]][] = [
   ['排队', ['queued']], ['执行', ['running']], ['恢复', ['recovering']],
   ['等待能力', ['waiting_capability']], ['待对账（需人工）', ['waiting_reconcile']], ['取消中', ['cancel_requested']],
-  ['失败', ['failed']], ['待验收', ['completed']], ['已取消', ['cancelled']],
+  ['失败', ['failed']], ['已完成', ['completed']], ['已取消', ['cancelled']],
 ]
+// 运行状态之外的待办：controller 按每个工作包的最新修订判定（与 CLI 摘要的 outcome 同义），
+// 要求验收而还没有“通过”的才是待验收，已就绪待发布单列。旧 controller 没有 outcomes 时不显示。
+const TODO: [string, string][] = [['待验收', 'awaiting_acceptance'], ['可发布', 'ready_to_publish']]
 
 export function Overview({ tick }: { tick: number }) {
   const { data: o, error, reload } = useData(() => api.overview(), [tick])
@@ -21,6 +24,7 @@ export function Overview({ tick }: { tick: number }) {
         const n = keys.reduce((s, k) => s + (Number(counts[k]) || 0), 0)
         return <a className="tile" key={label} href={'#/jobs'}><span>{label}</span><b>{n}</b></a>
       })}
+      {o.outcomes && TODO.map(([label, key]) => <a className="tile" key={label} href={'#/jobs'}><span>{label}</span><b>{Number(o.outcomes[key]) || 0}</b></a>)}
     </div>
     <Section title="恢复保障" extra={<span className="muted">只展示 controller 已确认的事实</span>}>
       <dl className="kv">

@@ -636,6 +636,57 @@ def _managed_profile(config):
     return result
 
 
+RESTING = ('completed', 'failed', 'cancelled', 'waiting_reconcile')  # 不再自行变化、等人或等下一步的状态
+ENDED = ('completed', 'failed', 'cancelled')
+OUTCOMES = ('running', 'awaiting_coordination', 'needs_attention', 'awaiting_acceptance', 'ready_to_publish',
+            'awaiting_publication', 'done', 'unknown')
+
+
+def job_outcome(job, coordinating=False):
+    """任务现在处在哪一步（CLI 摘要的 outcome、总览的待办计数共用）。coordinating：有没有仍在进行的协调回合。
+
+    运行状态、验收与发布是分开的事实：completed 只表示执行结束；要求验收而没有“通过”的才是待验收。
+    契约里没有发布规则的旧记录无法判断，记 unknown，不当作待办。"""
+    if job['status'] not in RESTING:
+        return 'running'
+    if coordinating:
+        # 失败或待对账也可能触发协调回合；回合结束前它可能新建修复修订，不能先判为需人工处理。
+        return 'awaiting_coordination'
+    # 验收与发布都要属于当前检查点：通过或发布之后再重试，旧记录仍留在任务上，但说的是上一次执行的成果。
+    current = job.get('durable_checkpoint_id')
+    acceptance = job['acceptance']['status']
+    if job['acceptance'].get('checkpoint_id', current) != current:
+        acceptance = 'unverified'
+    if job['status'] != 'completed' or acceptance in ('rework', 'blocked'):
+        return 'needs_attention'
+    publish = job['contract'].get('publish')
+    if not isinstance(publish, dict):
+        return 'unknown'
+    if publish.get('requires_acceptance') and acceptance != 'passed':
+        return 'awaiting_acceptance'
+    if not job['delivery_version'] or job.get('delivery_checkpoint_id', current) != current:
+        # 执行结束不等于成果已发布：手动发布等调用方，自动发布等执行节点完成发布。
+        return 'ready_to_publish' if publish.get('mode') == 'manual' else 'awaiting_publication'
+    return 'done'
+
+
+def outcome_counts(jobs):
+    """总览的待办计数。jobs 按写入顺序排列（Store.all 的顺序）：每个根工作包只看最后写入的一版修订
+    （被取代的旧修订不再是待办），不按 created_at 判断，时钟回拨或同一毫秒也不会选错；协调回合本身不计，
+    它的进行与结论归到被协调的任务。"""
+    coordinating = {job['contract']['coordinates']['job_id'] for job in jobs
+                    if (job['contract'].get('coordinates') or {}).get('job_id') and job['status'] not in ENDED}
+    latest = {}
+    for job in jobs:
+        if job['contract'].get('coordinates'):
+            continue
+        latest[job['work_package_id']] = job
+    counts = dict.fromkeys(OUTCOMES, 0)
+    for job in latest.values():
+        counts[job_outcome(job, job['job_id'] in coordinating)] += 1
+    return counts
+
+
 def node_status(node, now, config):
     age = now - seconds(node['last_seen_at'])
     if age >= config['lease_ttl_s']:

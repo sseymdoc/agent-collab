@@ -2,7 +2,7 @@
 
 桌面端与自动化入口（CLI、Agent）要覆盖的操作，以及每项落在哪个里程碑。作用目标分三类：**controller**（当前连接的控制服务）、**本机**（运行桌面端或 CLI 的这台机器）、**远端节点**（指定的执行设备）。需要远端节点管理 API 而目前没有的，列为后端工作，不由桌面端执行远程命令代替。
 
-里程碑：M1 远程候选闭环、M2 本机完整模式、项目与文件夹输入、完整管理操作，两者都已实现；M3 发行工程（构建身份、组件清单与兼容、桌面更新、本机后台的可恢复升级、备份恢复与预检、诊断导出、签名与公证流水线）已实现，正式签名、公证与发布资产待提供；M4 生产迁移未开始。“M3 联调”指 M3 验证中对隔离候选做的联调。标“M1 收尾”的几项（401 与 403 区分、提交回执、模型目录派单策略、凭据存储）属于 M1 范围，随 M2 一起交付。
+里程碑：M1 远程候选闭环、M2 本机完整模式、项目与文件夹输入、完整管理操作，两者都已实现；M3 发行工程（构建身份、组件清单与兼容、桌面更新、本机后台的可恢复升级、备份恢复与预检、诊断导出、签名与公证流水线）已实现，正式签名、公证与发布资产待提供；M4 个人生产迁移已于 2026-11-14 完成，公众发行的平台签名、Pages、Release 与 stable 仍未执行。“M3 联调”指 M3 验证中对隔离候选做的联调。标“M1 收尾”的几项（401 与 403 区分、提交回执、模型目录派单策略、凭据存储）属于 M1 范围，随 M2 一起交付。
 
 验收方法里的测试名指 `tests/` 下的用例，“Rust 用例”指 `desktop/src-tauri/src` 下 `cargo test` 的用例。“桌面联调”指在真实桌面窗口中对 controller 做的端到端联调；“M2 桌面联调 wN / mN”是 M2 验证中的步骤名（w 为 Windows 桌面端，m 为 macOS 桌面端），连接 HTTPS 候选 controller 与两台真实节点。“M2 CLI HTTPS 实测”“M2 服务生命周期实测”“切换机制隔离预演”是同一轮验证中的实测项目。“仅自动化测试”表示有自动化测试、没有在真实窗口或真实设备上跑过；“未验证”表示两者都没有。
 
@@ -80,7 +80,7 @@
 | 任务级模型与 effort 覆盖 | controller | 契约 `harness_params`；桌面“新建任务” | 无 | tasks | 受理时冻结 | M1 | `test_clients_models`；桌面联调 |
 | 协调设置：受管协调是否启用与候选节点 | controller | `GET` / `PUT /settings/coordination`；桌面“设置 → Claude 协调策略”（协调模型与 effort 在模型设置里） | 无 | read / settings | request_id + expected_revision | M2 | `test_node_admin` CoordinationSettingsTests；M2 桌面联调 w8（保存后恢复，版本递增并留下修改记录）；M3 联调：受管协调回合实际执行（Claude `claude-opus-5-5` / `xhigh`，取自工作区默认值；Windows 候选节点的服务进程上下文；决定 accept，目标任务验收 passed），外部 Agent 只用公共 CLI 完成提交、等待、取结果与成果、协调权、验收、发布与释放 |
 | 界面主题等本机偏好 | 本机 | 页面本地存储 | 无 | — | — | M1 | 桌面联调 |
-| 关闭浏览器控制台 | controller | `config.json` 的 `web_console` | 无 | 本机 | — | M4 | `test_clients_models` |
+| 关闭浏览器控制台 | controller | `config.json` 的 `web_console` | 无 | 本机 | — | M4 | `test_clients_models`；M4 生产：`web_console=false` 后 `POST /session` 403、根路径不再提供页面 |
 
 ## 维护与首次配置
 
@@ -103,4 +103,4 @@
 | 发行门禁 | 本机 | `scripts/build_desktop.py gate` | 无 | — | — | M3 | M3 候选门禁通过（M3 收尾起对所有身份核对许可材料随包，并要求至少一个通道有 `latest.json`；最终候选 dev.20/dev.21 通过，旧的 dev.15 在新门禁下许可项不通过；M3 两项补齐起门禁还用 `scripts/rust_licenses.py` 核对 `Cargo.lock` 的依赖都有许可证文本，并要求包里的 Rust 清单与文本就是核对过的那一份，dev.22 通过、dev.20 的副本不通过）；正式身份的门禁在缺资产时不通过 |
 | 干净机器上的安装验证 | 本机 | 桌面安装包 | 干净的测试机器 | — | — | M3 | M3 干净环境矩阵：macOS 26 虚拟机（tart，vanilla 镜像，无开发者工具）与 Windows 11 家庭版虚拟机（VirtualBox，UAC 过滤令牌）上验证了下载后首次打开（未签名/未公证被 Gatekeeper、SmartScreen 拦截，属资产缺口）、安装与首次启动、缺 CLI 的引导、仅连接远端、本机完整部署、桌面端真实更新、本机后台升级与停用保持、中断恢复、卸载后台与卸载桌面端的边界；过程中发现并修复四个缺陷（`29c3eda`、`edfb6e2`、`7d6c1fd`、`a76180a`），最终候选 dev.14 → dev.15 在两台虚拟机上复验。M3 收尾（dev.16–dev.21）：Windows 交互卸载一并移除本机后台（服务、启动项与程序文件，状态目录保留）、清理未完成时如实提示并可取消、再次卸载续完、静默卸载保留后台并留说明、安装与卸载向导为简体中文；macOS 只删应用时后台不受影响、不引用应用包，之后经前缀命令入口移除；发行验签用系统自带的 ssh-keygen，屏蔽它时拒绝安装；M3 发行接入：Windows 10 22H2（build 19045.2965）虚拟机上自带的 8.1p1 被安装器选中并通过验签与安装前检查；发现并修复卸载向导退回英文（`c25a5f4`）与清理未完成后无法续完（`27a8c37`） |
 | 自动更新：桌面端 | 本机 | 桌面“维护 → 桌面端更新”（`update_*`，Tauri updater） | 更新签名与产品发行清单签名 | 本机 | 持久更新记录、启动时对账；只提供更高的版本 | M3 | Rust `update.rs` 用例；M3 联调：Windows 普通候选经界面从 0.3.0-dev.3 更新到 dev.4（兼容判断、下载验签、安装重启，记录各步完成，旧模块不残留，本机后台进程不被打断）；内部测试身份上的失败路径：损坏包、错误签名、缺平台、controller 缺必需 feature、下载中断后重试、降级不提供、宣布版本不符、安装中断后载荷不完整被识别并经重新安装修复；最终候选：Windows 普通候选 dev.7 → dev.8（经界面）、macOS 内部测试 dev.5 → dev.6 与 dev.7 → dev.8（就地替换应用包，替换后签名有效），记录全部完成；M3 干净虚拟机：两平台 dev.11 → dev.12 与最终候选 dev.14 → dev.15；Windows 上更新时本机助手占着随包运行时、安装程序写不进去的缺陷由 `a76180a` 修复（安装前等助手结束，Rust `closing_the_gate_waits_for_running_helpers_and_refuses_new_ones`）；M3 收尾补齐关闸的失败出口（等待超时说明在等的操作并延后、安装程序没能接管时重新开闸、已下载的更新保留；Rust `helpers_that_fail_or_panic_leave_the_gate`、`update_install_reopens_the_gate_unless_the_installer_took_over`、`labels_name_the_subcommand_without_paths`），两平台 dev.18 → dev.19 与 Windows dev.20 → dev.21 复验 |
-| 生产迁移 | controller、远端节点 | `docs/migration.md` 的切换顺序 | 无 | maintain；本机 | — | M4 | 未开始（切换机制只在隔离副本上预演过） |
+| 生产迁移 | controller、远端节点 | `docs/migration.md` 的切换顺序 | 无 | maintain；本机 | — | M4 | 2026-11-14 生产执行：协同升级（controller 先、节点后，两节点停稳期间升级）、当天实例外备份与预演、验收运行、旧节点退役、项目闭环；没有使用切换屏障，代次保持 1 |
